@@ -5,6 +5,20 @@ build/
 dist/
 wheels/
 *.egg-info
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
 
 # Virtual environments
 .venv
+
+# Data and databases
+data/
+*.db
+
+# Environment variables
+.env
+
+# Rust
+rust/target/
