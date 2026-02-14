@@ -7,9 +7,9 @@ import logging
 from functools import partial
 from typing import Any, cast
 
-import docker
 from docker.errors import APIError, NotFound
 
+import docker
 from pixav.shared.exceptions import RedroidError
 
 logger = logging.getLogger(__name__)

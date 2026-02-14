@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pixav.shared.exceptions import RedroidError
 from pixav.pixel_injector.redroid import DockerRedroidManager
+from pixav.shared.exceptions import RedroidError
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, cast
+from typing import cast
 
 import httpx
 from bs4 import BeautifulSoup
@@ -26,7 +26,7 @@ class HttpxCrawler:
     def __init__(
         self,
         *,
-        flaresolverr: Optional[FlareSolverrSession] = None,
+        flaresolverr: FlareSolverrSession | None = None,
         timeout: int = 30,
     ) -> None:
         self._flaresolverr = flaresolverr

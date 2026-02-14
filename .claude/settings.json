@@ -1,0 +1,96 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(uv:*)",
+      "Bash(pytest:*)",
+      "Bash(black:*)",
+      "Bash(isort:*)",
+      "Bash(ruff:*)",
+      "Bash(mypy:*)",
+      "Bash(git:*)"
+    ],
+    "deny": [
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(rm -rf:*)"
+    ]
+  },
+  "env": {
+    "BASH_DEFAULT_TIMEOUT_MS": "60000",
+    "PYTHONPATH": "."
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q '\\bprint(\\b' && echo \"$CLAUDE_TOOL_INPUT\" | grep -q '\\.py'; then echo '[WARNING] Avoid using print() in production code. Use logging module instead.' >&2; fi",
+            "description": "Warn on print() usage in Python files"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'uv add|pip install'; then echo '[SECURITY] Review dependency before installing. Check for known vulnerabilities.' >&2; fi",
+            "description": "Security audit on dependency changes"
+          },
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'uvicorn|gunicorn|flask run|python -m http' && [ -z \"$TMUX\" ]; then echo '[WARNING] Consider running dev servers inside tmux to avoid blocking.' >&2; fi",
+            "description": "Block dev servers outside tmux"
+          },
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'sleep [0-9]{2,}|timeout [0-9]{3,}'; then echo '[REMINDER] This looks like a long-running command. Consider using background execution.' >&2; fi",
+            "description": "Remind on long-running commands"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then black --quiet \"$FILE\" 2>/dev/null || true; fi",
+            "description": "Auto-format Python files with black"
+          },
+          {
+            "type": "command",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then isort --quiet \"$FILE\" 2>/dev/null || true; fi",
+            "description": "Sort imports with isort"
+          },
+          {
+            "type": "command",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then ruff check --fix --quiet \"$FILE\" 2>/dev/null || true; fi",
+            "description": "Lint Python files with ruff"
+          },
+          {
+            "type": "command",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then mypy --ignore-missing-imports \"$FILE\" 2>/dev/null || true; fi",
+            "description": "Type-check Python files with mypy"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CHANGED=$(git diff --name-only --diff-filter=d HEAD 2>/dev/null | grep '\\.py$' || true); if [ -n \"$CHANGED\" ]; then echo \"$CHANGED\" | xargs black --check --quiet 2>/dev/null || echo '[STOP] Some Python files need formatting (black).'; echo \"$CHANGED\" | xargs ruff check --quiet 2>/dev/null || echo '[STOP] Some Python files have lint issues (ruff).'; echo \"$CHANGED\" | xargs mypy --ignore-missing-imports 2>/dev/null || echo '[STOP] Some Python files have type errors (mypy).'; fi",
+            "description": "Lint and type-check all changed Python files"
+          }
+        ]
+      }
+    ]
+  }
+}

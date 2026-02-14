@@ -7,10 +7,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from pixav.shared.enums import TaskState, VideoStatus
-from pixav.shared.models import Task, Video
-from pixav.shared.exceptions import DownloadError, RemuxError
 from pixav.media_loader.service import MediaLoaderService
+from pixav.shared.enums import TaskState, VideoStatus
+from pixav.shared.exceptions import DownloadError, RemuxError
+from pixav.shared.models import Task, Video
 
 
 @pytest.fixture

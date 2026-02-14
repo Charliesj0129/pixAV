@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pixav.shared.exceptions import RemuxError
 from pixav.media_loader.remuxer import FFmpegRemuxer
+from pixav.shared.exceptions import RemuxError
 
 
 @pytest.fixture

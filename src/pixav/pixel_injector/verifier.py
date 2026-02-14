@@ -30,7 +30,7 @@ class GooglePhotosVerifier:
     def __init__(
         self,
         *,
-        adb: "_AdbShell" | None = None,
+        adb: _AdbShell | None = None,
         timeout: int = 15,
     ) -> None:
         self._adb = adb
