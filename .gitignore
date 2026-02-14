@@ -22,3 +22,9 @@ data/
 
 # Rust
 rust/target/
+
+# Local tooling / workspace artifacts
+.mcp.json
+.flake8
+claude-code-templates/
+everything-claude-code/

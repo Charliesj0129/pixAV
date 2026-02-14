@@ -176,6 +176,33 @@ class TaskRepository:
         )
         return [_task_from_row(row) for row in rows]
 
+    async def has_open_task(self, video_id: uuid.UUID) -> bool:
+        """Return True when a video already has an in-flight task.
+
+        Open states are transient/non-terminal states that indicate the
+        pipeline is already processing this video.
+        """
+        open_states = [
+            TaskState.PENDING.value,
+            TaskState.DOWNLOADING.value,
+            TaskState.REMUXING.value,
+            TaskState.UPLOADING.value,
+            TaskState.VERIFYING.value,
+        ]
+        exists = await self._pool.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM tasks
+                 WHERE video_id = $1
+                   AND state = ANY($2::text[])
+            )
+            """,
+            video_id,
+            open_states,
+        )
+        return bool(exists)
+
 
 # ── Row → Model helpers ────────────────────────────────────────
 

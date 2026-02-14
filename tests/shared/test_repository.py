@@ -211,3 +211,18 @@ class TestTaskRepository:
         assert len(result) == 1
         assert result[0].state == TaskState.PENDING
         pool.fetch.assert_awaited_once()
+
+    async def test_has_open_task_true(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.fetchval.return_value = True
+
+        result = await repo.has_open_task(uuid.uuid4())
+
+        assert result is True
+        pool.fetchval.assert_awaited_once()
+
+    async def test_has_open_task_false(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.fetchval.return_value = False
+
+        result = await repo.has_open_task(uuid.uuid4())
+
+        assert result is False

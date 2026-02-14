@@ -56,26 +56,26 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit|Write",
+        "matcher": "Edit|Write|write_to_file|replace_file_content|multi_replace_file_content",
         "hooks": [
           {
             "type": "command",
-            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then black --quiet \"$FILE\" 2>/dev/null || true; fi",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '(?:\"file_path\"|\"TargetFile\"|\"AbsolutePath\")\\s*:\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then black --quiet \"$FILE\" 2>/dev/null || true; fi",
             "description": "Auto-format Python files with black"
           },
           {
             "type": "command",
-            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then isort --quiet \"$FILE\" 2>/dev/null || true; fi",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '(?:\"file_path\"|\"TargetFile\"|\"AbsolutePath\")\\s*:\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then isort --quiet \"$FILE\" 2>/dev/null || true; fi",
             "description": "Sort imports with isort"
           },
           {
             "type": "command",
-            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then ruff check --fix --quiet \"$FILE\" 2>/dev/null || true; fi",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '(?:\"file_path\"|\"TargetFile\"|\"AbsolutePath\")\\s*:\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then ruff check --fix --quiet \"$FILE\" 2>/dev/null || true; fi",
             "description": "Lint Python files with ruff"
           },
           {
             "type": "command",
-            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '\"file_path\":\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then mypy --ignore-missing-imports \"$FILE\" 2>/dev/null || true; fi",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -oP '(?:\"file_path\"|\"TargetFile\"|\"AbsolutePath\")\\s*:\\s*\"\\K[^\"]+' || true); if [ -n \"$FILE\" ] && echo \"$FILE\" | grep -q '\\.py$'; then mypy --ignore-missing-imports \"$FILE\" 2>/dev/null || true; fi",
             "description": "Type-check Python files with mypy"
           }
         ]
