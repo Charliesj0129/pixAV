@@ -23,7 +23,11 @@ data/
 # Rust
 rust/target/
 
+# Local secrets
+cookies*.txt
+
 # Local tooling / workspace artifacts
+.agent/
 .mcp.json
 .flake8
 claude-code-templates/

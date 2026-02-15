@@ -53,12 +53,12 @@ class TestHttpxCrawler:
         respx.get("https://protected.com/").mock(return_value=httpx.Response(403, text="Blocked"))
 
         mock_flare = AsyncMock()
-        mock_flare.get_html.return_value = '<html><body><a href="/ok">Link</a></body></html>'
+        mock_flare.get_html.return_value = ('<html><body><a href="/ok">Link</a></body></html>', {})
 
         crawler = HttpxCrawler(flaresolverr=mock_flare)
         links = await crawler.crawl("https://protected.com/")
 
-        mock_flare.get_html.assert_awaited_once_with("https://protected.com/")
+        mock_flare.get_html.assert_awaited_once_with("https://protected.com/", cookies={})
         assert "https://protected.com/ok" in links
 
     @respx.mock
@@ -81,3 +81,12 @@ class TestHttpxCrawler:
         html = '<html><body><a href="javascript:void(0)">JS</a></body></html>'
         links = HttpxCrawler._extract_links(html, "https://example.com/")
         assert links == []
+
+    def test_extract_links_keeps_query_string(self) -> None:
+        html = "<html><body>" '<a href="/forum.php?mod=viewthread&tid=123&page=1">T1</a>' "</body></html>"
+        links = HttpxCrawler._extract_links(
+            html,
+            "https://example.com/forum.php?mod=forumdisplay&fid=103",
+            link_pattern=r"mod=viewthread",
+        )
+        assert "https://example.com/forum.php?mod=viewthread&tid=123&page=1" in links

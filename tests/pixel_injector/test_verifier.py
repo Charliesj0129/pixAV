@@ -8,6 +8,7 @@ import httpx
 import pytest
 import respx
 
+from pixav.pixel_injector.session import RedroidSession
 from pixav.pixel_injector.verifier import GooglePhotosVerifier
 from pixav.shared.exceptions import VerificationError
 
@@ -15,28 +16,50 @@ from pixav.shared.exceptions import VerificationError
 class TestGooglePhotosVerifier:
     @pytest.fixture
     def mock_adb(self) -> AsyncMock:
-        return AsyncMock()
+        adb = AsyncMock()
+        adb.connect.return_value = None
+        return adb
 
     @pytest.fixture
     def verifier(self, mock_adb: AsyncMock) -> GooglePhotosVerifier:
         return GooglePhotosVerifier(adb=mock_adb, timeout=5)
 
-    async def test_wait_for_share_url_found(self, verifier: GooglePhotosVerifier, mock_adb: AsyncMock) -> None:
+    @pytest.fixture
+    def session(self) -> RedroidSession:
+        return RedroidSession(
+            task_id="task-1",
+            container_id="container-1",
+            adb_host="127.0.0.1",
+            adb_port=32768,
+        )
+
+    async def test_wait_for_share_url_found(
+        self,
+        verifier: GooglePhotosVerifier,
+        mock_adb: AsyncMock,
+        session: RedroidSession,
+    ) -> None:
         mock_adb.shell.return_value = "I/GooglePhotos: upload complete https://photos.app.goo.gl/AbCdEfGh123\n"
 
-        url = await verifier.wait_for_share_url("container-1", timeout=10)
+        url = await verifier.wait_for_share_url(session, timeout=10)
         assert url == "https://photos.app.goo.gl/AbCdEfGh123"
+        mock_adb.connect.assert_awaited_once_with("127.0.0.1", 32768)
 
-    async def test_wait_for_share_url_timeout(self, verifier: GooglePhotosVerifier, mock_adb: AsyncMock) -> None:
+    async def test_wait_for_share_url_timeout(
+        self,
+        verifier: GooglePhotosVerifier,
+        mock_adb: AsyncMock,
+        session: RedroidSession,
+    ) -> None:
         mock_adb.shell.return_value = "no url here"
 
         with pytest.raises(VerificationError, match="not found"):
-            await verifier.wait_for_share_url("container-1", timeout=0)
+            await verifier.wait_for_share_url(session, timeout=0)
 
-    async def test_wait_for_share_url_no_adb(self) -> None:
+    async def test_wait_for_share_url_no_adb(self, session: RedroidSession) -> None:
         verifier = GooglePhotosVerifier(adb=None)
         with pytest.raises(VerificationError, match="no ADB"):
-            await verifier.wait_for_share_url("container-1")
+            await verifier.wait_for_share_url(session)
 
     @respx.mock
     async def test_validate_share_url_valid(self, verifier: GooglePhotosVerifier) -> None:

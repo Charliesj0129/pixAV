@@ -56,6 +56,39 @@ class QBitClient:
             return {"SID": self._sid}
         return {}
 
+    async def health_check(self) -> str:
+        """Verify qBittorrent API reachability and authentication.
+
+        Returns:
+            qBittorrent version string from ``/api/v2/app/version``.
+
+        Raises:
+            DownloadError: If endpoint is unreachable, not qBittorrent, or auth fails.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                await self._login(client)
+                version_resp = await client.get(f"{self._base_url}/api/v2/app/version")
+                if version_resp.status_code == 404:
+                    raise DownloadError(
+                        f"qBittorrent health check failed: {self._base_url} "
+                        "does not expose /api/v2/app/version (404)"
+                    )
+                if version_resp.status_code in {401, 403}:
+                    raise DownloadError("qBittorrent health check failed: unauthorized even after login")
+                version_resp.raise_for_status()
+
+                version = version_resp.text.strip()
+                if not version or "<html" in version.lower():
+                    raise DownloadError("qBittorrent health check failed: invalid version response body")
+
+                logger.info("qBittorrent health check ok (version=%s)", version)
+                return version
+        except DownloadError:
+            raise
+        except httpx.HTTPError as exc:
+            raise DownloadError(f"qBittorrent health check request failed: {exc}") from exc
+
     async def add_magnet(self, uri: str) -> str:
         """Add a magnet URI to qBittorrent and return the torrent hash.
 
@@ -134,6 +167,26 @@ class QBitClient:
             raise DownloadError(f"qBittorrent polling failed: {exc}") from exc
 
         raise DownloadError(f"torrent {torrent_hash} download timed out after {timeout}s")
+
+    async def delete_torrent(self, torrent_hash: str, delete_files: bool = True) -> None:
+        """Delete a torrent and optionally its files."""
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                await self._login(client)
+                resp = await client.post(
+                    f"{self._base_url}/api/v2/torrents/delete",
+                    data={
+                        "hashes": torrent_hash,
+                        "deleteFiles": "true" if delete_files else "false",
+                    },
+                    cookies=self._cookies(),
+                )
+                if resp.status_code != 200:
+                    raise DownloadError(f"qBittorrent delete failed: {resp.text[:200]}")
+        except httpx.HTTPError as exc:
+            raise DownloadError(f"qBittorrent request failed: {exc}") from exc
+
+        logger.info("deleted torrent %s (files=%s)", torrent_hash, delete_files)
 
 
 def _extract_hash(magnet_uri: str) -> str | None:

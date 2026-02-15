@@ -72,6 +72,26 @@ def orchestrator(
     )
 
 
+@pytest.fixture
+def orchestrator_fail_policy(
+    mock_scheduler: AsyncMock,
+    mock_dispatcher: AsyncMock,
+    mock_monitor: AsyncMock,
+    mock_cleaner: AsyncMock,
+    mock_task_repo: AsyncMock,
+    mock_video_repo: AsyncMock,
+) -> MaxwellOrchestrator:
+    return MaxwellOrchestrator(
+        scheduler=mock_scheduler,
+        dispatcher=mock_dispatcher,
+        monitor=mock_monitor,
+        cleaner=mock_cleaner,
+        task_repo=mock_task_repo,
+        video_repo=mock_video_repo,
+        no_account_policy="fail",
+    )
+
+
 class TestMaxwellOrchestrator:
     async def test_tick_no_pending(
         self,
@@ -86,19 +106,31 @@ class TestMaxwellOrchestrator:
 
         assert stats["orphans_cleaned"] == 0
         mock_cleaner.cleanup.assert_awaited_once()
-        mock_monitor.check_pressure.assert_awaited_once()
+        mock_monitor.check_pressure.assert_not_awaited()
 
     async def test_tick_backpressured(
         self,
         orchestrator: MaxwellOrchestrator,
         mock_monitor: AsyncMock,
         mock_cleaner: AsyncMock,
+        mock_task_repo: AsyncMock,
+        mock_dispatcher: AsyncMock,
     ) -> None:
+        pending = Task(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000301"),
+            video_id=uuid.UUID("00000000-0000-0000-0000-000000000302"),
+            state=TaskState.PENDING,
+            queue_name="pixav:download",
+        )
+        mock_task_repo.count_by_state.return_value = 1
+        mock_task_repo.list_pending.return_value = [pending]
         mock_monitor.check_pressure.return_value = False
 
         stats = await orchestrator.tick()
 
         assert stats["skipped_pressure"] == 1
+        assert stats["dispatched"] == 0
+        mock_dispatcher.dispatch.assert_not_awaited()
         mock_cleaner.cleanup.assert_awaited_once()
 
     async def test_tick_with_orphans(
@@ -131,6 +163,57 @@ class TestMaxwellOrchestrator:
         assert stats["dispatched"] == 1
         mock_dispatcher.dispatch.assert_awaited_once_with(str(pending.id), "pixav:download")
         mock_task_repo.update_state.assert_awaited_once_with(pending.id, TaskState.DOWNLOADING)
+
+    async def test_tick_upload_task_waits_for_account(
+        self,
+        orchestrator: MaxwellOrchestrator,
+        mock_task_repo: AsyncMock,
+        mock_scheduler: AsyncMock,
+        mock_dispatcher: AsyncMock,
+    ) -> None:
+        pending = Task(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000211"),
+            video_id=uuid.UUID("00000000-0000-0000-0000-000000000212"),
+            state=TaskState.PENDING,
+            queue_name="pixav:upload",
+        )
+        mock_task_repo.count_by_state.return_value = 1
+        mock_task_repo.list_pending.return_value = [pending]
+        mock_scheduler.next_account.side_effect = RuntimeError("no active accounts available for scheduling")
+
+        stats = await orchestrator.tick()
+
+        assert stats["waiting_no_account"] == 1
+        assert stats["failed_no_account"] == 0
+        mock_dispatcher.dispatch.assert_not_awaited()
+        mock_task_repo.update_state.assert_not_awaited()
+
+    async def test_tick_upload_task_fails_when_policy_fail(
+        self,
+        orchestrator_fail_policy: MaxwellOrchestrator,
+        mock_task_repo: AsyncMock,
+        mock_scheduler: AsyncMock,
+        mock_dispatcher: AsyncMock,
+    ) -> None:
+        pending = Task(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000221"),
+            video_id=uuid.UUID("00000000-0000-0000-0000-000000000222"),
+            state=TaskState.PENDING,
+            queue_name="pixav:upload",
+        )
+        mock_task_repo.count_by_state.return_value = 1
+        mock_task_repo.list_pending.return_value = [pending]
+        mock_scheduler.next_account.side_effect = RuntimeError("no active accounts available for scheduling")
+
+        stats = await orchestrator_fail_policy.tick()
+
+        assert stats["failed_no_account"] == 1
+        mock_dispatcher.dispatch.assert_not_awaited()
+        mock_task_repo.update_state.assert_awaited_once_with(
+            pending.id,
+            TaskState.FAILED,
+            error_message="no active accounts available for scheduling",
+        )
 
     async def test_run_gc(
         self,

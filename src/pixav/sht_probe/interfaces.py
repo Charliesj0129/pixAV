@@ -64,14 +64,23 @@ class JackettSearcher(Protocol):
 class FlareSolverSession(Protocol):
     """Protocol for Cloudflare-bypass HTTP sessions."""
 
-    async def get_html(self, url: str, *, timeout: int = 60) -> str:
+    async def get_html(
+        self,
+        url: str,
+        *,
+        timeout: int = 60,
+        cookies: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, str]]:
         """Fetch a page's HTML after solving Cloudflare challenges.
 
         Args:
             url: Target page URL.
             timeout: Max time to wait in seconds.
+            cookies: Optional cookies to seed the session.
+            headers: Optional request headers.
 
         Returns:
-            Decoded HTML string.
+            Tuple of (html_string, cookies_dict).
         """
         ...

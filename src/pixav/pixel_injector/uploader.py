@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from pixav.pixel_injector.adb import AdbConnection
+from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.exceptions import UploadError
 
 logger = logging.getLogger(__name__)
@@ -20,14 +21,21 @@ class UIAutomatorUploader:
     a media scan so Google Photos picks up the file.
     """
 
-    def __init__(self, adb: AdbConnection) -> None:
+    def __init__(
+        self,
+        adb: AdbConnection,
+    ) -> None:
         self._adb = adb
 
-    async def push_file(self, container_id: str, local_path: str) -> str:
+    async def _ensure_connected(self, session: RedroidSession) -> None:
+        """Ensure adb has an active target before issuing commands."""
+        await self._adb.connect(session.adb_host, session.adb_port)
+
+    async def push_file(self, session: RedroidSession, local_path: str) -> str:
         """Push a file to the container via ADB.
 
         Args:
-            container_id: Target container ID (used for logging).
+            session: Target Redroid session.
             local_path: Path to local file.
 
         Returns:
@@ -42,29 +50,31 @@ class UIAutomatorUploader:
         remote_path = f"{_REMOTE_MEDIA_DIR}/{filename}"
 
         try:
+            await self._ensure_connected(session)
             await self._adb.push(local_path, remote_path)
         except Exception as exc:
-            raise UploadError(f"failed to push {local_path} to {container_id}: {exc}") from exc
+            raise UploadError(f"failed to push {local_path} to {session.container_id}: {exc}") from exc
 
-        logger.info("pushed %s → %s in container %s", local_path, remote_path, container_id[:12])
+        logger.info("pushed %s → %s in container %s", local_path, remote_path, session.container_id[:12])
         return remote_path
 
-    async def trigger_upload(self, container_id: str, remote_path: str) -> None:
+    async def trigger_upload(self, session: RedroidSession, remote_path: str) -> None:
         """Trigger media scan and Google Photos upload for a file.
 
         Sends a media scanner broadcast so Google Photos discovers the file.
 
         Args:
-            container_id: Target container ID.
+            session: Target Redroid session.
             remote_path: Path to file within container.
 
         Raises:
             UploadError: If triggering upload fails.
         """
         try:
+            await self._ensure_connected(session)
             # Trigger Android media scanner
             scan_cmd = f"am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE " f'-d "file://{remote_path}"'
             await self._adb.shell(scan_cmd)
-            logger.info("triggered media scan for %s in %s", remote_path, container_id[:12])
+            logger.info("triggered media scan for %s in %s", remote_path, session.container_id[:12])
         except Exception as exc:
-            raise UploadError(f"failed to trigger upload in {container_id}: {exc}") from exc
+            raise UploadError(f"failed to trigger upload in {session.container_id}: {exc}") from exc

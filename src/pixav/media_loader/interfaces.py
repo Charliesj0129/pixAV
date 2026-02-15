@@ -30,6 +30,14 @@ class TorrentClient(Protocol):
         Returns:
             Path to the downloaded content.
         """
+
+    async def delete_torrent(self, torrent_hash: str, delete_files: bool = True) -> None:
+        """Delete a torrent and optionally its files.
+
+        Args:
+            torrent_hash: Hash of the torrent to delete.
+            delete_files: Whether to delete downloaded files (default: True).
+        """
         ...
 
 

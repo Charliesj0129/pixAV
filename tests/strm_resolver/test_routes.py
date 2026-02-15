@@ -71,10 +71,12 @@ async def test_resolve_cache_miss_resolves_and_updates_db(app):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(f"/stream/{video_id}")
+        response = await client.get(f"/resolve/{video_id}")
 
-    assert response.status_code == 302
-    assert response.headers["location"] == "https://lh3.googleusercontent.com/pw/NEW=dv"
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cdn_url"] == "https://lh3.googleusercontent.com/pw/NEW=dv"
+    assert payload["source"] == "resolved"
     app.state.resolver.resolve.assert_awaited_once_with("https://photos.app.goo.gl/share456")
     app.state.db_pool.execute.assert_awaited_once()
     app.state.redis.setex.assert_awaited_once()
@@ -86,6 +88,7 @@ async def test_resolve_not_found(app):
     app.state.db_pool = AsyncMock()
     app.state.db_pool.fetchrow.return_value = None
     app.state.redis = AsyncMock()
+    app.state.redis.get.return_value = None
     app.state.resolver = AsyncMock()
 
     transport = ASGITransport(app=app)
@@ -122,3 +125,75 @@ async def test_resolve_missing_share_url_returns_409(app):
         response = await client.get(f"/resolve/{video_id}")
 
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_stream_video_redirects(app):
+    """Should resolve video and redirect to CDN URL."""
+    video_id = uuid.uuid4()
+    app.state.db_pool = AsyncMock()
+    app.state.db_pool.fetchrow.return_value = {
+        "id": video_id,
+        "share_url": "https://share",
+        "cdn_url": "https://cdn.com/video.mp4?dv",
+    }
+    # Cache hit
+    app.state.redis = AsyncMock()
+    app.state.redis.get.return_value = "https://cdn.com/video.mp4?dv"
+    app.state.resolver = AsyncMock()
+
+    transport = ASGITransport(app=app)
+    # allow_redirects=False to verify the 302 itself
+    async with AsyncClient(transport=transport, base_url="http://test", follow_redirects=False) as client:
+        response = await client.get(f"/stream/{video_id}")
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://cdn.com/video.mp4?dv"
+
+
+@pytest.mark.asyncio
+async def test_resolve_local_scheme_returns_local_endpoint_and_updates_db(app):
+    video_id = uuid.uuid4()
+    app.state.db_pool = AsyncMock()
+    app.state.db_pool.fetchrow.return_value = {
+        "id": video_id,
+        "share_url": f"pixav-local://{video_id}",
+        "cdn_url": None,
+    }
+    app.state.redis = AsyncMock()
+    app.state.redis.get.return_value = None
+    app.state.resolver = AsyncMock()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/resolve/{video_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["video_id"] == str(video_id)
+    assert payload["source"] == "local"
+    assert payload["cdn_url"] == f"http://test/local/{video_id}"
+    app.state.resolver.resolve.assert_not_awaited()
+    app.state.db_pool.execute.assert_awaited_once()
+    app.state.redis.setex.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_local_video_serves_file(app, tmp_path):
+    video_id = uuid.uuid4()
+    file_path = tmp_path / "video.mp4"
+    content = b"local-video-bytes"
+    file_path.write_bytes(content)
+
+    app.state.db_pool = AsyncMock()
+    app.state.db_pool.fetchrow.return_value = {
+        "id": video_id,
+        "local_path": str(file_path),
+    }
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/local/{video_id}")
+
+    assert response.status_code == 200
+    assert response.content == content

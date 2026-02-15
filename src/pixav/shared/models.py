@@ -25,6 +25,11 @@ class Account(BaseModel):
     status: AccountStatus = AccountStatus.ACTIVE
     storage_instance_id: uuid.UUID | None = None
     last_used_at: datetime | None = None
+    cooldown_until: datetime | None = None
+    daily_uploaded_bytes: int = 0
+    daily_quota_bytes: int = 20 * 1024 * 1024 * 1024
+    quota_reset_at: datetime | None = None
+    lease_expires_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -41,6 +46,10 @@ class Video(BaseModel):
     cdn_url: str | None = None
     status: VideoStatus = VideoStatus.DISCOVERED
     metadata_json: str | None = None
+    info_hash: str | None = None
+    quality_score: int = 0
+    tags: list[str] = Field(default_factory=list)
+    embedding: list[float] | None = Field(default=None, exclude=True)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime | None = None
 

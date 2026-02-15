@@ -35,6 +35,7 @@ class TestLruAccountScheduler:
         query = call_args[0][0]
         assert "ORDER BY last_used_at ASC" in query
         assert call_args[0][1] == AccountStatus.ACTIVE.value
+        assert mock_pool.execute.await_count >= 1
 
     async def test_next_account_no_active_raises(self, scheduler: LruAccountScheduler, mock_pool: AsyncMock) -> None:
         mock_pool.fetchrow.return_value = None

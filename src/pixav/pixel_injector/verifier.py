@@ -9,6 +9,7 @@ from typing import Protocol
 
 import httpx
 
+from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.exceptions import VerificationError
 
 logger = logging.getLogger(__name__)
@@ -30,19 +31,25 @@ class GooglePhotosVerifier:
     def __init__(
         self,
         *,
-        adb: _AdbShell | None = None,
+        adb: _AdbClient | None = None,
         timeout: int = 15,
     ) -> None:
         self._adb = adb
         self._http_timeout = timeout
 
-    async def wait_for_share_url(self, container_id: str, timeout: int = 300) -> str:
+    async def _ensure_connected(self, session: RedroidSession) -> None:
+        adb = self._adb
+        if adb is None:
+            raise VerificationError("no ADB connection configured")
+        await adb.connect(session.adb_host, session.adb_port)
+
+    async def wait_for_share_url(self, session: RedroidSession, timeout: int = 300) -> str:
         """Wait for and extract the Google Photos share URL from logcat.
 
         Polls the container's logcat output looking for a share URL pattern.
 
         Args:
-            container_id: Container ID to monitor.
+            session: Active Redroid session.
             timeout: Maximum seconds to wait.
 
         Returns:
@@ -54,6 +61,8 @@ class GooglePhotosVerifier:
         if self._adb is None:
             raise VerificationError("no ADB connection configured")
 
+        await self._ensure_connected(session)
+
         elapsed = 0
         poll_interval = 5
 
@@ -64,15 +73,15 @@ class GooglePhotosVerifier:
                 match = _SHARE_URL_PATTERN.search(output)
                 if match:
                     url = match.group(0)
-                    logger.info("found share URL in %s: %s", container_id[:12], url)
+                    logger.info("found share URL in %s: %s", session.container_id[:12], url)
                     return url
             except Exception as exc:
-                logger.debug("logcat poll error on %s: %s", container_id[:12], exc)
+                logger.debug("logcat poll error on %s: %s", session.container_id[:12], exc)
 
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
 
-        raise VerificationError(f"share URL not found in container {container_id[:12]} after {timeout}s")
+        raise VerificationError(f"share URL not found in container {session.container_id[:12]} after {timeout}s")
 
     async def validate_share_url(self, share_url: str) -> bool:
         """Validate that a share URL is accessible via HTTP HEAD.
@@ -102,5 +111,7 @@ class GooglePhotosVerifier:
             return False
 
 
-class _AdbShell(Protocol):
+class _AdbClient(Protocol):
+    async def connect(self, host: str, port: int) -> None: ...
+
     async def shell(self, cmd: str) -> str: ...

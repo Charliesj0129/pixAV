@@ -40,9 +40,10 @@ services:
       PUID: 1000
       PGID: 1000
       TZ: UTC
-      WEBUI_PORT: 8080
+      # Keep container port == host port to avoid WebUI Host header validation issues.
+      WEBUI_PORT: ${PIXAV_QBIT_PORT:-8085}
     ports:
-      - "8080:8080"
+      - "${PIXAV_QBIT_PORT:-8085}:${PIXAV_QBIT_PORT:-8085}"
       - "6881:6881"
       - "6881:6881/udp"
     volumes:
@@ -50,6 +51,11 @@ services:
       - ./data/downloads:/downloads
     networks:
       - pixav
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${WEBUI_PORT:-8080}/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   jackett:
     image: lscr.io/linuxserver/jackett:latest
@@ -88,6 +94,25 @@ services:
       - ./data/stash:/data
     networks:
       - pixav
+
+  pixel_injector:
+    build:
+      context: .
+      dockerfile: docker/pixel-injector.Dockerfile
+    # Use host network so we can connect to spawned sibling containers on localhost mapped ports
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      PIXAV_DB_HOST: localhost
+      PIXAV_REDIS_URL: redis://localhost:6379/0
+      # Ensure config matches internal docker network
+      PIXAV_QUEUE_UPLOAD: pixav:upload
+      PIXAV_QUEUE_UPLOAD_DLQ: pixav:upload:dlq
+      # PIXAV_REDROID_NETWORK: pixav_pixav # No longer needed if using host ports
 
 volumes:
   pgdata:

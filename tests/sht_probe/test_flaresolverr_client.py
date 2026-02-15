@@ -25,13 +25,15 @@ class TestFlareSolverrSession:
                 "url": "https://target.com/page",
                 "status": 200,
                 "response": "<html><body>Solved!</body></html>",
+                "cookies": [{"name": "cf_clearance", "value": "abc"}],
             },
         }
         respx.post("http://flaresolverr:8191/v1").mock(return_value=httpx.Response(200, json=mock_response))
 
-        html = await session.get_html("https://target.com/page", timeout=30)
+        html, cookies = await session.get_html("https://target.com/page", timeout=30)
         assert "<html>" in html
         assert "Solved!" in html
+        assert cookies == {"cf_clearance": "abc"}
 
     @respx.mock
     async def test_get_html_challenge_failed(self, session: FlareSolverrSession) -> None:
@@ -70,3 +72,37 @@ class TestFlareSolverrSession:
 
         with pytest.raises(CrawlError, match="FlareSolverr request failed"):
             await session.get_html("https://target.com/page")
+
+    @respx.mock
+    async def test_get_html_sends_session_and_cookies(self, session: FlareSolverrSession) -> None:
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal captured
+            captured = request.read().decode("utf-8")
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "solution": {
+                        "status": 200,
+                        "response": "<html>ok</html>",
+                        "cookies": [],
+                    },
+                },
+            )
+
+        respx.post("http://flaresolverr:8191/v1").mock(side_effect=handler)
+
+        await session.get_html(
+            "https://target.com/page",
+            cookies={"foo": "bar"},
+            headers={"Referer": "https://target.com/"},
+        )
+
+        assert isinstance(captured, str)
+        assert '"session"' in captured
+        assert '"cookies"' in captured
+        assert '"foo"' in captured
+        assert '".target.com"' in captured
+        assert '"headers"' in captured

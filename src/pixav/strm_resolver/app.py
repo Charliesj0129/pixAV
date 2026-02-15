@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from redis import asyncio as aioredis
 
 from pixav.config import get_settings
-from pixav.strm_resolver.middleware import RateLimitMiddleware, setup_cors
+from pixav.strm_resolver.middleware import setup_cors
 from pixav.strm_resolver.resolver import GooglePhotosResolver
 from pixav.strm_resolver.routes import router
 
@@ -24,32 +24,35 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     redis_url: str | None = app.state.redis_url
     db_dsn: str | None = app.state.db_dsn
     redis_client: aioredis.Redis | None = None
-    db_pool: asyncpg.Pool | None = None
+    db_pool: asyncpg.Pool = None
 
+    # Initialize resources
     if redis_url:
         try:
             redis_client = aioredis.from_url(redis_url, encoding="utf-8", decode_responses=True)
             await redis_client.ping()
             app.state.redis = redis_client
-        except Exception as exc:  # pragma: no cover - depends on external redis
+        except Exception as exc:
             logger.warning("redis unavailable at startup (%s): %s", redis_url, exc)
             app.state.redis = None
-    else:
-        app.state.redis = None
 
     if db_dsn:
         try:
             db_pool = await asyncpg.create_pool(dsn=db_dsn, min_size=1, max_size=5)
             app.state.db_pool = db_pool
-        except Exception as exc:  # pragma: no cover - depends on external postgres
+        except Exception as exc:
             logger.warning("postgres unavailable at startup (%s): %s", db_dsn, exc)
             app.state.db_pool = None
-    else:
-        app.state.db_pool = None
+
+    # Start resolver client
+    if hasattr(app.state, "resolver"):
+        await app.state.resolver.start()
 
     try:
         yield
     finally:
+        if hasattr(app.state, "resolver"):
+            await app.state.resolver.close()
         if redis_client is not None:
             await redis_client.aclose()
         if db_pool is not None:
@@ -61,16 +64,20 @@ def create_app(
     db_dsn: str | None = "auto",
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
+    settings = get_settings()
     if db_dsn == "auto":
-        db_dsn = get_settings().dsn
+        db_dsn = settings.dsn
 
     app = FastAPI(title="pixAV Strm-Resolver", lifespan=lifespan)
     app.state.redis_url = redis_url
     app.state.db_dsn = db_dsn
     app.state.redis = None
     app.state.db_pool = None
-    app.state.resolver = GooglePhotosResolver()
+    app.state.local_share_scheme = settings.pixel_injector_local_share_scheme
+
+    # Initialize resolver with settings
+    app.state.resolver = GooglePhotosResolver(concurrency=settings.resolver_concurrency)
+
     setup_cors(app)
-    app.add_middleware(RateLimitMiddleware)
     app.include_router(router)
     return app

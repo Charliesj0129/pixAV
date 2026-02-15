@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from pixav.config import Settings, get_settings
+from pixav.shared.cookies import load_cookies
 from pixav.shared.db import create_pool
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
@@ -35,6 +36,13 @@ async def run_once(settings: Settings) -> list[str]:
         # Build optional components
         flaresolverr = FlareSolverrSession(settings.flaresolverr_url) if settings.flaresolverr_url else None
         crawler = HttpxCrawler(flaresolverr=flaresolverr)
+        cookies, source = load_cookies(
+            cookie_header=settings.crawl_cookie_header,
+            cookie_file=settings.crawl_cookie_file,
+        )
+        if cookies:
+            crawler.seed_cookies(cookies)
+            logger.info("seeded %d crawl cookie(s) (%s)", len(cookies), source)
         extractor = BeautifulSoupExtractor()
         jackett = JackettClient(settings.jackett_url, settings.jackett_api_key) if settings.jackett_api_key else None
 
@@ -44,18 +52,48 @@ async def run_once(settings: Settings) -> list[str]:
             crawler=crawler,
             extractor=extractor,
             jackett=jackett,
+            embeddings_enabled=settings.embeddings_enabled,
         )
 
         all_new: list[str] = []
 
         # Crawl seed URLs
-        seed_urls = _parse_seed_urls(settings.crawl_seed_urls)
-        for url in seed_urls:
+        seed_entries = _parse_csv(settings.crawl_seed_urls)
+        for entry in seed_entries:
+            tags: list[str] = []
+            if "|" in entry:
+                url, tag_str = entry.split("|", 1)
+                # Support multiple tags with '+' e.g. "url|tag1+tag2"
+                tags = [t.strip() for t in tag_str.split("+") if t.strip()]
+            else:
+                url = entry.strip()
+
             try:
-                new = await service.run_crawl(url)
+                if not service._crawler:  # Basic check
+                    logger.warning("skipping seed URL %s (no crawler configured)", url)
+                    continue
+
+                new = await service.run_crawl(
+                    url,
+                    link_pattern=settings.crawl_link_filter_pattern,
+                    tags=tags,
+                    max_pages=settings.crawl_max_pages,
+                )
                 all_new.extend(new)
             except Exception as exc:
                 logger.error("crawl failed for %s: %s", url, exc)
+
+        # Search Jackett queries
+        queries = _parse_csv(settings.crawl_queries)
+        for query in queries:
+            try:
+                if not service._jackett:
+                    logger.warning("skipping query %r (no jackett configured)", query)
+                    continue
+                new = await service.run_search(query)
+                all_new.extend(new)
+            except Exception as exc:
+                logger.error("search failed for %r: %s", query, exc)
 
         logger.info("crawl cycle complete: %d new magnets total", len(all_new))
         return all_new
@@ -82,11 +120,11 @@ async def run_loop(settings: Settings) -> None:
         await asyncio.sleep(settings.crawl_interval_seconds)
 
 
-def _parse_seed_urls(raw: str) -> list[str]:
-    """Split comma-separated seed URL string into a list."""
-    if not raw.strip():
+def _parse_csv(raw: str) -> list[str]:
+    """Split comma-separated string into a list."""
+    if not raw or not raw.strip():
         return []
-    return [u.strip() for u in raw.split(",") if u.strip()]
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
 
 def main() -> None:

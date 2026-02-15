@@ -13,6 +13,7 @@ import pytest
 from pixav.shared.enums import TaskState, VideoStatus
 from pixav.shared.models import Task, Video
 from pixav.shared.repository import (
+    AccountRepository,
     TaskRepository,
     VideoRepository,
     _task_from_row,
@@ -84,7 +85,9 @@ class TestVideoFromRow:
         data["embedding"] = [0.1, 0.2, 0.3]
         row = _make_record(data)
         video = _video_from_row(row)
-        assert not hasattr(video, "embedding")
+        # embedding is kept on the model for internal use, but excluded from default dumps.
+        assert video.embedding == [0.1, 0.2, 0.3]
+        assert "embedding" not in video.model_dump()
 
     def test_jsonb_dict_is_serialized(self) -> None:
         data = _sample_video_row()
@@ -149,6 +152,20 @@ class TestVideoRepository:
         await repo.update_status(uuid.uuid4(), VideoStatus.DOWNLOADING)
         pool.execute.assert_awaited_once()
 
+    async def test_update_download_result(self, repo: VideoRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        await repo.update_download_result(
+            uuid.uuid4(),
+            local_path="/data/remuxed/video.mp4",
+            metadata_json='{"found": true}',
+        )
+        pool.execute.assert_awaited_once()
+
+    async def test_update_upload_result(self, repo: VideoRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        await repo.update_upload_result(uuid.uuid4(), share_url="https://photos.app.goo.gl/share")
+        pool.execute.assert_awaited_once()
+
     async def test_count_by_status(self, repo: VideoRepository, pool: AsyncMock) -> None:
         pool.fetchval.return_value = 42
         result = await repo.count_by_status(VideoStatus.DISCOVERED)
@@ -198,6 +215,22 @@ class TestTaskRepository:
         call_args = pool.execute.call_args
         assert call_args[0][3] == "boom"
 
+    async def test_set_retry(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        task_id = uuid.uuid4()
+        await repo.set_retry(
+            task_id,
+            retries=2,
+            state=TaskState.PENDING,
+            error_message="transient failure",
+        )
+        pool.execute.assert_awaited_once()
+        args = pool.execute.call_args[0]
+        assert args[1] == 2
+        assert args[2] == TaskState.PENDING.value
+        assert args[3] == "transient failure"
+        assert args[5] == task_id
+
     async def test_count_by_state(self, repo: TaskRepository, pool: AsyncMock) -> None:
         pool.fetchval.return_value = 7
         result = await repo.count_by_state(TaskState.PENDING)
@@ -226,3 +259,32 @@ class TestTaskRepository:
         result = await repo.has_open_task(uuid.uuid4())
 
         assert result is False
+
+
+class TestAccountRepository:
+    @pytest.fixture()
+    def pool(self) -> AsyncMock:
+        return AsyncMock()
+
+    @pytest.fixture()
+    def repo(self, pool: AsyncMock) -> AccountRepository:
+        return AccountRepository(pool)
+
+    async def test_release_expired_cooldowns_returns_count(self, repo: AccountRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 2"
+
+        count = await repo.release_expired_cooldowns()
+
+        assert count == 2
+        pool.execute.assert_awaited_once()
+
+    async def test_apply_upload_usage_executes_update(self, repo: AccountRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        account_id = uuid.uuid4()
+
+        await repo.apply_upload_usage(account_id, 123456)
+
+        pool.execute.assert_awaited_once()
+        args = pool.execute.call_args[0]
+        assert args[1] == account_id
+        assert args[2] == 123456

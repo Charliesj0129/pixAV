@@ -43,15 +43,19 @@ class RedisTaskDispatcher:
         if queue is None:
             raise ValueError(f"unknown queue: {queue_name}. Known: {list(self._queues.keys())}")
 
-        payload = {
+        payload: dict[str, str | int] = {
             "task_id": task_id,
+            "queue_name": queue_name,
         }
 
         # Optionally enrich with video_id from DB
         task = await self._task_repo.find_by_id(uuid.UUID(task_id))
         if task is not None:
             payload["video_id"] = str(task.video_id)
-            payload["queue_name"] = queue_name
+            payload["retries"] = task.retries
+            payload["max_retries"] = task.max_retries
+            if task.account_id is not None:
+                payload["account_id"] = str(task.account_id)
 
         await queue.push(payload)
         logger.info("dispatched task %s → %s", task_id, queue_name)

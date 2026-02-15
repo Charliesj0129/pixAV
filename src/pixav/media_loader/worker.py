@@ -14,6 +14,7 @@ from pixav.media_loader.remuxer import FFmpegRemuxer
 from pixav.media_loader.service import MediaLoaderService
 from pixav.shared.db import create_pool
 from pixav.shared.enums import TaskState
+from pixav.shared.exceptions import DownloadError
 from pixav.shared.models import Task
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
@@ -35,7 +36,7 @@ async def run_loop(settings: Settings) -> None:
         video_repo = VideoRepository(pool)
         task_repo = TaskRepository(pool)
         download_queue = TaskQueue(redis=redis, queue_name=settings.queue_download)
-        upload_queue = TaskQueue(redis=redis, queue_name=settings.queue_upload)
+        download_dlq_queue = TaskQueue(redis=redis, queue_name=settings.queue_download_dlq)
 
         client = QBitClient(
             base_url=settings.qbit_url,
@@ -43,6 +44,13 @@ async def run_loop(settings: Settings) -> None:
             password=settings.qbit_password,
             download_dir=settings.download_dir,
         )
+        try:
+            version = await client.health_check()
+            logger.info("qBittorrent health check ok (version=%s)", version)
+        except DownloadError as exc:
+            logger.error("qBittorrent health check failed: %s", exc)
+            logger.error("hint: run `uv run python scripts/bootstrap_qbittorrent_webui.py` to set stable credentials")
+            return
         remuxer = FFmpegRemuxer()
         scraper = StashMetadataScraper(settings.stash_url) if settings.stash_url else None
 
@@ -52,8 +60,11 @@ async def run_loop(settings: Settings) -> None:
             scraper=scraper,
             video_repo=video_repo,
             task_repo=task_repo,
-            upload_queue=upload_queue,
+            upload_queue_name=settings.queue_upload,
+            retry_queue=download_queue,
+            dlq_queue=download_dlq_queue,
             output_dir=settings.download_dir,
+            mode=settings.media_loader_mode,
         )
 
         logger.info("media-loader worker started, listening on %s", download_queue.name)
@@ -79,12 +90,19 @@ async def run_loop(settings: Settings) -> None:
                 continue
 
             task_id = _parse_uuid(task_id_raw) or uuid.uuid4()
+            retries = _parse_int(payload.get("retries"), default=0, minimum=0)
+            max_retries = _parse_int(payload.get("max_retries"), default=settings.download_max_retries, minimum=1)
+            queue_name = payload.get("queue_name", settings.queue_download)
+            if not isinstance(queue_name, str) or not queue_name:
+                queue_name = settings.queue_download
 
             task = Task(
                 id=task_id,
                 video_id=video_id,
                 state=TaskState.PENDING,
-                queue_name=settings.queue_download,
+                queue_name=queue_name,
+                retries=retries,
+                max_retries=max_retries,
             )
 
             try:
@@ -110,6 +128,15 @@ def _parse_uuid(val: Any) -> uuid.UUID | None:
         return uuid.UUID(val)
     except (ValueError, AttributeError):
         return None
+
+
+def _parse_int(val: Any, *, default: int, minimum: int) -> int:
+    """Parse arbitrary values into bounded integers."""
+    try:
+        parsed = int(val)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, minimum)
 
 
 def main() -> None:

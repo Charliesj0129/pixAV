@@ -10,6 +10,7 @@ from typing import Any, cast
 from docker.errors import APIError, NotFound
 
 import docker
+from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.exceptions import RedroidError
 
 logger = logging.getLogger(__name__)
@@ -31,10 +32,12 @@ class DockerRedroidManager:
         self,
         image: str,
         *,
+        adb_host: str = "127.0.0.1",
         adb_port_start: int = 5555,
-        network: str = "pixav",
+        network: str | None = None,
     ) -> None:
         self.image = image
+        self._adb_host = adb_host
         self._adb_port = adb_port_start
         self._network = network
         self._docker: Any | None = None
@@ -44,14 +47,14 @@ class DockerRedroidManager:
             self._docker = cast(Any, docker).from_env()
         return self._docker
 
-    async def create(self, task_id: str) -> str:
+    async def create(self, task_id: str) -> RedroidSession:
         """Create a new Redroid container for the given task.
 
         Args:
             task_id: Unique identifier for the upload task.
 
         Returns:
-            Container ID string.
+            Active Redroid session with container and ADB endpoint.
 
         Raises:
             RedroidError: If container creation fails.
@@ -60,22 +63,35 @@ class DockerRedroidManager:
         loop = asyncio.get_running_loop()
 
         try:
+            kwargs: dict[str, Any] = {
+                "name": name,
+                "detach": True,
+                "privileged": True,
+                # Let Docker assign a random host port
+                "ports": {"5555/tcp": None},
+                "labels": {"pixav.task_id": task_id},
+            }
+            if self._network:
+                kwargs["network"] = self._network
+
             container = await loop.run_in_executor(
                 None,
                 partial(
                     self._client().containers.run,
                     self.image,
-                    name=name,
-                    detach=True,
-                    privileged=True,
-                    ports={"5555/tcp": self._adb_port},
-                    network=self._network,
-                    labels={"pixav.task_id": task_id},
+                    **kwargs,
                 ),
             )
             cid = container.id
+            adb_port = _extract_adb_port(container, fallback=self._adb_port, container_name=name)
+            session = RedroidSession(
+                task_id=task_id,
+                container_id=cid,
+                adb_host=self._adb_host,
+                adb_port=adb_port,
+            )
             logger.info("created redroid container %s (%s) for task %s", name, cid[:12], task_id)
-            return cid
+            return session
         except APIError as exc:
             raise RedroidError(f"failed to create container {name}: {exc}") from exc
 
@@ -144,3 +160,19 @@ class DockerRedroidManager:
 
         logger.warning("container %s readiness timed out after %ds", container_id[:12], timeout)
         return False
+
+
+def _extract_adb_port(container: Any, *, fallback: int, container_name: str) -> int:
+    """Resolve mapped host port for container ADB tcp/5555."""
+    try:
+        container.reload()
+        bindings = container.attrs.get("NetworkSettings", {}).get("Ports", {}).get("5555/tcp", [])
+        if bindings:
+            host_port = bindings[0].get("HostPort")
+            if host_port is not None:
+                return int(host_port)
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        logger.warning("failed to read dynamic port for %s: %s", container_name, exc)
+
+    logger.warning("could not read dynamic port for %s, falling back to %d", container_name, fallback)
+    return fallback

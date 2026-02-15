@@ -4,19 +4,22 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from pixav.pixel_injector.session import RedroidSession
+from pixav.shared.models import Task
+
 
 @runtime_checkable
 class RedroidManager(Protocol):
     """Protocol for managing Redroid container lifecycle."""
 
-    async def create(self, task_id: str) -> str:
+    async def create(self, task_id: str) -> RedroidSession:
         """Create a new Redroid container for the given task.
 
         Args:
             task_id: Unique identifier for the upload task
 
         Returns:
-            Container ID string
+            Runtime session info (container + ADB endpoint)
 
         Raises:
             RedroidError: If container creation fails
@@ -54,11 +57,11 @@ class RedroidManager(Protocol):
 class FileUploader(Protocol):
     """Protocol for uploading files to Redroid container."""
 
-    async def push_file(self, container_id: str, local_path: str) -> str:
+    async def push_file(self, session: RedroidSession, local_path: str) -> str:
         """Push a file to the container.
 
         Args:
-            container_id: Target container ID
+            session: Active Redroid session
             local_path: Path to local file
 
         Returns:
@@ -69,11 +72,11 @@ class FileUploader(Protocol):
         """
         ...
 
-    async def trigger_upload(self, container_id: str, remote_path: str) -> None:
+    async def trigger_upload(self, session: RedroidSession, remote_path: str) -> None:
         """Trigger Google Photos upload for a file in the container.
 
         Args:
-            container_id: Target container ID
+            session: Active Redroid session
             remote_path: Path to file within container
 
         Raises:
@@ -86,11 +89,11 @@ class FileUploader(Protocol):
 class UploadVerifier(Protocol):
     """Protocol for verifying Google Photos uploads."""
 
-    async def wait_for_share_url(self, container_id: str, timeout: int = 300) -> str:
+    async def wait_for_share_url(self, session: RedroidSession, timeout: int = 300) -> str:
         """Wait for and extract the Google Photos share URL.
 
         Args:
-            container_id: Container ID to monitor
+            session: Active Redroid session
             timeout: Maximum seconds to wait
 
         Returns:
@@ -111,3 +114,10 @@ class UploadVerifier(Protocol):
             True if URL is valid and accessible, False otherwise
         """
         ...
+
+
+@runtime_checkable
+class PixelInjector(Protocol):
+    """Protocol for upload orchestration services (real or local/dev)."""
+
+    async def process_task(self, task: Task) -> Task: ...

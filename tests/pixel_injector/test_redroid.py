@@ -15,8 +15,12 @@ def mock_container() -> MagicMock:
     c = MagicMock()
     c.id = "abc123def456"
     c.status = "running"
-    c.attrs = {"State": {"Health": {"Status": "none"}}}
+    c.attrs = {
+        "State": {"Health": {"Status": "none"}},
+        "NetworkSettings": {"Ports": {"5555/tcp": [{"HostIp": "127.0.0.1", "HostPort": "32768"}]}},
+    }
     c.remove = MagicMock()
+    c.reload = MagicMock()
     return c
 
 
@@ -37,9 +41,11 @@ def manager(mock_docker: MagicMock) -> DockerRedroidManager:
 
 class TestDockerRedroidManager:
     async def test_create_success(self, manager: DockerRedroidManager, mock_docker: MagicMock) -> None:
-        cid = await manager.create("task-001-abcdef")
+        session = await manager.create("task-001-abcdef")
 
-        assert cid == "abc123def456"
+        assert session.container_id == "abc123def456"
+        assert session.adb_host == "127.0.0.1"
+        assert session.adb_port == 32768
         mock_docker.containers.run.assert_called_once()
 
     async def test_create_api_error(self, manager: DockerRedroidManager, mock_docker: MagicMock) -> None:

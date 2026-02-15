@@ -49,7 +49,7 @@ def mock_jackett() -> AsyncMock:
         {
             "title": "Jackett Video",
             "magnet_uri": "magnet:?xt=urn:btih:jackett123",
-            "size": 1024,
+            "size": 2 * 1024**3,  # 2 GB
             "seeders": 5,
         }
     ]
@@ -73,7 +73,7 @@ class TestShtProbeService:
 
         result = await service.run_crawl("https://example.com")
 
-        mock_crawler.crawl.assert_awaited_once_with("https://example.com")
+        mock_crawler.crawl.assert_awaited_once_with("https://example.com", None)
         assert len(result) == 1
         assert "newmag" in result[0]
 
@@ -83,6 +83,24 @@ class TestShtProbeService:
         push_payload = mock_queue.push.call_args[0][0]
         assert "video_id" in push_payload
         assert "magnet_uri" in push_payload
+
+    async def test_run_crawl_persists_tags(
+        self,
+        mock_video_repo: AsyncMock,
+        mock_queue: AsyncMock,
+        mock_crawler: AsyncMock,
+    ) -> None:
+        mock_crawler.crawl.return_value = []
+        mock_crawler.fetch_page_html.return_value = '<a href="magnet:?xt=urn:btih:newmag">Magnet</a>'
+        mock_video_repo.find_by_info_hash.return_value = None
+        mock_video_repo.insert.return_value = None
+
+        service = ShtProbeService(video_repo=mock_video_repo, queue=mock_queue, crawler=mock_crawler)
+        await service.run_crawl("http://seed", tags=["tag1", "tag2"])
+
+        mock_video_repo.insert.assert_awaited_once()
+        inserted_video = mock_video_repo.insert.call_args[0][0]
+        assert inserted_video.tags == ["tag1", "tag2"]
 
     async def test_run_crawl_skips_existing_magnets(
         self,

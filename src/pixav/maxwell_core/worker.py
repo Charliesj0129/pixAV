@@ -7,6 +7,8 @@ import logging
 import uuid
 from typing import Any
 
+import redis.asyncio as aioredis
+
 from pixav.config import Settings, get_settings
 from pixav.maxwell_core.backpressure import QueueDepthMonitor
 from pixav.maxwell_core.dispatcher import RedisTaskDispatcher
@@ -32,12 +34,24 @@ def _parse_uuid(value: Any) -> uuid.UUID | None:
         return None
 
 
+def _is_paused_value(raw: Any) -> bool:
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _is_paused(redis: aioredis.Redis, pause_key: str) -> bool:
+    value = await redis.get(pause_key)
+    return _is_paused_value(value)
+
+
 async def ingest_crawl_queue(
     *,
     crawl_queue: TaskQueue,
     task_repo: TaskRepository,
     video_repo: VideoRepository,
     download_queue_name: str,
+    max_retries: int = 10,
     batch_size: int = 100,
 ) -> int:
     """Drain crawl queue payloads and create pending download tasks."""
@@ -66,6 +80,7 @@ async def ingest_crawl_queue(
                 video_id=video_id,
                 state=TaskState.PENDING,
                 queue_name=download_queue_name,
+                max_retries=max_retries,
             )
         )
         created += 1
@@ -107,17 +122,24 @@ async def run_loop(settings: Settings, *, interval: int = 30) -> None:
             video_repo=video_repo,
             download_queue_name=settings.queue_download,
             upload_queue_name=settings.queue_upload,
+            no_account_policy=settings.no_account_policy,
         )
 
         logger.info("maxwell-core worker started (interval=%ds)", interval)
 
         while True:
             try:
+                if await _is_paused(redis, settings.system_pause_key):
+                    logger.info("system paused via redis key %s; skip tick", settings.system_pause_key)
+                    await asyncio.sleep(min(interval, 5))
+                    continue
+
                 created = await ingest_crawl_queue(
                     crawl_queue=crawl_queue,
                     task_repo=task_repo,
                     video_repo=video_repo,
                     download_queue_name=settings.queue_download,
+                    max_retries=settings.download_max_retries,
                 )
                 stats = await orchestrator.tick()
                 if created:

@@ -21,8 +21,9 @@ class LruAccountScheduler:
     ``last_used_at`` ascending (oldest first = least recently used).
     """
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, *, lease_seconds: int = 600) -> None:
         self._pool = pool
+        self._lease_seconds = lease_seconds
 
     async def next_account(self) -> str:
         """Return the account ID least recently used for uploading.
@@ -33,14 +34,46 @@ class LruAccountScheduler:
         Raises:
             RuntimeError: If no active accounts are available.
         """
-        row = await self._pool.fetchrow(
+        await self._pool.execute(
             """
-            SELECT id FROM accounts
-             WHERE status = $1
-             ORDER BY last_used_at ASC NULLS FIRST
-             LIMIT 1
+            UPDATE accounts
+               SET status = $1,
+                   cooldown_until = NULL,
+                   lease_expires_at = NULL,
+                   daily_uploaded_bytes = 0,
+                   quota_reset_at = date_trunc('day', now()) + interval '1 day'
+             WHERE status = $2
+               AND cooldown_until IS NOT NULL
+               AND cooldown_until <= now()
             """,
             AccountStatus.ACTIVE.value,
+            AccountStatus.COOLDOWN.value,
+        )
+
+        row = await self._pool.fetchrow(
+            """
+            WITH candidate AS (
+                SELECT id
+                  FROM accounts
+                 WHERE status = $1
+                   AND (cooldown_until IS NULL OR cooldown_until <= now())
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+                   AND (
+                        quota_reset_at <= now()
+                        OR daily_uploaded_bytes < daily_quota_bytes
+                   )
+                 ORDER BY last_used_at ASC NULLS FIRST
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+            )
+            UPDATE accounts AS a
+               SET lease_expires_at = now() + ($2 * interval '1 second')
+              FROM candidate
+             WHERE a.id = candidate.id
+            RETURNING a.id
+            """,
+            AccountStatus.ACTIVE.value,
+            self._lease_seconds,
         )
         if row is None:
             raise RuntimeError("no active accounts available for scheduling")
@@ -56,7 +89,12 @@ class LruAccountScheduler:
             account_id: UUID string of the account to mark.
         """
         await self._pool.execute(
-            "UPDATE accounts SET last_used_at = now() WHERE id = $1",
+            """
+            UPDATE accounts
+               SET last_used_at = now(),
+                   lease_expires_at = NULL
+             WHERE id = $1
+            """,
             uuid.UUID(account_id),
         )
 

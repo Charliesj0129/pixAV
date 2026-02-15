@@ -40,6 +40,31 @@ class TestExtractHash:
 
 class TestQBitClient:
     @respx.mock
+    async def test_health_check_success(self, client: QBitClient) -> None:
+        respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=httpx.Response(200, text="Ok."))
+        respx.get("http://qbit:8080/api/v2/app/version").mock(return_value=httpx.Response(200, text="5.0.5"))
+
+        version = await client.health_check()
+
+        assert version == "5.0.5"
+
+    @respx.mock
+    async def test_health_check_wrong_endpoint(self, client: QBitClient) -> None:
+        respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=httpx.Response(200, text="Ok."))
+        respx.get("http://qbit:8080/api/v2/app/version").mock(return_value=httpx.Response(404, text="Not found"))
+
+        with pytest.raises(DownloadError, match="does not expose /api/v2/app/version"):
+            await client.health_check()
+
+    @respx.mock
+    async def test_health_check_auth_fails(self, client: QBitClient) -> None:
+        respx.get("http://qbit:8080/api/v2/app/version").mock(return_value=httpx.Response(200, text="5.0.5"))
+        respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=httpx.Response(200, text="Fails."))
+
+        with pytest.raises(DownloadError, match="login failed"):
+            await client.health_check()
+
+    @respx.mock
     async def test_add_magnet_success(self, client: QBitClient) -> None:
         # Login
         login_route = respx.post("http://qbit:8080/api/v2/auth/login").mock(

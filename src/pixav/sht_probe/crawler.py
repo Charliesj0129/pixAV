@@ -31,12 +31,19 @@ class HttpxCrawler:
     ) -> None:
         self._flaresolverr = flaresolverr
         self._timeout = timeout
+        self._cookies: dict[str, str] = {}
 
-    async def crawl(self, url: str) -> list[str]:
+    def seed_cookies(self, cookies: dict[str, str]) -> None:
+        """Seed the crawler cookie jar (e.g. from a browser session export)."""
+        if cookies:
+            self._cookies.update(cookies)
+
+    async def crawl(self, url: str, link_pattern: str | None = None) -> list[str]:
         """Fetch a seed URL and extract all internal page links.
 
         Args:
             url: Seed URL to crawl.
+            link_pattern: Optional regex pattern to filter links.
 
         Returns:
             List of absolute page URLs discovered.
@@ -45,7 +52,7 @@ class HttpxCrawler:
             CrawlError: If both direct and FlareSolverr fetches fail.
         """
         html = await self._fetch_html(url)
-        return self._extract_links(html, url)
+        return self._extract_links(html, url, link_pattern)
 
     async def fetch_page_html(self, url: str) -> str:
         """Public helper: fetch a single page's HTML (for magnet extraction).
@@ -59,23 +66,41 @@ class HttpxCrawler:
         return await self._fetch_html(url)
 
     async def _fetch_html(self, url: str) -> str:
-        """Try direct httpx first, fallback to FlareSolverr on failure."""
+        """Try direct httpx first, fallback to FlareSolverr on failure.
+
+        If FlareSolverr succeeds, cache the cookies for future direct requests.
+        """
         try:
-            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                follow_redirects=True,
+                cookies=self._cookies,
+                headers={"User-Agent": "Mozilla/5.0"},  # Basic evasion
+            ) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
+                # Update cookies if server sent new ones
+                self._cookies.update(resp.cookies)
                 return resp.text
         except httpx.HTTPError as direct_err:
             logger.warning("direct fetch failed for %s: %s", url, direct_err)
             if self._flaresolverr is None:
                 raise CrawlError(f"direct fetch failed and no FlareSolverr configured: {direct_err}") from direct_err
+
             logger.info("falling back to FlareSolverr for %s", url)
-            return await self._flaresolverr.get_html(url)
+            html, cookies = await self._flaresolverr.get_html(url, cookies=self._cookies)
+            if cookies:
+                self._cookies.update(cookies)
+                logger.info("cached %d cookies from FlareSolverr", len(cookies))
+            return html
 
     @staticmethod
-    def _extract_links(html: str, base_url: str) -> list[str]:
-        """Parse HTML and return absolute <a href> links from the same domain."""
+    def _extract_links(html: str, base_url: str, link_pattern: str | None = None) -> list[str]:
+        """Parse HTML and return links, optionally filtered by regex."""
+        import re
         from urllib.parse import urljoin, urlparse
+
+        pattern = re.compile(link_pattern) if link_pattern else None
 
         base_domain = urlparse(base_url).netloc
         soup = BeautifulSoup(html, "lxml")
@@ -91,8 +116,14 @@ class HttpxCrawler:
             absolute = urljoin(base_url, href)
             parsed = urlparse(absolute)
             if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
-                # Remove fragments for dedup
-                links.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}")
+                # Apply optional regex filter
+                full_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                if parsed.query:
+                    full_url = f"{full_url}?{parsed.query}"
+                if pattern and not pattern.search(full_url):
+                    continue
+                links.add(full_url)
 
         logger.debug("extracted %d links from %s", len(links), base_url)
-        return list(links)
+        # Deterministic ordering improves debuggability and keeps max_pages slicing stable.
+        return sorted(links)
