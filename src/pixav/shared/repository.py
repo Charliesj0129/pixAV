@@ -312,8 +312,9 @@ class TaskRepository:
         row = await self._pool.fetchrow(
             """
             INSERT INTO tasks (id, video_id, account_id, state, queue_name,
-                               retries, max_retries, error_message, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                               local_path, share_url, retries, max_retries, error_message,
+                               trace_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING *
             """,
             task.id,
@@ -321,9 +322,12 @@ class TaskRepository:
             task.account_id,
             task.state.value,
             task.queue_name,
+            task.local_path,
+            task.share_url,
             task.retries,
             task.max_retries,
             task.error_message,
+            task.trace_id,
             task.created_at,
             task.updated_at,
         )
