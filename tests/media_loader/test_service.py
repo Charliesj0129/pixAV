@@ -134,6 +134,7 @@ class TestMediaLoaderService:
         service: MediaLoaderService,
         sample_task: Task,
         mock_video_repo: AsyncMock,
+        mock_task_repo: AsyncMock,
     ) -> None:
         mock_video_repo.find_by_id.return_value = None
 
@@ -141,12 +142,15 @@ class TestMediaLoaderService:
 
         assert result.state == TaskState.FAILED
         assert "not found" in (result.error_message or "")
+        mock_task_repo.update_state.assert_awaited_once()
+        mock_video_repo.update_status.assert_not_awaited()
 
     async def test_process_task_no_magnet(
         self,
         service: MediaLoaderService,
         sample_task: Task,
         mock_video_repo: AsyncMock,
+        mock_task_repo: AsyncMock,
     ) -> None:
         mock_video_repo.find_by_id.return_value = Video(
             title="No Magnet",
@@ -158,6 +162,8 @@ class TestMediaLoaderService:
 
         assert result.state == TaskState.FAILED
         assert "no magnet_uri" in (result.error_message or "")
+        mock_task_repo.update_state.assert_awaited_once()
+        mock_video_repo.update_status.assert_awaited_once_with(sample_task.video_id, VideoStatus.FAILED)
 
     async def test_process_task_download_fails(
         self,

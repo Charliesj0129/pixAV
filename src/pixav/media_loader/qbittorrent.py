@@ -71,8 +71,7 @@ class QBitClient:
                 version_resp = await client.get(f"{self._base_url}/api/v2/app/version")
                 if version_resp.status_code == 404:
                     raise DownloadError(
-                        f"qBittorrent health check failed: {self._base_url} "
-                        "does not expose /api/v2/app/version (404)"
+                        f"qBittorrent health check failed: {self._base_url} does not expose /api/v2/app/version (404)"
                     )
                 if version_resp.status_code in {401, 403}:
                     raise DownloadError("qBittorrent health check failed: unauthorized even after login")

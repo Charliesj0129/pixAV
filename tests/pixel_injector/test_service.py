@@ -12,7 +12,7 @@ from pixav.pixel_injector.service import PixelInjectorService
 from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import RedroidError, UploadError, VerificationError
-from pixav.shared.models import Task
+from pixav.shared.models import Account, Task
 
 
 @pytest.fixture
@@ -67,16 +67,22 @@ def sample_task() -> Task:
     )
 
 
+@pytest.fixture
+def sample_account() -> Account:
+    return Account(email="test@example.com", password="password")
+
+
 @pytest.mark.asyncio
 async def test_process_task_happy_path(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     redroid_session: RedroidSession,
     mock_redroid: AsyncMock,
     mock_uploader: AsyncMock,
     mock_verifier: AsyncMock,
 ) -> None:
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     mock_redroid.create.assert_called_once_with(str(sample_task.id))
     mock_redroid.wait_ready.assert_called_once_with("container-123", timeout=120)
@@ -95,11 +101,12 @@ async def test_process_task_happy_path(
 async def test_process_task_redroid_create_fails(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
 ) -> None:
     mock_redroid.create.side_effect = RedroidError("failed to create container")
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.share_url is None
@@ -111,12 +118,13 @@ async def test_process_task_redroid_create_fails(
 async def test_process_task_upload_fails(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
     mock_uploader: AsyncMock,
 ) -> None:
     mock_uploader.trigger_upload.side_effect = UploadError("upload failed")
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.share_url is None
@@ -128,12 +136,13 @@ async def test_process_task_upload_fails(
 async def test_process_task_verification_fails(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
     mock_verifier: AsyncMock,
 ) -> None:
     mock_verifier.validate_share_url.return_value = False
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.share_url is None
@@ -145,12 +154,13 @@ async def test_process_task_verification_fails(
 async def test_process_task_always_destroys_container(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
     mock_uploader: AsyncMock,
 ) -> None:
     mock_uploader.push_file.side_effect = UploadError("push failed")
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     mock_redroid.destroy.assert_called_once_with("container-123")
     assert result.state == TaskState.FAILED
@@ -160,11 +170,12 @@ async def test_process_task_always_destroys_container(
 async def test_process_task_wait_ready_timeout(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
 ) -> None:
     mock_redroid.wait_ready.return_value = False
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.share_url is None
@@ -175,12 +186,13 @@ async def test_process_task_wait_ready_timeout(
 async def test_process_task_verification_error(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
     mock_verifier: AsyncMock,
 ) -> None:
     mock_verifier.wait_for_share_url.side_effect = VerificationError("timeout waiting for share url")
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.share_url is None
@@ -191,11 +203,12 @@ async def test_process_task_verification_error(
 async def test_process_task_missing_local_path_fails_fast(
     service: PixelInjectorService,
     sample_task: Task,
+    sample_account: Account,
     mock_redroid: AsyncMock,
 ) -> None:
     missing_path_task = sample_task.model_copy(update={"local_path": None})
 
-    result = await service.process_task(missing_path_task)
+    result = await service.process_task(missing_path_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.error_message == "local_path is required for upload tasks"
@@ -208,6 +221,7 @@ async def test_process_task_timeout_marks_failed(
     mock_uploader: AsyncMock,
     mock_verifier: AsyncMock,
     sample_task: Task,
+    sample_account: Account,
 ) -> None:
     service = PixelInjectorService(
         redroid=mock_redroid,
@@ -221,7 +235,7 @@ async def test_process_task_timeout_marks_failed(
 
     mock_uploader.trigger_upload.side_effect = _slow_trigger
 
-    result = await service.process_task(sample_task)
+    result = await service.process_task(sample_task, sample_account)
 
     assert result.state == TaskState.FAILED
     assert result.error_message == "upload timed out after 1s"

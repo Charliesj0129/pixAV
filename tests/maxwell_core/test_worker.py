@@ -14,8 +14,8 @@ class TestIngestCrawlQueue:
     async def test_creates_pending_task_from_valid_payload(self) -> None:
         video_id = uuid.uuid4()
         crawl_queue = AsyncMock()
-        crawl_queue.pop.side_effect = [
-            {"video_id": str(video_id), "magnet_uri": "magnet:?xt=urn:btih:abc"},
+        crawl_queue.pop_claim.side_effect = [
+            ({"video_id": str(video_id), "magnet_uri": "magnet:?xt=urn:btih:abc"}, "receipt-1"),
             None,
         ]
 
@@ -46,7 +46,7 @@ class TestIngestCrawlQueue:
 
     async def test_skips_invalid_video_id(self) -> None:
         crawl_queue = AsyncMock()
-        crawl_queue.pop.side_effect = [{"video_id": "bad-uuid"}, None]
+        crawl_queue.pop_claim.side_effect = [({"video_id": "bad-uuid"}, "receipt-1"), None]
 
         task_repo = AsyncMock()
         video_repo = AsyncMock()
@@ -64,7 +64,7 @@ class TestIngestCrawlQueue:
     async def test_skips_missing_video(self) -> None:
         video_id = uuid.uuid4()
         crawl_queue = AsyncMock()
-        crawl_queue.pop.side_effect = [{"video_id": str(video_id)}, None]
+        crawl_queue.pop_claim.side_effect = [({"video_id": str(video_id)}, "receipt-1"), None]
 
         task_repo = AsyncMock()
         video_repo = AsyncMock()
@@ -83,7 +83,7 @@ class TestIngestCrawlQueue:
     async def test_skips_when_open_task_exists(self) -> None:
         video_id = uuid.uuid4()
         crawl_queue = AsyncMock()
-        crawl_queue.pop.side_effect = [{"video_id": str(video_id)}, None]
+        crawl_queue.pop_claim.side_effect = [({"video_id": str(video_id)}, "receipt-1"), None]
 
         task_repo = AsyncMock()
         task_repo.has_open_task.return_value = True

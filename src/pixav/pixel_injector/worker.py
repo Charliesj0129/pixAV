@@ -33,11 +33,16 @@ logger = logging.getLogger(__name__)
 
 def _task_from_payload(payload: dict[str, Any], *, default_max_retries: int) -> Task:
     """Convert queue payload into a typed Task model."""
+    import uuid as _uuid
+
     normalized = dict(payload)
     if "task_id" in normalized and "id" not in normalized:
         normalized["id"] = normalized.pop("task_id")
     normalized.setdefault("retries", 0)
     normalized.setdefault("max_retries", default_max_retries)
+    # Preserve trace_id from upstream; generate fresh one if absent
+    if not isinstance(normalized.get("trace_id"), str) or not normalized.get("trace_id"):
+        normalized["trace_id"] = str(_uuid.uuid4())
     return Task.model_validate(normalized)
 
 
@@ -48,6 +53,7 @@ def _build_retry_payload(task: Task, retries: int) -> dict[str, str | int]:
         "queue_name": task.queue_name,
         "retries": retries,
         "max_retries": task.max_retries,
+        "trace_id": task.trace_id,
     }
     if task.local_path:
         payload["local_path"] = task.local_path
@@ -67,6 +73,7 @@ def _build_dlq_payload(task: Task, error_message: str) -> dict[str, str | int]:
         "error_message": error_message,
         "failed_at": datetime.now(timezone.utc).isoformat(),
         "dlq_replays": 0,
+        "trace_id": task.trace_id,
     }
     if task.account_id is not None:
         payload["account_id"] = str(task.account_id)
@@ -248,6 +255,15 @@ async def _hydrate_local_path(task: Task, *, video_repo: VideoRepository | None)
     return task.model_copy(update={"local_path": video.local_path})
 
 
+async def _is_terminal_task(task: Task, *, task_repo: TaskRepository | None) -> bool:
+    if task_repo is None:
+        return False
+    current = await task_repo.find_by_id(task.id)
+    if current is None:
+        return False
+    return current.state in {TaskState.COMPLETE, TaskState.FAILED}
+
+
 async def _mark_uploading(task: Task, *, task_repo: TaskRepository | None, video_repo: VideoRepository | None) -> None:
     if task_repo is not None:
         await task_repo.update_state(task.id, TaskState.UPLOADING)
@@ -269,7 +285,7 @@ async def _persist_success(
     if account_repo is not None and result.account_id is not None:
         uploaded_bytes = _uploaded_bytes_from_task(result)
         await account_repo.apply_upload_usage(result.account_id, uploaded_bytes)
-    logger.info("task %s complete", result.id)
+    logger.info("task %s complete (trace_id=%s)", result.id, result.trace_id)
 
 
 async def _persist_failure(
@@ -353,11 +369,19 @@ async def run_worker(  # noqa: C901
         dlq_replay_schedule_key = f"{queue.name}:dlq:replay"
 
     logger.info("pixel injector worker starting on queue %s", queue.name)
+    try:
+        recovered = int(await queue.requeue_inflight())
+    except (TypeError, ValueError):
+        recovered = 0
+    if recovered:
+        logger.warning("requeued %d in-flight payload(s) on %s", recovered, queue.name)
     while True:
         if stop_event is not None and stop_event.is_set():
             logger.info("stop_event set; shutting down worker")
             return
 
+        receipt: str | None = None
+        acked = False
         try:
             if redis_client is not None and await _is_paused(redis_client, pause_key):
                 logger.info("system paused via redis key %s; skip polling", pause_key)
@@ -383,9 +407,10 @@ async def run_worker(  # noqa: C901
                 if replayed > 0:
                     logger.warning("replayed %d task(s) from scheduled upload DLQ", replayed)
 
-            payload = await queue.pop(timeout=poll_timeout)
-            if payload is None:
+            claimed = await queue.pop_claim(timeout=poll_timeout)
+            if claimed is None:
                 continue
+            payload, receipt = claimed
 
             lock_token: str | None = None
             if enforce_single_flight and redis_client is not None:
@@ -397,7 +422,8 @@ async def run_worker(  # noqa: C901
                     ttl_seconds=upload_lock_ttl_seconds,
                 )
                 if not acquired:
-                    await queue.push(payload)
+                    await queue.nack(receipt, requeue=True)
+                    acked = True
                     logger.info("upload lock busy (%s), payload requeued", upload_lock_key)
                     await asyncio.sleep(1)
                     continue
@@ -405,33 +431,17 @@ async def run_worker(  # noqa: C901
 
             try:
                 task = _task_from_payload(payload, default_max_retries=default_max_retries)
-                task = await _hydrate_local_path(task, video_repo=video_repo)
-                if not task.local_path:
-                    result = task.model_copy(
-                        update={
-                            "state": TaskState.FAILED,
-                            "error_message": "video local_path is missing",
-                        }
-                    )
-                    dlq_payload = await _persist_failure(
-                        result,
-                        task_repo=task_repo,
-                        video_repo=video_repo,
-                        retry_queue=retry_queue,
-                        dlq_queue=dlq_queue,
-                    )
+                if await _is_terminal_task(task, task_repo=task_repo):
+                    logger.info("drop duplicate payload for terminal task %s", task.id)
                 else:
-                    await _mark_uploading(task, task_repo=task_repo, video_repo=video_repo)
-                    result = await service.process_task(task)
-                    if result.state == TaskState.COMPLETE and result.share_url:
-                        await _persist_success(
-                            result,
-                            task_repo=task_repo,
-                            video_repo=video_repo,
-                            account_repo=account_repo,
+                    task = await _hydrate_local_path(task, video_repo=video_repo)
+                    if not task.local_path:
+                        result = task.model_copy(
+                            update={
+                                "state": TaskState.FAILED,
+                                "error_message": "video local_path is missing",
+                            }
                         )
-                        dlq_payload = None
-                    else:
                         dlq_payload = await _persist_failure(
                             result,
                             task_repo=task_repo,
@@ -439,26 +449,50 @@ async def run_worker(  # noqa: C901
                             retry_queue=retry_queue,
                             dlq_queue=dlq_queue,
                         )
+                    else:
+                        await _mark_uploading(task, task_repo=task_repo, video_repo=video_repo)
+                        
+                        account = None
+                        if task.account_id is not None and account_repo is not None:
+                            account = await account_repo.find_by_id(task.account_id)
+                            
+                        result = await service.process_task(task, account)
+                        if result.state == TaskState.COMPLETE and result.share_url:
+                            await _persist_success(
+                                result,
+                                task_repo=task_repo,
+                                video_repo=video_repo,
+                                account_repo=account_repo,
+                            )
+                            dlq_payload = None
+                        else:
+                            dlq_payload = await _persist_failure(
+                                result,
+                                task_repo=task_repo,
+                                video_repo=video_repo,
+                                retry_queue=retry_queue,
+                                dlq_queue=dlq_queue,
+                            )
 
-                if (
-                    dlq_payload is not None
-                    and redis_client is not None
-                    and dlq_replay_enabled
-                    and dlq_replay_max > 0
-                    and dlq_queue is not None
-                ):
-                    scheduled = await _schedule_dlq_replay(
-                        redis_client=redis_client,
-                        schedule_key=dlq_replay_schedule_key,
-                        dlq_payload=dlq_payload,
-                        backoff_seconds=dlq_replay_backoff_seconds,
-                        max_replays=dlq_replay_max,
-                    )
-                    if scheduled:
-                        logger.warning(
-                            "task %s scheduled for delayed DLQ replay",
-                            dlq_payload.get("task_id", "unknown"),
+                    if (
+                        dlq_payload is not None
+                        and redis_client is not None
+                        and dlq_replay_enabled
+                        and dlq_replay_max > 0
+                        and dlq_queue is not None
+                    ):
+                        scheduled = await _schedule_dlq_replay(
+                            redis_client=redis_client,
+                            schedule_key=dlq_replay_schedule_key,
+                            dlq_payload=dlq_payload,
+                            backoff_seconds=dlq_replay_backoff_seconds,
+                            max_replays=dlq_replay_max,
                         )
+                        if scheduled:
+                            logger.warning(
+                                "task %s scheduled for delayed DLQ replay",
+                                dlq_payload.get("task_id", "unknown"),
+                            )
             finally:
                 if lock_token is not None and redis_client is not None:
                     await _release_upload_lock(
@@ -466,10 +500,23 @@ async def run_worker(  # noqa: C901
                         lock_key=upload_lock_key,
                         lock_token=lock_token,
                     )
+            if receipt is not None and not acked:
+                await queue.ack(receipt)
+                acked = True
         except ValidationError as exc:
             logger.error("invalid upload payload: %s", exc)
+            if receipt is not None and not acked:
+                try:
+                    await queue.ack(receipt)
+                except Exception as ack_exc:  # pragma: no cover - defensive logging
+                    logger.error("failed to ack invalid payload: %s", ack_exc)
         except Exception as exc:  # pragma: no cover - long running worker resilience
             logger.exception("worker loop error: %s", exc)
+            if receipt is not None and not acked:
+                try:
+                    await queue.nack(receipt, requeue=True)
+                except Exception as nack_exc:
+                    logger.error("failed to nack payload after worker error: %s", nack_exc)
             await asyncio.sleep(1)
 
 
@@ -527,8 +574,38 @@ async def run_from_settings(settings: Settings) -> None:
 
 
 def main() -> None:
+    import uvicorn
+
+    from pixav.shared.health import create_health_app
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(run_from_settings(get_settings()))
+    settings = get_settings()
+    health_app = create_health_app("pixel_injector")
+
+    async def _run() -> None:
+        config = uvicorn.Config(
+            health_app,
+            host=settings.health_host,
+            port=settings.pixel_injector_health_port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        worker_task = asyncio.ensure_future(run_from_settings(settings))
+        server_task = asyncio.ensure_future(server.serve())
+        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: S110
+                pass
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                raise exc
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

@@ -58,9 +58,9 @@ class MediaLoaderService:
         """Process a single download task from the crawl queue."""
         video = await self._video_repo.find_by_id(task.video_id)
         if not video:
-            return self._fail_task(task, f"video {task.video_id} not found in DB", fatal=True)
+            return await self._fail_task(task, f"video {task.video_id} not found in DB")
         if not video.magnet_uri:
-            return self._fail_task(task, "video has no magnet_uri", fatal=True)
+            return await self._fail_task(task, "video has no magnet_uri", persist_video_failure=True)
 
         # Fast path: resume a previously downloaded/remuxed video.
         if video.local_path and os.path.isfile(video.local_path):
@@ -165,11 +165,11 @@ class MediaLoaderService:
             }
         )
 
-    def _fail_task(self, task: Task, msg: str, fatal: bool = False) -> Task:
-        """Immediate failure helper (non-async for pre-checks)."""
-        # Note: In a real app we might want to update DB here, but strict
-        # signature expects Task return. The calling code handles state if needed.
-        # But for 'fatal' pre-checks (no video/magnet), we usually just return FAILED state.
+    async def _fail_task(self, task: Task, msg: str, *, persist_video_failure: bool = False) -> Task:
+        """Persist and return an immediate FAILED task result."""
+        await self._task_repo.update_state(task.id, TaskState.FAILED, error_message=msg)
+        if persist_video_failure:
+            await self._video_repo.update_status(task.video_id, VideoStatus.FAILED)
         return task.model_copy(update={"state": TaskState.FAILED, "error_message": msg})
 
     async def _handle_processing_error(self, task: Task, exc: Exception) -> Task:

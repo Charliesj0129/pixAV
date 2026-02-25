@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     resolver_host: str = "0.0.0.0"
     resolver_port: int = 8000
 
+    # Health endpoints (each worker exposes /health and /metrics on its port)
+    maxwell_core_health_port: int = 8001
+    media_loader_health_port: int = 8002
+    pixel_injector_health_port: int = 8003
+    sht_probe_health_port: int = 8004
+    health_host: str = "0.0.0.0"
+
     # Stash
     stash_url: str = "http://localhost:9999"
 
@@ -68,12 +75,14 @@ class Settings(BaseSettings):
 
     # Crawl
     # Format: "URL|tag1,tag2;URL2|tag3"
-    crawl_seed_urls: str = ""
+    crawl_seed_urls: str = "https://www.sehuatang.org/forum-103-1.html|sehuatang,hd"
     # Filter which internal links to visit from seed pages. Leave blank to visit everything.
     # Common forum patterns include either "thread-..." or "viewthread" style routes.
-    crawl_link_filter_pattern: str = r"(viewthread|thread)"
+    crawl_link_filter_pattern: str = r"(viewthread|thread(-\d+)+\.html)"
     crawl_queries: str = ""
     crawl_max_pages: int = 50
+    crawl_request_delay_seconds: float = 2.0
+    crawl_max_board_pages: int = 3
     crawl_interval_seconds: int = 3600
     # Optional cookies for crawling (raw Cookie header or Netscape cookie file path).
     crawl_cookie_header: str = ""
@@ -85,7 +94,6 @@ class Settings(BaseSettings):
     queue_download_dlq: str = "pixav:download:dlq"
     queue_upload: str = "pixav:upload"
     queue_upload_dlq: str = "pixav:upload:dlq"
-    queue_verify: str = "pixav:verify"
 
     # Retry
     download_max_retries: int = 10

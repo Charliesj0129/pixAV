@@ -19,14 +19,13 @@ WORKDIR /app
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 
-# Install python dependencies (including dev)
-RUN uv sync --frozen
+# Install runtime dependencies only (exclude local dev/test groups)
+RUN uv sync --frozen --no-group dev --no-group embeddings
 
 # Copy source code
 COPY src/ ./src/
-COPY tests/ ./tests/
 COPY scripts/ ./scripts/
-COPY config.py ./config.py
+COPY migrations/ ./migrations/
 
 # Ensure python path includes src
 ENV PYTHONPATH=/app/src:/app

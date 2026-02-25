@@ -57,43 +57,65 @@ async def ingest_crawl_queue(
     """Drain crawl queue payloads and create pending download tasks."""
     created = 0
     for _ in range(batch_size):
-        payload = await crawl_queue.pop(timeout=1)
-        if payload is None:
-            break
+        receipt: str | None = None
+        acked = False
+        try:
+            claimed = await crawl_queue.pop_claim(timeout=1)
+            if claimed is None:
+                break
+            payload, receipt = claimed
 
-        video_id = _parse_uuid(payload.get("video_id"))
-        if video_id is None:
-            logger.warning("skip crawl payload with invalid video_id: %s", payload)
-            continue
+            video_id = _parse_uuid(payload.get("video_id"))
+            if video_id is None:
+                logger.warning("skip crawl payload with invalid video_id: %s", payload)
+                await crawl_queue.ack(receipt)
+                acked = True
+                continue
 
-        video = await video_repo.find_by_id(video_id)
-        if video is None:
-            logger.warning("skip crawl payload for missing video %s", video_id)
-            continue
+            video = await video_repo.find_by_id(video_id)
+            if video is None:
+                logger.warning("skip crawl payload for missing video %s", video_id)
+                await crawl_queue.ack(receipt)
+                acked = True
+                continue
 
-        if await task_repo.has_open_task(video_id):
-            logger.info("skip crawl payload; open task already exists for video %s", video_id)
-            continue
+            if await task_repo.has_open_task(video_id):
+                logger.info("skip crawl payload; open task already exists for video %s", video_id)
+                await crawl_queue.ack(receipt)
+                acked = True
+                continue
 
-        await task_repo.insert(
-            Task(
+            new_task = Task(
                 video_id=video_id,
                 state=TaskState.PENDING,
                 queue_name=download_queue_name,
                 max_retries=max_retries,
             )
-        )
-        created += 1
+            await task_repo.insert(new_task)
+            logger.debug("created task %s for video %s (trace_id=%s)", new_task.id, video_id, new_task.trace_id)
+            created += 1
+            await crawl_queue.ack(receipt)
+            acked = True
+        except Exception as exc:
+            logger.exception("crawl ingest error: %s", exc)
+            if receipt is not None and not acked:
+                try:
+                    await crawl_queue.nack(receipt, requeue=True)
+                except Exception as nack_exc:  # pragma: no cover - defensive logging
+                    logger.error("failed to nack crawl payload: %s", nack_exc)
 
     return created
 
 
-async def run_loop(settings: Settings, *, interval: int = 30) -> None:
+async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = None) -> None:
     """Run the Maxwell orchestrator tick loop.
 
     Args:
-        settings: Application settings.
-        interval: Seconds between ticks (default: 30).
+        settings:    Application settings.
+        interval:    Seconds between ticks (default: 30).
+        health_app:  Optional FastAPI app; if provided, the orchestrator is
+                     mounted on ``health_app.state.orchestrator`` so the
+                     ``/health`` endpoint can expose live scheduling status.
     """
     pool = await create_pool(settings)
     redis = await create_redis(settings)
@@ -107,6 +129,12 @@ async def run_loop(settings: Settings, *, interval: int = 30) -> None:
             settings.queue_upload: TaskQueue(redis=redis, queue_name=settings.queue_upload),
         }
         crawl_queue = TaskQueue(redis=redis, queue_name=settings.queue_crawl)
+        try:
+            recovered = int(await crawl_queue.requeue_inflight())
+        except (TypeError, ValueError):
+            recovered = 0
+        if recovered:
+            logger.warning("requeued %d in-flight crawl payload(s)", recovered)
 
         scheduler = LruAccountScheduler(pool)
         dispatcher = RedisTaskDispatcher(task_repo=task_repo, queues=queues)
@@ -124,6 +152,10 @@ async def run_loop(settings: Settings, *, interval: int = 30) -> None:
             upload_queue_name=settings.queue_upload,
             no_account_policy=settings.no_account_policy,
         )
+
+        # Expose orchestrator to health app if one was provided
+        if health_app is not None:
+            health_app.state.orchestrator = orchestrator
 
         logger.info("maxwell-core worker started (interval=%ds)", interval)
 
@@ -156,9 +188,59 @@ async def run_loop(settings: Settings, *, interval: int = 30) -> None:
 
 def main() -> None:
     """Entry point for ``python -m pixav.maxwell_core.worker``."""
+    import uvicorn
+    from fastapi import FastAPI, Request
+    from fastapi.responses import PlainTextResponse
+
+    from pixav.shared.metrics import get_metrics_output
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
-    asyncio.run(run_loop(settings))
+
+    health_app = FastAPI(title="pixAV maxwell_core health", docs_url=None, redoc_url=None)
+    health_app.state.orchestrator = None
+
+    @health_app.get("/health")
+    async def health(request: Request) -> dict[str, Any]:
+        orchestrator: MaxwellOrchestrator | None = getattr(request.app.state, "orchestrator", None)
+        if orchestrator is not None:
+            try:
+                return {"status": "ok", "module": "maxwell_core", **(await orchestrator.health())}
+            except Exception:  # noqa: S110
+                pass
+        return {"status": "ok", "module": "maxwell_core"}
+
+    @health_app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> PlainTextResponse:
+        return PlainTextResponse(
+            content=get_metrics_output().decode("utf-8"),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    async def _run() -> None:
+        config = uvicorn.Config(
+            health_app,
+            host=settings.health_host,
+            port=settings.maxwell_core_health_port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        worker_task = asyncio.ensure_future(run_loop(settings, health_app=health_app))
+        server_task = asyncio.ensure_future(server.serve())
+        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: S110
+                pass
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                raise exc
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

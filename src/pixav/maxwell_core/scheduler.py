@@ -98,6 +98,17 @@ class LruAccountScheduler:
             uuid.UUID(account_id),
         )
 
+    async def release_lease(self, account_id: str) -> None:
+        """Release an account lease without marking usage."""
+        await self._pool.execute(
+            """
+            UPDATE accounts
+               SET lease_expires_at = NULL
+             WHERE id = $1
+            """,
+            uuid.UUID(account_id),
+        )
+
     async def active_count(self) -> int:
         """Return the number of active accounts."""
         val = await self._pool.fetchval(

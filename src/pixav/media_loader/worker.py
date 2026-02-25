@@ -23,11 +23,13 @@ from pixav.shared.repository import TaskRepository, VideoRepository
 logger = logging.getLogger(__name__)
 
 
-async def run_loop(settings: Settings) -> None:
+async def run_loop(settings: Settings) -> None:  # noqa: C901
     """Consume tasks from the download queue and process them.
 
-    BLPOP loop: waits for messages on ``pixav:download``, deserialises,
-    and passes to ``MediaLoaderService.process_task()``.
+    Durable claim loop:
+    - Claim payloads via BRPOPLPUSH into ``:processing``.
+    - ACK on handled payloads (including invalid payload drop).
+    - NACK+requeue on unexpected loop errors.
     """
     pool = await create_pool(settings)
     redis = await create_redis(settings)
@@ -68,52 +70,83 @@ async def run_loop(settings: Settings) -> None:
         )
 
         logger.info("media-loader worker started, listening on %s", download_queue.name)
+        try:
+            recovered = int(await download_queue.requeue_inflight())
+        except (TypeError, ValueError):
+            recovered = 0
+        if recovered:
+            logger.warning("requeued %d in-flight payload(s) for %s", recovered, download_queue.name)
 
         while True:
-            payload = await download_queue.pop(timeout=5)
-            if payload is None:
-                continue
-
-            task_id_raw = payload.get("task_id") or payload.get("video_id")
-            if not isinstance(task_id_raw, str):
-                logger.warning("invalid payload (no task_id): %s", payload)
-                continue
-
-            video_id_raw = payload.get("video_id", task_id_raw)
-            if not isinstance(video_id_raw, str):
-                logger.warning("invalid payload (non-string video_id): %s", payload)
-                continue
-
-            video_id = _parse_uuid(video_id_raw)
-            if video_id is None:
-                logger.warning("invalid payload (bad video_id=%r): %s", video_id_raw, payload)
-                continue
-
-            task_id = _parse_uuid(task_id_raw) or uuid.uuid4()
-            retries = _parse_int(payload.get("retries"), default=0, minimum=0)
-            max_retries = _parse_int(payload.get("max_retries"), default=settings.download_max_retries, minimum=1)
-            queue_name = payload.get("queue_name", settings.queue_download)
-            if not isinstance(queue_name, str) or not queue_name:
-                queue_name = settings.queue_download
-
-            task = Task(
-                id=task_id,
-                video_id=video_id,
-                state=TaskState.PENDING,
-                queue_name=queue_name,
-                retries=retries,
-                max_retries=max_retries,
-            )
-
+            receipt: str | None = None
+            acked = False
             try:
-                result = await service.process_task(task)
-                logger.info(
-                    "task %s result: %s",
-                    result.id,
-                    result.state.value,
+                claimed = await download_queue.pop_claim(timeout=5)
+                if claimed is None:
+                    continue
+                payload, receipt = claimed
+
+                task_id_raw = payload.get("task_id") or payload.get("video_id")
+                if not isinstance(task_id_raw, str):
+                    logger.warning("invalid payload (no task_id): %s", payload)
+                    await download_queue.ack(receipt)
+                    acked = True
+                    continue
+
+                video_id_raw = payload.get("video_id", task_id_raw)
+                if not isinstance(video_id_raw, str):
+                    logger.warning("invalid payload (non-string video_id): %s", payload)
+                    await download_queue.ack(receipt)
+                    acked = True
+                    continue
+
+                video_id = _parse_uuid(video_id_raw)
+                if video_id is None:
+                    logger.warning("invalid payload (bad video_id=%r): %s", video_id_raw, payload)
+                    await download_queue.ack(receipt)
+                    acked = True
+                    continue
+
+                task_id = _parse_uuid(task_id_raw) or uuid.uuid4()
+                retries = _parse_int(payload.get("retries"), default=0, minimum=0)
+                max_retries = _parse_int(payload.get("max_retries"), default=settings.download_max_retries, minimum=1)
+                queue_name = payload.get("queue_name", settings.queue_download)
+                if not isinstance(queue_name, str) or not queue_name:
+                    queue_name = settings.queue_download
+                trace_id_raw = payload.get("trace_id")
+                trace_id = trace_id_raw if isinstance(trace_id_raw, str) and trace_id_raw else str(uuid.uuid4())
+
+                task = Task(
+                    id=task_id,
+                    video_id=video_id,
+                    state=TaskState.PENDING,
+                    queue_name=queue_name,
+                    retries=retries,
+                    max_retries=max_retries,
+                    trace_id=trace_id,
                 )
+
+                try:
+                    result = await service.process_task(task)
+                    logger.info(
+                        "task %s result: %s (trace_id=%s)",
+                        result.id,
+                        result.state.value,
+                        result.trace_id,
+                    )
+                except Exception as exc:
+                    logger.exception("unexpected error processing task %s: %s", task.id, exc)
+
+                await download_queue.ack(receipt)
+                acked = True
             except Exception as exc:
-                logger.exception("unexpected error processing task %s: %s", task.id, exc)
+                logger.exception("media-loader worker loop error: %s", exc)
+                if receipt is not None and not acked:
+                    try:
+                        await download_queue.nack(receipt, requeue=True)
+                    except Exception as nack_exc:  # pragma: no cover - defensive logging
+                        logger.error("failed to nack payload on %s: %s", download_queue.name, nack_exc)
+                await asyncio.sleep(1)
 
     finally:
         await redis.aclose()
@@ -141,9 +174,38 @@ def _parse_int(val: Any, *, default: int, minimum: int) -> int:
 
 def main() -> None:
     """Entry point for ``python -m pixav.media_loader.worker``."""
+    import uvicorn
+
+    from pixav.shared.health import create_health_app
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
-    asyncio.run(run_loop(settings))
+    health_app = create_health_app("media_loader")
+
+    async def _run() -> None:
+        config = uvicorn.Config(
+            health_app,
+            host=settings.health_host,
+            port=settings.media_loader_health_port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        worker_task = asyncio.ensure_future(run_loop(settings))
+        server_task = asyncio.ensure_future(server.serve())
+        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: S110
+                pass
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                raise exc
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

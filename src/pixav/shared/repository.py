@@ -15,7 +15,7 @@ from typing import Any
 import asyncpg
 
 from pixav.shared.enums import AccountStatus, TaskState, VideoStatus
-from pixav.shared.models import Task, Video
+from pixav.shared.models import Account, Task, Video
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +218,18 @@ class AccountRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
+    async def find_by_id(self, account_id: uuid.UUID) -> Account | None:
+        """Fetch a single account by primary key."""
+        row = await self._pool.fetchrow(
+            "SELECT * FROM accounts WHERE id = $1",
+            account_id,
+        )
+        if row is None:
+            return None
+        data = dict(row)
+        data["status"] = AccountStatus(data["status"])
+        return Account.model_validate(data)
+
     async def release_expired_cooldowns(self) -> int:
         """Reactivate cooldown accounts that are ready to be reused."""
         tag = await self._pool.execute(
@@ -361,6 +373,60 @@ class TaskRepository:
             """,
             retries,
             state.value,
+            error_message,
+            _utc_now(),
+            task_id,
+        )
+
+    async def claim_for_dispatch(
+        self,
+        task_id: uuid.UUID,
+        *,
+        next_state: TaskState,
+        account_id: uuid.UUID | None = None,
+    ) -> bool:
+        """Atomically claim a pending task for dispatch.
+
+        Returns:
+            True when claim succeeds (task was pending), False otherwise.
+        """
+        tag = await self._pool.execute(
+            """
+            UPDATE tasks
+               SET state = $1,
+                   account_id = COALESCE($2::uuid, account_id),
+                   error_message = NULL,
+                   updated_at = $3
+             WHERE id = $4
+               AND state = $5
+            """,
+            next_state.value,
+            account_id,
+            _utc_now(),
+            task_id,
+            TaskState.PENDING.value,
+        )
+        return _rows_from_tag(tag) == 1
+
+    async def release_dispatch_claim(
+        self,
+        task_id: uuid.UUID,
+        *,
+        error_message: str | None = None,
+        clear_account: bool = False,
+    ) -> None:
+        """Return a claimed task back to pending after dispatch failure."""
+        await self._pool.execute(
+            """
+            UPDATE tasks
+               SET state = $1,
+                   account_id = CASE WHEN $2 THEN NULL ELSE account_id END,
+                   error_message = $3,
+                   updated_at = $4
+             WHERE id = $5
+            """,
+            TaskState.PENDING.value,
+            clear_account,
             error_message,
             _utc_now(),
             task_id,

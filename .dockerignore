@@ -1,0 +1,31 @@
+.git
+.github
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+.coverage.*
+
+# Local artifacts / secrets
+.env
+cookies*.txt
+.agent
+node_modules
+
+# Heavy runtime data
+data
+rust/target
+
+# Dev-only files
+tests
+docs
+claude-code-templates
+everything-claude-code
+
+# Ad-hoc local probes
+test_*.py
+test_*.js
+evaluate_*.js
+find_*.py
+fix_*.py

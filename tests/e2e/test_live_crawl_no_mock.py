@@ -127,9 +127,22 @@ async def test_live_seed_crawl_no_mock(
 
     flaresolverr = FlareSolverrSession(flaresolverr_url) if flaresolverr_url else None
     crawler = HttpxCrawler(flaresolverr=flaresolverr, timeout=60)
+
+    if "sehuatang.org" in seed_url:
+        from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
+
+        crawler = SehuatangCrawler(flaresolverr=flaresolverr, timeout=60)
+        extractor = SehuatangExtractor()
+    else:
+        from pixav.sht_probe.parser import BeautifulSoupExtractor
+
+        extractor = BeautifulSoupExtractor()
+
     cookies, _ = load_cookies(cookie_header=cookie_header, cookie_file=cookie_file)
     if cookies:
         crawler.seed_cookies(cookies)
+
+    # Check seed connectivity
     await crawler.fetch_page_html(seed_url)
 
     pool = await asyncpg.create_pool(dsn=live_db_dsn, min_size=1, max_size=3)
@@ -140,6 +153,7 @@ async def test_live_seed_crawl_no_mock(
         video_repo=repo,
         queue=queue,
         crawler=crawler,
+        extractor=extractor,
         min_quality_score=-10000,
     )
 

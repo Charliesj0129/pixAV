@@ -32,3 +32,18 @@ cookies*.txt
 .flake8
 claude-code-templates/
 everything-claude-code/
+
+# Node / JS reverse-engineering scratch space (local-only)
+node_modules/
+/package-lock.json
+
+# Ad-hoc root-level probes (keep real tests under tests/)
+/test_*.py
+/test_*.js
+/evaluate_*.js
+/find_*.py
+/fix_*.py
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

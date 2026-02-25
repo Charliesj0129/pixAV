@@ -12,8 +12,8 @@ WORKDIR /app
 # Copy project files
 COPY . .
 
-# Sync dependencies
-RUN uv sync
+# Sync runtime dependencies only (exclude local dev/test groups)
+RUN uv sync --frozen --no-group dev --no-group embeddings
 
 # Run the pixel injector worker
 CMD ["uv", "run", "python", "-m", "pixav.pixel_injector.worker"]

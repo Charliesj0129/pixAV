@@ -4,7 +4,7 @@ Guidance for agents working in `pixAV`.
 
 ## Project Overview
 
-`pixAV` (Maxwell's Demon) is a distributed media pipeline built as Python microservices communicating over Redis queues with PostgreSQL as the single source of truth. The architecture follows a staged pipeline pattern: crawl → download → upload → verify → resolve.
+`pixAV` (Maxwell's Demon) is a distributed media pipeline built as Python microservices communicating over Redis queues with PostgreSQL as the single source of truth. The architecture follows a staged pipeline pattern: crawl → download → upload → resolve.
 
 Rust crates are present as future rewrite targets — do not modify Rust code unless explicitly asked.
 
@@ -31,7 +31,6 @@ SHT-Probe → Media-Loader → Maxwell-Core → Pixel-Injector → STRM-Resolver
 - `pixav:crawl` — new URLs for SHT-Probe
 - `pixav:download` — magnets for Media-Loader
 - `pixav:upload` — files for Pixel-Injector
-- `pixav:verify` — share URLs for verification
 
 ### Key Infrastructure
 

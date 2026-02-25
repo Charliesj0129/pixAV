@@ -88,7 +88,11 @@ class HttpxCrawler:
                 raise CrawlError(f"direct fetch failed and no FlareSolverr configured: {direct_err}") from direct_err
 
             logger.info("falling back to FlareSolverr for %s", url)
-            html, cookies = await self._flaresolverr.get_html(url, cookies=self._cookies)
+            result = await self._flaresolverr.get_html(url, cookies=self._cookies)
+            if len(result) == 2:
+                html, cookies = result
+            else:
+                html, cookies, _user_agent = result
             if cookies:
                 self._cookies.update(cookies)
                 logger.info("cached %d cookies from FlareSolverr", len(cookies))

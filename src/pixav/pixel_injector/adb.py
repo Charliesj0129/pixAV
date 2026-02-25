@@ -16,7 +16,7 @@ class AdbConnection:
     Uses ``adb`` CLI through async subprocess calls.
     """
 
-    def __init__(self, *, adb_bin: str = "adb", timeout: int = 30) -> None:
+    def __init__(self, *, adb_bin: str = "adb", timeout: int = 120) -> None:
         self._adb_bin = adb_bin
         self._timeout = timeout
         self._target: str | None = None
@@ -35,6 +35,20 @@ class AdbConnection:
         stdout, stderr, rc = await self._run("connect", self._target)
         if rc != 0 or "cannot" in stdout.lower():
             raise AdbError(f"ADB connect failed to {self._target}: {stdout} {stderr}")
+        
+        # Wait for device to come fully online
+        await self._run("-s", self._target, "wait-for-device")
+        
+        # Also wait for sys.boot_completed = 1
+        for _ in range(60):
+            try:
+                boot_stdout, _, _ = await self._run("-s", self._target, "shell", "getprop sys.boot_completed")
+                if boot_stdout.strip() == "1":
+                    break
+            except Exception as e:
+                logger.debug("ADB wait for boot failure: %s", e)
+            await asyncio.sleep(1)
+
         logger.info("ADB connected to %s", self._target)
 
     async def push(self, local: str, remote: str) -> None:

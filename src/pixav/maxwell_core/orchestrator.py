@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 
 from pixav.maxwell_core.backpressure import QueueDepthMonitor
 from pixav.maxwell_core.dispatcher import RedisTaskDispatcher
@@ -46,7 +47,7 @@ class MaxwellOrchestrator:
         self._no_account_policy = no_account_policy
         self._batch_size = batch_size
 
-    async def tick(self) -> dict[str, int]:
+    async def tick(self) -> dict[str, int]:  # noqa: C901
         """Run one scheduling cycle.
 
         Returns:
@@ -88,7 +89,6 @@ class MaxwellOrchestrator:
                 if queue_name == self._upload_q:
                     try:
                         account_id = await self._scheduler.next_account()
-                        await self._task_repo.assign_account(task.id, account_id)
                     except RuntimeError as exc:
                         if self._no_account_policy == "fail":
                             await self._task_repo.update_state(task.id, TaskState.FAILED, error_message=str(exc))
@@ -99,8 +99,30 @@ class MaxwellOrchestrator:
                             stats["waiting_no_account"] += 1
                         continue
 
-                await self._dispatcher.dispatch(str(task.id), queue_name)
-                await self._task_repo.update_state(task.id, next_state)
+                claimed = await self._task_repo.claim_for_dispatch(
+                    task.id,
+                    next_state=next_state,
+                    account_id=uuid.UUID(account_id) if account_id is not None else None,
+                )
+                if not claimed:
+                    if account_id is not None:
+                        await self._scheduler.release_lease(account_id)
+                    logger.info("skip task %s; already claimed by another orchestrator", task.id)
+                    continue
+
+                try:
+                    await self._dispatcher.dispatch(str(task.id), queue_name)
+                except Exception as exc:
+                    await self._task_repo.release_dispatch_claim(
+                        task.id,
+                        error_message=f"dispatch failed: {exc}",
+                        clear_account=account_id is not None,
+                    )
+                    if account_id is not None:
+                        await self._scheduler.release_lease(account_id)
+                    logger.warning("failed to dispatch task %s to %s: %s", task.id, queue_name, exc)
+                    continue
+
                 stats["dispatched"] += 1
 
                 # Mark account as used after successful dispatch

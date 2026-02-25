@@ -45,6 +45,7 @@ def mock_task_repo() -> AsyncMock:
     r = AsyncMock()
     r.count_by_state.return_value = 0
     r.list_pending.return_value = []
+    r.claim_for_dispatch.return_value = True
     return r
 
 
@@ -162,7 +163,33 @@ class TestMaxwellOrchestrator:
 
         assert stats["dispatched"] == 1
         mock_dispatcher.dispatch.assert_awaited_once_with(str(pending.id), "pixav:download")
-        mock_task_repo.update_state.assert_awaited_once_with(pending.id, TaskState.DOWNLOADING)
+        mock_task_repo.claim_for_dispatch.assert_awaited_once_with(
+            pending.id,
+            next_state=TaskState.DOWNLOADING,
+            account_id=None,
+        )
+        mock_task_repo.update_state.assert_not_awaited()
+
+    async def test_tick_dispatch_failure_releases_claim(
+        self,
+        orchestrator: MaxwellOrchestrator,
+        mock_task_repo: AsyncMock,
+        mock_dispatcher: AsyncMock,
+    ) -> None:
+        pending = Task(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000231"),
+            video_id=uuid.UUID("00000000-0000-0000-0000-000000000232"),
+            state=TaskState.PENDING,
+            queue_name="pixav:download",
+        )
+        mock_task_repo.count_by_state.return_value = 1
+        mock_task_repo.list_pending.return_value = [pending]
+        mock_dispatcher.dispatch.side_effect = RuntimeError("redis unavailable")
+
+        stats = await orchestrator.tick()
+
+        assert stats["dispatched"] == 0
+        mock_task_repo.release_dispatch_claim.assert_awaited_once()
 
     async def test_tick_upload_task_waits_for_account(
         self,
