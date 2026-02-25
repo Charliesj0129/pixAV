@@ -15,6 +15,10 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _new_trace_id() -> str:
+    return str(uuid.uuid4())
+
+
 class Account(BaseModel):
     """A Google account used for Google Photos uploads."""
 
@@ -22,6 +26,7 @@ class Account(BaseModel):
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     email: str
+    password: str | None = None
     status: AccountStatus = AccountStatus.ACTIVE
     storage_instance_id: uuid.UUID | None = None
     last_used_at: datetime | None = None
@@ -69,6 +74,7 @@ class Task(BaseModel):
     retries: int = 0
     max_retries: int = 3
     error_message: str | None = None
+    trace_id: str = Field(default_factory=_new_trace_id)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime | None = None
 

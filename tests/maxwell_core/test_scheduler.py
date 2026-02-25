@@ -61,3 +61,10 @@ class TestLruAccountScheduler:
 
         assert result == 3
         mock_pool.fetchval.assert_awaited_once()
+
+    async def test_release_lease(self, scheduler: LruAccountScheduler, mock_pool: AsyncMock) -> None:
+        acct_id = str(uuid.uuid4())
+
+        await scheduler.release_lease(acct_id)
+
+        mock_pool.execute.assert_awaited_once()

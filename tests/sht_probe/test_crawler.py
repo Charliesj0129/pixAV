@@ -83,7 +83,7 @@ class TestHttpxCrawler:
         assert links == []
 
     def test_extract_links_keeps_query_string(self) -> None:
-        html = "<html><body>" '<a href="/forum.php?mod=viewthread&tid=123&page=1">T1</a>' "</body></html>"
+        html = '<html><body><a href="/forum.php?mod=viewthread&tid=123&page=1">T1</a></body></html>'
         links = HttpxCrawler._extract_links(
             html,
             "https://example.com/forum.php?mod=forumdisplay&fid=103",

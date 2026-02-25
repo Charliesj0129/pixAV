@@ -15,6 +15,7 @@ from pixav.sht_probe.crawler import HttpxCrawler
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
 from pixav.sht_probe.jackett_client import JackettClient
 from pixav.sht_probe.parser import BeautifulSoupExtractor
+from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
 from pixav.sht_probe.service import ShtProbeService
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ async def run_once(settings: Settings) -> list[str]:
     """
     pool = await create_pool(settings)
     redis = await create_redis(settings)
+    sehuatang_crawler: SehuatangCrawler | None = None
 
     try:
         video_repo = VideoRepository(pool)
@@ -43,16 +45,40 @@ async def run_once(settings: Settings) -> list[str]:
         if cookies:
             crawler.seed_cookies(cookies)
             logger.info("seeded %d crawl cookie(s) (%s)", len(cookies), source)
-        extractor = BeautifulSoupExtractor()
+        # Default generic components
+        generic_extractor = BeautifulSoupExtractor()
+        sehuatang_crawler = (
+            SehuatangCrawler(
+                flaresolverr=flaresolverr,
+                request_delay_seconds=settings.crawl_request_delay_seconds,
+                max_board_pages=settings.crawl_max_board_pages,
+            )
+            if flaresolverr
+            else None
+        )
+        sehuatang_extractor = SehuatangExtractor()
         jackett = JackettClient(settings.jackett_url, settings.jackett_api_key) if settings.jackett_api_key else None
 
-        service = ShtProbeService(
+        generic_service = ShtProbeService(
             video_repo=video_repo,
             queue=queue,
             crawler=crawler,
-            extractor=extractor,
+            extractor=generic_extractor,
             jackett=jackett,
             embeddings_enabled=settings.embeddings_enabled,
+        )
+        sehuatang_service = (
+            ShtProbeService(
+                video_repo=video_repo,
+                queue=queue,
+                crawler=sehuatang_crawler,
+                extractor=sehuatang_extractor,
+                jackett=jackett,
+                embeddings_enabled=settings.embeddings_enabled,
+                page_fetch_concurrency=4,
+            )
+            if sehuatang_crawler
+            else None
         )
 
         all_new: list[str] = []
@@ -69,11 +95,10 @@ async def run_once(settings: Settings) -> list[str]:
                 url = entry.strip()
 
             try:
-                if not service._crawler:  # Basic check
-                    logger.warning("skipping seed URL %s (no crawler configured)", url)
-                    continue
+                is_sehuatang = "sehuatang.org" in url
+                active_service = sehuatang_service if (is_sehuatang and sehuatang_service) else generic_service
 
-                new = await service.run_crawl(
+                new = await active_service.run_crawl(
                     url,
                     link_pattern=settings.crawl_link_filter_pattern,
                     tags=tags,
@@ -87,10 +112,10 @@ async def run_once(settings: Settings) -> list[str]:
         queries = _parse_csv(settings.crawl_queries)
         for query in queries:
             try:
-                if not service._jackett:
+                if not jackett:
                     logger.warning("skipping query %r (no jackett configured)", query)
                     continue
-                new = await service.run_search(query)
+                new = await generic_service.run_search(query)
                 all_new.extend(new)
             except Exception as exc:
                 logger.error("search failed for %r: %s", query, exc)
@@ -98,6 +123,11 @@ async def run_once(settings: Settings) -> list[str]:
         logger.info("crawl cycle complete: %d new magnets total", len(all_new))
         return all_new
     finally:
+        if sehuatang_crawler is not None:
+            try:
+                await sehuatang_crawler.aclose()
+            except Exception as exc:
+                logger.warning("failed to close sehuatang crawler client: %s", exc)
         await redis.aclose()
         await pool.close()
 
@@ -131,13 +161,43 @@ def main() -> None:
     """Entry point for ``python -m pixav.sht_probe.worker``."""
     import sys
 
+    import uvicorn
+
+    from pixav.shared.health import create_health_app
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
 
     if "--once" in sys.argv:
         asyncio.run(run_once(settings))
-    else:
-        asyncio.run(run_loop(settings))
+        return
+
+    health_app = create_health_app("sht_probe")
+
+    async def _run() -> None:
+        config = uvicorn.Config(
+            health_app,
+            host=settings.health_host,
+            port=settings.sht_probe_health_port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        worker_task = asyncio.ensure_future(run_loop(settings))
+        server_task = asyncio.ensure_future(server.serve())
+        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: S110
+                pass
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                raise exc
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

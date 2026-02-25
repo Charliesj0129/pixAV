@@ -30,8 +30,8 @@ class FlareSolverrSession:
         timeout: int = 60,
         cookies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
-    ) -> tuple[str, dict[str, str]]:
-        """Send a request through FlareSolverr and return the solved HTML and cookies.
+    ) -> tuple[str, dict[str, str], str]:
+        """Send a request through FlareSolverr and return the solved HTML, cookies and User-Agent.
 
         Args:
             url: Target page URL.
@@ -40,7 +40,7 @@ class FlareSolverrSession:
             headers: Optional request headers (e.g. Referer).
 
         Returns:
-            Tuple of (html_string, cookies_dict).
+            Tuple of (html_string, cookies_dict, user_agent_string).
 
         Raises:
             CrawlError: If FlareSolverr fails or returns an error.
@@ -79,8 +79,15 @@ class FlareSolverrSession:
             raise CrawlError("FlareSolverr returned empty response body")
 
         cookies = {c["name"]: c["value"] for c in solution.get("cookies", [])}
-        logger.info("FlareSolverr solved %s (status=%s, cookies=%d)", url, solution.get("status", "?"), len(cookies))
-        return html, cookies
+        user_agent = solution.get("userAgent", "")
+        logger.info(
+            "FlareSolverr solved %s (status=%s, cookies=%d, ua=%s)",
+            url,
+            solution.get("status", "?"),
+            len(cookies),
+            bool(user_agent),
+        )
+        return html, cookies, user_agent
 
     @staticmethod
     def _to_flaresolverr_cookies(url: str, cookies: dict[str, str]) -> list[dict[str, str]]:

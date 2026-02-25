@@ -1,0 +1,43 @@
+x-service-defaults: &service_defaults
+  restart: unless-stopped
+  init: true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  postgres:
+    <<: *service_defaults
+    image: ${PIXAV_IMAGE_POSTGRES:-pgvector/pgvector:pg16}
+
+  redis:
+    <<: *service_defaults
+    image: ${PIXAV_IMAGE_REDIS:-redis:7-alpine}
+
+  qbittorrent:
+    <<: *service_defaults
+    image: ${PIXAV_IMAGE_QBITTORRENT:-lscr.io/linuxserver/qbittorrent:latest}
+    stop_grace_period: 60s
+
+  jackett:
+    <<: *service_defaults
+    image: ${PIXAV_IMAGE_JACKETT:-lscr.io/linuxserver/jackett:latest}
+
+  flaresolverr:
+    <<: *service_defaults
+    image: ${PIXAV_IMAGE_FLARESOLVERR:-ghcr.io/flaresolverr/flaresolverr:latest}
+
+  stash:
+    <<: *service_defaults
+    image: ${PIXAV_IMAGE_STASH:-stashapp/stash:latest}
+    stop_grace_period: 60s
+
+  pixel_injector:
+    <<: *service_defaults
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

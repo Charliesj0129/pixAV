@@ -30,10 +30,11 @@ class TestFlareSolverrSession:
         }
         respx.post("http://flaresolverr:8191/v1").mock(return_value=httpx.Response(200, json=mock_response))
 
-        html, cookies = await session.get_html("https://target.com/page", timeout=30)
+        html, cookies, user_agent = await session.get_html("https://target.com/page", timeout=30)
         assert "<html>" in html
         assert "Solved!" in html
         assert cookies == {"cf_clearance": "abc"}
+        assert user_agent == ""
 
     @respx.mock
     async def test_get_html_challenge_failed(self, session: FlareSolverrSession) -> None:

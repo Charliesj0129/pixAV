@@ -17,20 +17,23 @@ class TestPixelInjectorWorker:
         task_id = uuid.uuid4()
         queue = AsyncMock()
         queue.name = "pixav:upload"
-        queue.pop.side_effect = [
-            {
-                "task_id": str(task_id),
-                "video_id": str(video_id),
-                "local_path": "/tmp/video.mp4",
-                "queue_name": "pixav:upload",
-            },
+        queue.pop_claim.side_effect = [
+            (
+                {
+                    "task_id": str(task_id),
+                    "video_id": str(video_id),
+                    "local_path": "/tmp/video.mp4",
+                    "queue_name": "pixav:upload",
+                },
+                "receipt-1",
+            ),
             None,
         ]
 
         stop_event = asyncio.Event()
         service = AsyncMock()
 
-        async def _process(task: Task) -> Task:
+        async def _process(task: Task, account=None) -> Task:
             stop_event.set()
             return task.model_copy(
                 update={
@@ -64,21 +67,24 @@ class TestPixelInjectorWorker:
         task_id = uuid.uuid4()
         queue = AsyncMock()
         queue.name = "pixav:upload"
-        queue.pop.side_effect = [
-            {
-                "task_id": str(task_id),
-                "video_id": str(video_id),
-                "local_path": "/tmp/video.mp4",
-                "queue_name": "pixav:upload",
-                "max_retries": 0,
-            },
+        queue.pop_claim.side_effect = [
+            (
+                {
+                    "task_id": str(task_id),
+                    "video_id": str(video_id),
+                    "local_path": "/tmp/video.mp4",
+                    "queue_name": "pixav:upload",
+                    "max_retries": 0,
+                },
+                "receipt-1",
+            ),
             None,
         ]
 
         stop_event = asyncio.Event()
         service = AsyncMock()
 
-        async def _process(task: Task) -> Task:
+        async def _process(task: Task, account=None) -> Task:
             stop_event.set()
             return task.model_copy(
                 update={
@@ -131,7 +137,7 @@ class TestPixelInjectorWorker:
         finally:
             await stopper
 
-        queue.pop.assert_not_awaited()
+        queue.pop_claim.assert_not_awaited()
         service.process_task.assert_not_awaited()
 
     async def test_run_worker_requeues_when_lock_busy(self) -> None:
@@ -139,13 +145,16 @@ class TestPixelInjectorWorker:
         task_id = uuid.uuid4()
         queue = AsyncMock()
         queue.name = "pixav:upload"
-        queue.pop.side_effect = [
-            {
-                "task_id": str(task_id),
-                "video_id": str(video_id),
-                "local_path": "/tmp/video.mp4",
-                "queue_name": "pixav:upload",
-            },
+        queue.pop_claim.side_effect = [
+            (
+                {
+                    "task_id": str(task_id),
+                    "video_id": str(video_id),
+                    "local_path": "/tmp/video.mp4",
+                    "queue_name": "pixav:upload",
+                },
+                "receipt-1",
+            ),
             None,
         ]
 
@@ -155,11 +164,11 @@ class TestPixelInjectorWorker:
         redis_client.get.return_value = None
         redis_client.set.return_value = False
 
-        async def _push(payload: dict[str, str]) -> None:
+        async def _nack(*_args, **_kwargs) -> bool:
             stop_event.set()
-            return None
+            return True
 
-        queue.push.side_effect = _push
+        queue.nack.side_effect = _nack
 
         await run_worker(
             queue=queue,
@@ -169,7 +178,7 @@ class TestPixelInjectorWorker:
             stop_event=stop_event,
         )
 
-        queue.push.assert_awaited()
+        queue.nack.assert_awaited()
         service.process_task.assert_not_awaited()
 
     async def test_run_worker_updates_account_usage_on_success(self) -> None:
@@ -178,21 +187,24 @@ class TestPixelInjectorWorker:
         account_id = uuid.uuid4()
         queue = AsyncMock()
         queue.name = "pixav:upload"
-        queue.pop.side_effect = [
-            {
-                "task_id": str(task_id),
-                "video_id": str(video_id),
-                "account_id": str(account_id),
-                "local_path": "/tmp/video.mp4",
-                "queue_name": "pixav:upload",
-            },
+        queue.pop_claim.side_effect = [
+            (
+                {
+                    "task_id": str(task_id),
+                    "video_id": str(video_id),
+                    "account_id": str(account_id),
+                    "local_path": "/tmp/video.mp4",
+                    "queue_name": "pixav:upload",
+                },
+                "receipt-1",
+            ),
             None,
         ]
 
         stop_event = asyncio.Event()
         service = AsyncMock()
 
-        async def _process(task: Task) -> Task:
+        async def _process(task: Task, account=None) -> Task:
             stop_event.set()
             return task.model_copy(
                 update={
@@ -218,3 +230,50 @@ class TestPixelInjectorWorker:
             )
 
         account_repo.apply_upload_usage.assert_awaited_once_with(account_id, 987654)
+
+    async def test_run_worker_drops_duplicate_terminal_task(self) -> None:
+        video_id = uuid.uuid4()
+        task_id = uuid.uuid4()
+        queue = AsyncMock()
+        queue.name = "pixav:upload"
+        queue.pop_claim.side_effect = [
+            (
+                {
+                    "task_id": str(task_id),
+                    "video_id": str(video_id),
+                    "local_path": "/tmp/video.mp4",
+                    "queue_name": "pixav:upload",
+                },
+                "receipt-1",
+            ),
+            None,
+        ]
+
+        stop_event = asyncio.Event()
+        service = AsyncMock()
+        task_repo = AsyncMock()
+        task_repo.find_by_id.return_value = Task(
+            id=task_id,
+            video_id=video_id,
+            state=TaskState.COMPLETE,
+            queue_name="pixav:upload",
+        )
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            stop_event.set()
+
+        stopper = asyncio.create_task(_stop_soon())
+        try:
+            await run_worker(
+                queue=queue,
+                service=service,
+                task_repo=task_repo,
+                poll_timeout=0,
+                stop_event=stop_event,
+            )
+        finally:
+            await stopper
+
+        service.process_task.assert_not_awaited()
+        queue.ack.assert_awaited()

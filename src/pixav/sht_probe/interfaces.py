@@ -71,7 +71,7 @@ class FlareSolverSession(Protocol):
         timeout: int = 60,
         cookies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
-    ) -> tuple[str, dict[str, str]]:
+    ) -> tuple[str, dict[str, str]] | tuple[str, dict[str, str], str]:
         """Fetch a page's HTML after solving Cloudflare challenges.
 
         Args:
@@ -81,6 +81,7 @@ class FlareSolverSession(Protocol):
             headers: Optional request headers.
 
         Returns:
-            Tuple of (html_string, cookies_dict).
+            Tuple of (html_string, cookies_dict) or
+            (html_string, cookies_dict, user_agent_string).
         """
         ...

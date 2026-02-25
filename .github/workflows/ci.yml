@@ -48,4 +48,4 @@ jobs:
         run: uv run mypy src
 
       - name: Pytest
-        run: uv run pytest -q
+        run: uv run pytest -q --cov=src/pixav --cov-report=term-missing --cov-fail-under=80

@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from redis import asyncio as aioredis
 
 from pixav.config import get_settings
-from pixav.strm_resolver.middleware import setup_cors
+from pixav.strm_resolver.middleware import RateLimitMiddleware, setup_cors
 from pixav.strm_resolver.resolver import GooglePhotosResolver
 from pixav.strm_resolver.routes import router
 
@@ -78,6 +78,7 @@ def create_app(
     # Initialize resolver with settings
     app.state.resolver = GooglePhotosResolver(concurrency=settings.resolver_concurrency)
 
+    app.add_middleware(RateLimitMiddleware, rpm=settings.resolver_rate_limit_rpm)
     setup_cors(app)
     app.include_router(router)
     return app

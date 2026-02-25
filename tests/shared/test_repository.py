@@ -231,6 +231,40 @@ class TestTaskRepository:
         assert args[3] == "transient failure"
         assert args[5] == task_id
 
+    async def test_claim_for_dispatch_true(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        task_id = uuid.uuid4()
+        account_id = uuid.uuid4()
+
+        claimed = await repo.claim_for_dispatch(
+            task_id,
+            next_state=TaskState.DOWNLOADING,
+            account_id=account_id,
+        )
+
+        assert claimed is True
+        pool.execute.assert_awaited_once()
+
+    async def test_claim_for_dispatch_false(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 0"
+
+        claimed = await repo.claim_for_dispatch(
+            uuid.uuid4(),
+            next_state=TaskState.UPLOADING,
+        )
+
+        assert claimed is False
+
+    async def test_release_dispatch_claim(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        task_id = uuid.uuid4()
+        await repo.release_dispatch_claim(task_id, error_message="dispatch failed", clear_account=True)
+        pool.execute.assert_awaited_once()
+        args = pool.execute.call_args[0]
+        assert args[1] == TaskState.PENDING.value
+        assert args[2] is True
+        assert args[3] == "dispatch failed"
+        assert args[5] == task_id
+
     async def test_count_by_state(self, repo: TaskRepository, pool: AsyncMock) -> None:
         pool.fetchval.return_value = 7
         result = await repo.count_by_state(TaskState.PENDING)

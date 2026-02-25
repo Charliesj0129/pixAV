@@ -56,6 +56,7 @@ class RedisTaskDispatcher:
             payload["max_retries"] = task.max_retries
             if task.account_id is not None:
                 payload["account_id"] = str(task.account_id)
+            payload["trace_id"] = task.trace_id
 
         await queue.push(payload)
         logger.info("dispatched task %s → %s", task_id, queue_name)

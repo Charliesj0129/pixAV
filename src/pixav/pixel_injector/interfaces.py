@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.models import Task
+
+if TYPE_CHECKING:
+    from pixav.shared.models import Account
 
 
 @runtime_checkable
@@ -56,6 +59,18 @@ class RedroidManager(Protocol):
 @runtime_checkable
 class FileUploader(Protocol):
     """Protocol for uploading files to Redroid container."""
+
+    async def login(self, session: RedroidSession, account: Account) -> None:
+        """Perform automated login for the given account.
+
+        Args:
+            session: Active Redroid session
+            account: The Google account credentials
+
+        Raises:
+            UploadError: If login fails
+        """
+        ...
 
     async def push_file(self, session: RedroidSession, local_path: str) -> str:
         """Push a file to the container.
@@ -120,4 +135,4 @@ class UploadVerifier(Protocol):
 class PixelInjector(Protocol):
     """Protocol for upload orchestration services (real or local/dev)."""
 
-    async def process_task(self, task: Task) -> Task: ...
+    async def process_task(self, task: Task, account: Account | None = None) -> Task: ...

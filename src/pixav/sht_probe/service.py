@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pixav.shared.enums import VideoStatus
 from pixav.shared.models import Video
@@ -14,6 +15,9 @@ from pixav.sht_probe.crawler import HttpxCrawler
 from pixav.sht_probe.jackett_client import JackettClient
 from pixav.sht_probe.parser import BeautifulSoupExtractor
 from pixav.sht_probe.scoring import QualityScorer
+
+if TYPE_CHECKING:
+    from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +36,21 @@ class ShtProbeService:
         *,
         video_repo: VideoRepository,
         queue: TaskQueue,
-        crawler: HttpxCrawler | None = None,
-        extractor: BeautifulSoupExtractor | None = None,
+        crawler: HttpxCrawler | SehuatangCrawler | None = None,
+        extractor: BeautifulSoupExtractor | SehuatangExtractor | None = None,
         jackett: JackettClient | None = None,
         min_quality_score: int = 0,
         embeddings_enabled: bool = False,
+        page_fetch_concurrency: int = 1,
     ) -> None:
         self._video_repo = video_repo
         self._queue = queue
-        self._crawler = crawler
-        self._extractor = extractor or BeautifulSoupExtractor()
+        self._crawler: HttpxCrawler | SehuatangCrawler | None = crawler
+        self._extractor: BeautifulSoupExtractor | SehuatangExtractor = extractor or BeautifulSoupExtractor()
         self._jackett = jackett
         self._scorer = QualityScorer()
         self._min_quality_score = min_quality_score
+        self._page_fetch_concurrency = max(1, page_fetch_concurrency)
         self._embedding_service = None
         if embeddings_enabled:
             from pixav.shared.embedding import EmbeddingService
@@ -91,13 +97,32 @@ class ShtProbeService:
         seed_magnets = await self._extractor.extract(seed_html)
         all_magnets.update(seed_magnets)
 
-        for page_url in page_urls:
-            try:
-                html = await self._crawler.fetch_page_html(page_url)
-                magnets = await self._extractor.extract(html)
-                all_magnets.update(magnets)
-            except Exception as exc:
-                logger.warning("failed to extract from %s: %s", page_url, exc)
+        if page_urls:
+            if self._page_fetch_concurrency <= 1 or len(page_urls) == 1:
+                for page_url in page_urls:
+                    try:
+                        html = await self._crawler.fetch_page_html(page_url)
+                        magnets = await self._extractor.extract(html)
+                        all_magnets.update(magnets)
+                    except Exception as exc:
+                        logger.warning("failed to extract from %s: %s", page_url, exc)
+            else:
+                semaphore = asyncio.Semaphore(self._page_fetch_concurrency)
+
+                async def _fetch_and_extract(page_url: str) -> list[str]:
+                    async with semaphore:
+                        html = await self._crawler.fetch_page_html(page_url)
+                        return await self._extractor.extract(html)
+
+                results = await asyncio.gather(
+                    *(_fetch_and_extract(page_url) for page_url in page_urls),
+                    return_exceptions=True,
+                )
+                for page_url, result in zip(page_urls, results, strict=True):
+                    if isinstance(result, Exception):
+                        logger.warning("failed to extract from %s: %s", page_url, result)
+                        continue
+                    all_magnets.update(result)
 
         return await self._persist_new(list(all_magnets), tags=tags)
 

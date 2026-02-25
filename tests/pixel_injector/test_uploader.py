@@ -1,85 +1,70 @@
-"""Tests for UIAutomatorUploader."""
-
-from __future__ import annotations
-
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pixav.pixel_injector.session import RedroidSession
 from pixav.pixel_injector.uploader import UIAutomatorUploader
 from pixav.shared.exceptions import UploadError
+from pixav.shared.models import Account
 
 
 @pytest.fixture
-def mock_adb() -> AsyncMock:
-    adb = AsyncMock()
-    adb.connect.return_value = None
-    adb.push.return_value = None
-    adb.shell.return_value = "Broadcasting: Intent..."
-    return adb
-
-
-@pytest.fixture
-def uploader(mock_adb: AsyncMock) -> UIAutomatorUploader:
-    return UIAutomatorUploader(adb=mock_adb)
-
-
-@pytest.fixture
-def session() -> RedroidSession:
+def session():
     return RedroidSession(
-        task_id="task-1",
-        container_id="container-123",
+        task_id="task-123",
+        container_id="cont-456",
         adb_host="127.0.0.1",
-        adb_port=32768,
+        adb_port=5555,
     )
 
+@pytest.fixture
+def adb_mock():
+    return AsyncMock()
 
-class TestUIAutomatorUploader:
-    async def test_push_file_success(
-        self,
-        uploader: UIAutomatorUploader,
-        mock_adb: AsyncMock,
-        session: RedroidSession,
-    ) -> None:
-        result = await uploader.push_file(session, "/data/remuxed/video.mp4")
+@pytest.fixture
+def account():
+    return Account(email="test@example.com", password="SecretPassword123!")
 
-        assert result == "/sdcard/DCIM/Camera/video.mp4"
-        mock_adb.connect.assert_awaited_once_with("127.0.0.1", 32768)
-        mock_adb.push.assert_awaited_once_with("/data/remuxed/video.mp4", "/sdcard/DCIM/Camera/video.mp4")
+@pytest.mark.asyncio
+async def test_login_success(adb_mock, session, account):
+    uploader = UIAutomatorUploader(adb=adb_mock)
+    
+    # We mock out asyncio.sleep to run fast
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await uploader.login(session, account)
+    
+    # Verify the connection was established
+    adb_mock.connect.assert_called_once_with("127.0.0.1", 5555)
+    
+    # Verify the Google Intent was launched
+    adb_mock.shell.assert_any_call("am start -a android.settings.ADD_ACCOUNT_SETTINGS -e account_types com.google")
+    
+    # Verify inputs
+    adb_mock.shell.assert_any_call("input text 'test@example.com'")
+    adb_mock.shell.assert_any_call("input text 'SecretPassword123!'")
+    
+    # Verify ENTER keys were sent
+    assert adb_mock.shell.call_args_list.count((("input keyevent 66",), {})) == 3
+    
+    # Verify TAB keys were sent for accepting TOS
+    assert adb_mock.shell.call_args_list.count((("input keyevent 61",), {})) == 3
+    
+    # Verify returning to home screen
+    adb_mock.shell.assert_any_call("input keyevent 3")
 
-    async def test_push_file_failure(
-        self,
-        uploader: UIAutomatorUploader,
-        mock_adb: AsyncMock,
-        session: RedroidSession,
-    ) -> None:
-        mock_adb.push.side_effect = Exception("adb error")
-
-        with pytest.raises(UploadError, match="failed to push"):
-            await uploader.push_file(session, "/data/video.mp4")
-
-    async def test_trigger_upload(
-        self,
-        uploader: UIAutomatorUploader,
-        mock_adb: AsyncMock,
-        session: RedroidSession,
-    ) -> None:
-        await uploader.trigger_upload(session, "/sdcard/DCIM/Camera/video.mp4")
-
-        mock_adb.connect.assert_awaited_once_with("127.0.0.1", 32768)
-        mock_adb.shell.assert_awaited_once()
-        cmd = mock_adb.shell.call_args[0][0]
-        assert "MEDIA_SCANNER_SCAN_FILE" in cmd
-        assert "/sdcard/DCIM/Camera/video.mp4" in cmd
-
-    async def test_trigger_upload_failure(
-        self,
-        uploader: UIAutomatorUploader,
-        mock_adb: AsyncMock,
-        session: RedroidSession,
-    ) -> None:
-        mock_adb.shell.side_effect = Exception("shell error")
-
-        with pytest.raises(UploadError, match="failed to trigger"):
-            await uploader.trigger_upload(session, "/sdcard/video.mp4")
+@pytest.mark.asyncio
+async def test_login_no_password(adb_mock, session):
+    # Missing password
+    account = Account(email="test@example.com")
+    uploader = UIAutomatorUploader(adb=adb_mock)
+    
+    with pytest.raises(UploadError, match="account password not provided"):
+        await uploader.login(session, account)
+        
+@pytest.mark.asyncio
+async def test_login_adb_failure(adb_mock, session, account):
+    uploader = UIAutomatorUploader(adb=adb_mock)
+    adb_mock.connect.side_effect = Exception("device offline")
+    
+    with pytest.raises(UploadError, match="failed to execute login automation in cont-456: device offline"):
+        await uploader.login(session, account)

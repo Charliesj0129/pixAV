@@ -53,6 +53,10 @@ uv run pytest
 uv run uvicorn pixav.strm_resolver.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
+## Production Deployment
+
+For long-running deployments (compose override, image pinning, backups, secrets, and operations checklist), see `docs/DEPLOYMENT_PRODUCTION.md`.
+
 ## Queue Names
 
 - `pixav:crawl`

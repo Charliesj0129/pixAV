@@ -53,6 +53,24 @@ class TestTask:
         assert task.retries == 0
         assert task.max_retries == 3
 
+    def test_trace_id_auto_generated(self) -> None:
+        t1 = Task(video_id=uuid.uuid4())
+        t2 = Task(video_id=uuid.uuid4())
+        # Each task gets a unique trace_id by default
+        assert isinstance(t1.trace_id, str)
+        assert len(t1.trace_id) > 0
+        assert t1.trace_id != t2.trace_id
+
+    def test_trace_id_can_be_set(self) -> None:
+        fixed_id = "test-trace-id-123"
+        task = Task(video_id=uuid.uuid4(), trace_id=fixed_id)
+        assert task.trace_id == fixed_id
+
+    def test_trace_id_propagates_via_model_copy(self) -> None:
+        task = Task(video_id=uuid.uuid4())
+        updated = task.model_copy(update={"state": TaskState.UPLOADING})
+        assert updated.trace_id == task.trace_id
+
     def test_immutable_update(self) -> None:
         vid_id = uuid.uuid4()
         task = Task(video_id=vid_id)

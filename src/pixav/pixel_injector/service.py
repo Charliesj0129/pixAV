@@ -10,7 +10,7 @@ from pixav.pixel_injector.interfaces import FileUploader, RedroidManager, Upload
 from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import RedroidError, UploadError, VerificationError
-from pixav.shared.models import Task
+from pixav.shared.models import Account, Task
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +35,19 @@ class PixelInjectorService:
         self._verify_timeout_seconds = verify_timeout_seconds
         self._task_timeout_seconds = task_timeout_seconds
 
-    async def process_task(self, task: Task) -> Task:
+    async def process_task(self, task: Task, account: Account | None = None) -> Task:
         """Process an upload task and return an updated immutable task model."""
         session: RedroidSession | None = None
         task_id = str(task.id)
+
+        if account is None:
+            logger.error("task %s is missing account credentials for login", task_id)
+            return task.model_copy(
+                update={
+                    "state": TaskState.FAILED,
+                    "error_message": "account credentials are required for upload tasks",
+                }
+            )
 
         if not task.local_path:
             logger.error("task %s is missing local_path", task_id)
@@ -64,6 +73,9 @@ class PixelInjectorService:
             ready = await self.redroid.wait_ready(session.container_id, timeout=self._ready_timeout_seconds)
             if not ready:
                 raise RedroidError(f"container {session.container_id} did not become ready")
+
+            logger.info("logging into Google account %s in %s", account.email, session.container_id)
+            await self.uploader.login(session, account)
 
             logger.info("pushing %s into container %s", local_path, session.container_id)
             remote_path = await self.uploader.push_file(session, local_path)
@@ -126,7 +138,7 @@ class LocalPixelInjectorService:
             scheme = "pixav-local://"
         self._share_scheme = scheme
 
-    async def process_task(self, task: Task) -> Task:
+    async def process_task(self, task: Task, account: Account | None = None) -> Task:
         if not task.local_path:
             return task.model_copy(
                 update={

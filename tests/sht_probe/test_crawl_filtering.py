@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from unittest.mock import AsyncMock, MagicMock
 
@@ -92,3 +93,52 @@ async def test_forum_crawl_filtering(service):
     # 2 threads -> 2 unique magnets
     assert len(magnets) == 2
     assert any("11111" in m for m in magnets)  # url suffix used in magnet
+
+
+@pytest.mark.asyncio
+async def test_run_crawl_fetches_thread_pages_with_bounded_concurrency() -> None:
+    """Thread page fetch/extract pipeline should use configured concurrency."""
+    seed_url = "https://www.sehuatang.org/forum-103-1.html"
+    page_urls = [f"https://www.sehuatang.org/thread-{i}-1-1.html" for i in range(1, 7)]
+
+    crawler = MagicMock()
+    crawler.crawl = AsyncMock(return_value=page_urls)
+
+    active = 0
+    max_seen = 0
+    lock = asyncio.Lock()
+
+    async def fetch_html(url: str) -> str:
+        nonlocal active, max_seen
+        if url == seed_url:
+            return "<html>seed</html>"
+        async with lock:
+            active += 1
+            max_seen = max(max_seen, active)
+        try:
+            await asyncio.sleep(0.01)
+            return "<html>thread</html>"
+        finally:
+            async with lock:
+                active -= 1
+
+    crawler.fetch_page_html = AsyncMock(side_effect=fetch_html)
+
+    extractor = MagicMock()
+    extractor.extract = AsyncMock(return_value=[])
+
+    service = ShtProbeService(
+        video_repo=AsyncMock(),
+        queue=AsyncMock(),
+        crawler=crawler,
+        extractor=extractor,
+        min_quality_score=-10000,
+        page_fetch_concurrency=3,
+    )
+    service._persist_new = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    await service.run_crawl(seed_url, link_pattern=r"thread(-\d+)+\.html")
+
+    assert max_seen > 1
+    assert max_seen <= 3
+    assert crawler.fetch_page_html.await_count == 1 + len(page_urls)
