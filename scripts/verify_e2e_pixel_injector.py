@@ -16,11 +16,9 @@ from pixav.shared.repository import TaskRepository, VideoRepository
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("verify_pixel_injector")
 
-# Override Redis/DB settings for localhost access if needed
-# Assuming localhost mapping is correct as per docker-compose.yml
-os.environ["PIXAV_DB_HOST"] = "localhost"
-os.environ["PIXAV_REDIS_URL"] = "redis://localhost:6379/0"
-# Note: pixav-redis has no password by default
+# Connection settings come from PIXAV_* env vars / .env via get_settings().
+# Do not hardcode ports here: the published Redis/Postgres ports are driven by
+# PIXAV_REDIS_PORT / PIXAV_POSTGRES_PORT in docker-compose.yml.
 
 
 async def main():

@@ -107,8 +107,11 @@ services:
       - postgres
       - redis
     environment:
+      # host network -> must follow the same published-port variables as the
+      # postgres/redis services above, not the in-container ports.
       PIXAV_DB_HOST: localhost
-      PIXAV_REDIS_URL: redis://localhost:6379/0
+      PIXAV_DB_PORT: ${PIXAV_POSTGRES_PORT:-5432}
+      PIXAV_REDIS_URL: redis://localhost:${PIXAV_REDIS_PORT:-6379}/0
       # Ensure config matches internal docker network
       PIXAV_QUEUE_UPLOAD: pixav:upload
       PIXAV_QUEUE_UPLOAD_DLQ: pixav:upload:dlq
