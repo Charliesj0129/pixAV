@@ -10,24 +10,29 @@ from pixav.shared.models import Account
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+
 async def main():
     # Attempt to test ADB login flow
     task_id = "test-login-1234"
     image = os.environ.get("PIXAV_REDROID_IMAGE", "redroid/redroid:14.0.0-latest")
     logger.info(f"Using Redroid image: {image}")
-    
+
     redroid_manager = DockerRedroidManager(image=image)
     adb = AdbConnection()
     uploader = UIAutomatorUploader(adb=adb)
-    
-    # Fake account
-    account = Account(email="seed-account@example.com", password="***REMOVED-CREDENTIAL***")  # noqa: S106
-    
+
+    # Account under test -- credentials come from the environment, never the source.
+    email = os.environ.get("PIXAV_SEED_ACCOUNT_EMAIL", "").strip()
+    password = os.environ.get("PIXAV_SEED_ACCOUNT_PASSWORD", "").strip()
+    if not email or not password:
+        raise SystemExit("PIXAV_SEED_ACCOUNT_EMAIL and PIXAV_SEED_ACCOUNT_PASSWORD are required")
+    account = Account(email=email, password=password)
+
     session = None
     try:
         logger.info("Creating Redroid container...")
         session = await redroid_manager.create(task_id)
-        
+
         logger.info(f"Waiting for container {session.container_id} to be ready...")
         ready = await redroid_manager.wait_ready(session.container_id, timeout=120)
         if not ready:
@@ -36,15 +41,15 @@ async def main():
 
         logger.info("Starting login automation...")
         await uploader.login(session, account)
-        
+
         logger.info("Login automation finished executing.")
-        
+
         # Test taking a screenshot to see where it ended up
         logger.info("Taking screenshot...")
         await adb.shell("screencap -p /data/local/tmp/screen.png")
         await adb.pull("/data/local/tmp/screen.png", "screen.png")
         logger.info("Screenshot saved to screen.png")
-        
+
     except Exception as e:
         logger.error(f"Test failed: {e}")
         if session:
@@ -54,6 +59,7 @@ async def main():
         if session:
             logger.info("Destroying container...")
             await redroid_manager.destroy(session.container_id)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
