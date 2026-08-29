@@ -165,7 +165,7 @@ class TestMaxwellOrchestrator:
         mock_dispatcher.dispatch.assert_awaited_once_with(str(pending.id), "pixav:download")
         mock_task_repo.claim_for_dispatch.assert_awaited_once_with(
             pending.id,
-            next_state=TaskState.DOWNLOADING,
+            next_state=TaskState.DISPATCHED,
             account_id=None,
         )
         mock_task_repo.update_state.assert_not_awaited()

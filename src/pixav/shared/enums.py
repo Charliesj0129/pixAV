@@ -10,6 +10,7 @@ class TaskState(str, Enum):
     """Lifecycle states for a pipeline task."""
 
     PENDING = "pending"
+    DISPATCHED = "dispatched"
     DOWNLOADING = "downloading"
     REMUXING = "remuxing"
     UPLOADING = "uploading"

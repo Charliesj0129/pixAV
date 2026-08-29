@@ -87,5 +87,20 @@ class TestTaskQueue:
         mock_redis.llen.assert_awaited_once_with("pixav:test")
         assert result == 42
 
+    async def test_processing_length_returns_processing_llen(self, queue: TaskQueue, mock_redis: AsyncMock) -> None:
+        mock_redis.llen.return_value = 3
+
+        result = await queue.processing_length()
+
+        mock_redis.llen.assert_awaited_once_with("pixav:test:processing")
+        assert result == 3
+
+    async def test_total_depth_sums_queue_and_processing(self, queue: TaskQueue, mock_redis: AsyncMock) -> None:
+        mock_redis.llen.side_effect = [4, 2]
+
+        result = await queue.total_depth()
+
+        assert result == 6
+
     def test_name_property(self, queue: TaskQueue) -> None:
         assert queue.name == "pixav:test"

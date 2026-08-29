@@ -61,9 +61,12 @@ def _sample_task_row() -> dict[str, Any]:
         "account_id": None,
         "state": "pending",
         "queue_name": "pixav:crawl",
+        "local_path": None,
+        "share_url": None,
         "retries": 0,
         "max_retries": 3,
         "error_message": None,
+        "trace_id": "trace-task-row-001",
         "created_at": datetime.now(timezone.utc),
         "updated_at": None,
     }
@@ -104,6 +107,7 @@ class TestTaskFromRow:
         assert isinstance(task, Task)
         assert task.state == TaskState.PENDING
         assert task.queue_name == "pixav:crawl"
+        assert task.trace_id == "trace-task-row-001"
 
 
 # ── VideoRepository ────────────────────────────────────────────
@@ -201,6 +205,26 @@ class TestTaskRepository:
         result = await repo.insert(task)
         pool.fetchrow.assert_awaited_once()
         assert result.state == TaskState.PENDING
+
+    async def test_insert_persists_runtime_fields_and_trace_id(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.fetchrow.return_value = _make_record(_sample_task_row())
+        task = Task(
+            video_id=uuid.uuid4(),
+            local_path="/tmp/video.mp4",
+            share_url="https://photos.app.goo.gl/example",
+            trace_id="trace-insert-001",
+        )
+
+        await repo.insert(task)
+
+        args = pool.fetchrow.call_args[0]
+        sql = args[0]
+        assert "local_path" in sql
+        assert "share_url" in sql
+        assert "trace_id" in sql
+        assert args[6] == "/tmp/video.mp4"
+        assert args[7] == "https://photos.app.goo.gl/example"
+        assert args[11] == "trace-insert-001"
 
     async def test_update_state(self, repo: TaskRepository, pool: AsyncMock) -> None:
         pool.execute.return_value = "UPDATE 1"

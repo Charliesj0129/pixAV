@@ -7,7 +7,7 @@ from pixav.shared.enums import AccountStatus, StorageHealth, TaskState, VideoSta
 
 class TestTaskState:
     def test_all_states_present(self) -> None:
-        expected = {"pending", "downloading", "remuxing", "uploading", "verifying", "complete", "failed"}
+        expected = {"pending", "dispatched", "downloading", "remuxing", "uploading", "verifying", "complete", "failed"}
         assert {s.value for s in TaskState} == expected
 
     def test_string_value(self) -> None:

@@ -201,8 +201,8 @@ def main() -> None:
     health_app.state.orchestrator = None
 
     @health_app.get("/health")
-    async def health(request: Request) -> dict[str, Any]:
-        orchestrator: MaxwellOrchestrator | None = getattr(request.app.state, "orchestrator", None)
+    async def health() -> dict[str, Any]:
+        orchestrator: MaxwellOrchestrator | None = getattr(health_app.state, "orchestrator", None)
         if orchestrator is not None:
             try:
                 return {"status": "ok", "module": "maxwell_core", **(await orchestrator.health())}

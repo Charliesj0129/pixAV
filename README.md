@@ -62,7 +62,8 @@ For long-running deployments (compose override, image pinning, backups, secrets,
 - `pixav:crawl`
 - `pixav:download`
 - `pixav:upload`
-- `pixav:verify`
+
+Verification is currently performed inside `pixel_injector` (inline in the upload workflow), not via a separate `pixav:verify` queue.
 
 ## Notes
 

@@ -74,9 +74,11 @@ class MaxwellOrchestrator:
         pending_tasks = await self._task_repo.list_pending(self._batch_size)
         for task in pending_tasks:
             queue_name = task.queue_name or self._download_q
-            next_state = TaskState.DOWNLOADING
-            if queue_name == self._upload_q:
-                next_state = TaskState.UPLOADING
+            # Claim as DISPATCHED (queued but not yet started by a worker).
+            # Workers will advance to stage-specific transient states when they
+            # actually begin execution, which avoids GC treating queue backlog
+            # as stuck worker execution.
+            next_state = TaskState.DISPATCHED
 
             try:
                 queue_ok = await self._monitor.check_pressure(queue_name)

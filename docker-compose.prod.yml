@@ -1,6 +1,5 @@
 x-service-defaults: &service_defaults
   restart: unless-stopped
-  init: true
   logging:
     driver: json-file
     options:

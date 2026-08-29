@@ -109,6 +109,15 @@ class QBitClient:
                     cookies=self._cookies(),
                 )
                 if resp.status_code != 200 or "fails" in resp.text.lower():
+                    # Check if torrent already exists to make addition idempotent
+                    check_resp = await client.get(
+                        f"{self._base_url}/api/v2/torrents/info",
+                        params={"hashes": torrent_hash},
+                        cookies=self._cookies(),
+                    )
+                    if check_resp.status_code == 200 and check_resp.json():
+                        logger.info("torrent %s already exists in qBittorrent", torrent_hash)
+                        return torrent_hash
                     raise DownloadError(f"qBittorrent add_magnet failed: {resp.text[:200]}")
         except httpx.HTTPError as exc:
             raise DownloadError(f"qBittorrent request failed: {exc}") from exc

@@ -60,13 +60,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 def create_app(
-    redis_url: str | None = "redis://localhost:6379/0",
+    redis_url: str | None = "auto",
     db_dsn: str | None = "auto",
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
     settings = get_settings()
     if db_dsn == "auto":
         db_dsn = settings.dsn
+    if redis_url == "auto":
+        redis_url = settings.redis_url
 
     app = FastAPI(title="pixAV Strm-Resolver", lifespan=lifespan)
     app.state.redis_url = redis_url

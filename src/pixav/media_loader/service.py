@@ -67,6 +67,9 @@ class MediaLoaderService:
             await self._video_repo.update_status(task.video_id, VideoStatus.DOWNLOADED)
             return await self._route_to_upload(task, video, video.local_path)
 
+        torrent_hash: str | None = None
+        cleaned_up = False
+
         try:
             if self._mode == "verify":
                 return await self._process_verify(task, video.magnet_uri, video)
@@ -82,6 +85,7 @@ class MediaLoaderService:
 
             # 2a. Cleanup
             await self._cleanup(torrent_hash)
+            cleaned_up = True
 
             # 3. Metadata
             metadata_json = await self._scrape_metadata(video.title)
@@ -93,6 +97,11 @@ class MediaLoaderService:
             return await self._route_to_upload(task, video, output_path)
 
         except Exception as exc:
+            # If we already created a torrent but failed before the normal cleanup
+            # point (e.g. remux crash), attempt best-effort cleanup to avoid
+            # leaving qBittorrent state/files behind.
+            if torrent_hash and not cleaned_up:
+                await self._cleanup(torrent_hash)
             return await self._handle_processing_error(task, exc)
 
     async def _process_verify(self, task: Task, magnet_uri: str, video: Any) -> Task:

@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     
     state         TEXT NOT NULL DEFAULT 'pending'
                       CHECK (state IN ('pending', 'downloading', 'remuxing',
-                                       'uploading', 'verifying', 'complete', 'failed')),
+                                       'uploading', 'verifying', 'dispatched', 'complete', 'failed')),
     queue_name    TEXT NOT NULL DEFAULT '',
     
     retries       INTEGER NOT NULL DEFAULT 0,

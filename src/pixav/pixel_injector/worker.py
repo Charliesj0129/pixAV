@@ -31,6 +31,21 @@ from pixav.shared.repository import AccountRepository, TaskRepository, VideoRepo
 logger = logging.getLogger(__name__)
 
 
+_RELEASE_UPLOAD_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+_RENEW_UPLOAD_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], tonumber(ARGV[2]))
+end
+return 0
+"""
+
+
 def _task_from_payload(payload: dict[str, Any], *, default_max_retries: int) -> Task:
     """Convert queue payload into a typed Task model."""
     import uuid as _uuid
@@ -143,9 +158,53 @@ async def _release_upload_lock(
     lock_key: str,
     lock_token: str,
 ) -> None:
-    holder = await redis_client.get(lock_key)
-    if holder == lock_token:
-        await redis_client.delete(lock_key)
+    try:
+        await redis_client.eval(_RELEASE_UPLOAD_LOCK_LUA, 1, lock_key, lock_token)
+    except Exception:
+        # Fallback for Redis variants/mocks without EVAL support.
+        holder = await redis_client.get(lock_key)
+        if holder == lock_token:
+            await redis_client.delete(lock_key)
+
+
+async def _renew_upload_lock(
+    redis_client: aioredis.Redis,
+    *,
+    lock_key: str,
+    lock_token: str,
+    ttl_seconds: int,
+) -> bool:
+    try:
+        renewed = await redis_client.eval(_RENEW_UPLOAD_LOCK_LUA, 1, lock_key, lock_token, str(ttl_seconds))
+        return bool(renewed)
+    except Exception:
+        # Fallback for Redis variants/mocks without EVAL support.
+        holder = await redis_client.get(lock_key)
+        if holder != lock_token:
+            return False
+        await redis_client.expire(lock_key, ttl_seconds)
+        return True
+
+
+async def _upload_lock_heartbeat(
+    redis_client: aioredis.Redis,
+    *,
+    lock_key: str,
+    lock_token: str,
+    ttl_seconds: int,
+    interval_seconds: int,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        renewed = await _renew_upload_lock(
+            redis_client,
+            lock_key=lock_key,
+            lock_token=lock_token,
+            ttl_seconds=ttl_seconds,
+        )
+        if not renewed:
+            logger.warning("upload lock lost or expired while processing (%s)", lock_key)
+            return
 
 
 async def _schedule_dlq_replay(
@@ -413,6 +472,7 @@ async def run_worker(  # noqa: C901
             payload, receipt = claimed
 
             lock_token: str | None = None
+            lock_heartbeat_task: asyncio.Task[None] | None = None
             if enforce_single_flight and redis_client is not None:
                 candidate = str(uuid.uuid4())
                 acquired = await _acquire_upload_lock(
@@ -428,6 +488,17 @@ async def run_worker(  # noqa: C901
                     await asyncio.sleep(1)
                     continue
                 lock_token = candidate
+                if upload_lock_ttl_seconds > 1:
+                    refresh_interval = max(1, upload_lock_ttl_seconds // 3)
+                    lock_heartbeat_task = asyncio.create_task(
+                        _upload_lock_heartbeat(
+                            redis_client,
+                            lock_key=upload_lock_key,
+                            lock_token=lock_token,
+                            ttl_seconds=upload_lock_ttl_seconds,
+                            interval_seconds=refresh_interval,
+                        )
+                    )
 
             try:
                 task = _task_from_payload(payload, default_max_retries=default_max_retries)
@@ -494,6 +565,14 @@ async def run_worker(  # noqa: C901
                                 dlq_payload.get("task_id", "unknown"),
                             )
             finally:
+                if lock_heartbeat_task is not None:
+                    lock_heartbeat_task.cancel()
+                    try:
+                        await lock_heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:  # pragma: no cover - defensive heartbeat cleanup
+                        logger.debug("upload lock heartbeat task ended with error: %s", exc)
                 if lock_token is not None and redis_client is not None:
                     await _release_upload_lock(
                         redis_client,

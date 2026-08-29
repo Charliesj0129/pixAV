@@ -510,6 +510,7 @@ class TaskRepository:
         """
         open_states = [
             TaskState.PENDING.value,
+            TaskState.DISPATCHED.value,
             TaskState.DOWNLOADING.value,
             TaskState.REMUXING.value,
             TaskState.UPLOADING.value,

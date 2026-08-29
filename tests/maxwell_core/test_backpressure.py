@@ -13,6 +13,7 @@ from pixav.maxwell_core.backpressure import QueueDepthMonitor
 def mock_queue() -> AsyncMock:
     q = AsyncMock()
     q.length.return_value = 0
+    q.processing_length.return_value = 0
     return q
 
 
@@ -48,11 +49,20 @@ class TestQueueDepthMonitor:
 
     async def test_all_pressures(self, monitor: QueueDepthMonitor, mock_queue: AsyncMock) -> None:
         mock_queue.length.return_value = 15
+        mock_queue.processing_length.return_value = 2
         result = await monitor.all_pressures()
 
         assert "pixav:download" in result
         info = result["pixav:download"]
-        assert info["depth"] == 15
+        assert info["depth"] == 17
+        assert info["queued_depth"] == 15
+        assert info["processing_depth"] == 2
         assert info["ok"] is True
         assert info["warn"] is True
         assert info["critical"] is False
+
+    async def test_processing_depth_contributes_to_backpressure(self, monitor: QueueDepthMonitor, mock_queue: AsyncMock) -> None:
+        mock_queue.length.return_value = 5
+        mock_queue.processing_length.return_value = 20
+
+        assert await monitor.check_pressure("pixav:download") is False

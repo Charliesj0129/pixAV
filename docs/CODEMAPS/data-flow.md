@@ -16,7 +16,8 @@
 | `pixav:crawl` | SHT-Probe | Media-Loader | `{video_id, magnet_uri}` |
 | `pixav:download` | Maxwell-Core | Media-Loader | `{task_id, video_id, magnet_uri}` |
 | `pixav:upload` | Maxwell-Core | Pixel-Injector | `{task_id, video_id, local_path, account_id}` |
-| `pixav:verify` | Pixel-Injector | Maxwell-Core | `{task_id, video_id, share_url}` |
+
+`verifying` remains a task-state concept, but verification currently runs inline inside `pixel_injector` (no dedicated `pixav:verify` queue in runtime modules).
 
 ## State Transitions
 
@@ -29,9 +30,13 @@ discovered → downloading → downloaded → uploading → available
 
 ### Task State
 ```
-pending → downloading → remuxing → uploading → verifying → complete
+pending → dispatched → downloading → remuxing → uploading → verifying → complete
        any state → failed
 ```
+
+Notes:
+- `dispatched` means claimed/enqueued by `maxwell_core`, but not yet started by a worker.
+- In current runtime, the upload worker performs verification inline and typically persists `uploading → complete` without routing through a separate verify queue.
 
 ## PostgreSQL as SSOT
 

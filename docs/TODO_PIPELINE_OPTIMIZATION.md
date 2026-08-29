@@ -14,7 +14,8 @@
 
 ## P0 共享契約 / 架構文件（先做）
 
-- [ ] `TODO-CONTRACT-01` 對齊 `Task` model 與 `tasks` schema 欄位（至少釐清 `trace_id`, `local_path`, `share_url` 是否應持久化）
+- [x] `TODO-CONTRACT-01` 對齊 `Task` model 與 `tasks` schema 欄位（至少釐清 `trace_id`, `local_path`, `share_url` 是否應持久化）
+  - 完成：新增 `tasks.trace_id/local_path/share_url` migration，並讓 `TaskRepository.insert()` 寫入 `trace_id/local_path/share_url`
   - 參考：`src/pixav/shared/models.py:62`
   - 參考：`migrations/001_initial_schema.sql:101`
   - 參考：`src/pixav/shared/repository.py:311`
@@ -24,7 +25,8 @@
   - 參考：`src/pixav/media_loader/worker.py:89`
   - 參考：`src/pixav/pixel_injector/worker.py:34`
 
-- [ ] `TODO-CONTRACT-03` 決定 `pixav:verify` 的去留（保留並實作 / 移除文件與殘留狀態）
+- [x] `TODO-CONTRACT-03` 決定 `pixav:verify` 的去留（保留並實作 / 移除文件與殘留狀態）
+  - 決策：目前 runtime 不使用獨立 `pixav:verify` queue；verification 為 `pixel_injector` 內聯流程。移除 README / CodeMap 的 verify queue 宣告，保留 `TaskState.VERIFYING` 作為可擴展狀態。
   - 參考：`README.md:60`
   - 參考：`docs/CODEMAPS/data-flow.md:12`
   - 參考：`src/pixav/config.py:91`
@@ -38,12 +40,14 @@
 
 ### `maxwell_core`（調度中樞）
 
-- [ ] `TODO-MC-01` 修正 task state 語義：避免「已 dispatch 但尚未被 worker 實際執行」就標成 transient state
+- [x] `TODO-MC-01` 修正 task state 語義：避免「已 dispatch 但尚未被 worker 實際執行」就標成 transient state
+  - 完成：新增 `TaskState.DISPATCHED`，讓 orchestrator claim+enqueue 時先標記 `dispatched`；worker 實際開始時才進入 `downloading/uploading` 等 transient state
   - 目標：降低 orphan cleanup 誤判
   - 參考：`src/pixav/maxwell_core/orchestrator.py:77`
   - 參考：`src/pixav/maxwell_core/gc.py:18`
 
-- [ ] `TODO-MC-02` Backpressure 監控納入 `:processing` inflight 深度（不只看主 queue）
+- [x] `TODO-MC-02` Backpressure 監控納入 `:processing` inflight 深度（不只看主 queue）
+  - 完成：`TaskQueue` 新增 `processing_length()` / `total_depth()`；`QueueDepthMonitor` 以 `queued + processing` 做 backpressure，並在 health 資訊回報 breakdown
   - 參考：`src/pixav/maxwell_core/backpressure.py:51`
   - 參考：`src/pixav/shared/queue.py:26`
 
@@ -63,7 +67,8 @@
 
 ### `media_loader`（下載/轉檔）
 
-- [ ] `TODO-ML-01` 確保失敗路徑也會清理 torrent（download 成功但 remux 失敗時不可殘留）
+- [x] `TODO-ML-01` 確保失敗路徑也會清理 torrent（download 成功但 remux 失敗時不可殘留）
+  - 完成：`MediaLoaderService.process_task()` 在拿到 torrent hash 後若於正常 cleanup 前失敗，會執行 best-effort cleanup；新增 remux fail 測試驗證會呼叫 `delete_torrent`
   - 參考：`src/pixav/media_loader/service.py:83`
   - 參考：`src/pixav/media_loader/service.py:95`
 
@@ -87,10 +92,12 @@
 
 ### `pixel_injector`（上傳 / Redroid / ADB）
 
-- [ ] `TODO-PI-01` 修正 upload 分散式鎖釋放為原子操作（Lua compare-and-del），避免 `GET`/`DEL` race
+- [x] `TODO-PI-01` 修正 upload 分散式鎖釋放為原子操作（Lua compare-and-del），避免 `GET`/`DEL` race
+  - 完成：`pixel_injector.worker._release_upload_lock()` 改為 Redis Lua compare-and-del，並保留無 `EVAL` 能力時的 fallback
   - 參考：`src/pixav/pixel_injector/worker.py:140`
 
-- [ ] `TODO-PI-02` 為 upload 鎖加入 TTL 續租（heartbeat），避免長任務鎖過期導致雙重處理
+- [x] `TODO-PI-02` 為 upload 鎖加入 TTL 續租（heartbeat），避免長任務鎖過期導致雙重處理
+  - 完成：upload 鎖持有期間啟動背景 heartbeat，定期續租 TTL；新增 `_renew_upload_lock()`（Lua compare-and-expire）與測試
   - 參考：`src/pixav/pixel_injector/worker.py:360`
   - 參考：`src/pixav/pixel_injector/worker.py:416`
   - 參考：`src/pixav/pixel_injector/service.py:102`
@@ -178,11 +185,10 @@
 
 ## 建議第一批開工（最穩妥）
 
-- [ ] `TODO-CONTRACT-01`
-- [ ] `TODO-CONTRACT-03`
-- [ ] `TODO-MC-01`
-- [ ] `TODO-MC-02`
-- [ ] `TODO-ML-01`
-- [ ] `TODO-PI-01`
-- [ ] `TODO-PI-02`
-
+- [x] `TODO-CONTRACT-01`
+- [x] `TODO-CONTRACT-03`
+- [x] `TODO-MC-01`
+- [x] `TODO-MC-02`
+- [x] `TODO-ML-01`
+- [x] `TODO-PI-01`
+- [x] `TODO-PI-02`

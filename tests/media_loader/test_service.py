@@ -185,12 +185,14 @@ class TestMediaLoaderService:
             error_message=result.error_message,
         )
         mock_video_repo.update_status.assert_any_await(sample_task.video_id, VideoStatus.FAILED)
+        mock_client.delete_torrent.assert_not_awaited()
 
     async def test_process_task_remux_fails(
         self,
         service: MediaLoaderService,
         sample_task: Task,
         mock_remuxer: AsyncMock,
+        mock_client: AsyncMock,
     ) -> None:
         mock_remuxer.remux.side_effect = RemuxError("ffmpeg crashed")
 
@@ -198,6 +200,7 @@ class TestMediaLoaderService:
 
         assert result.state == TaskState.FAILED
         assert "RemuxError" in (result.error_message or "")
+        mock_client.delete_torrent.assert_awaited_once_with("hash123", delete_files=True)
 
     async def test_process_task_metadata_failure_non_fatal(
         self,

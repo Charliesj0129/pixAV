@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Application-wide configuration loaded from environment variables."""
 
-    model_config = {"env_prefix": "PIXAV_", "frozen": True}
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="PIXAV_", frozen=True, extra="ignore")
 
     # PostgreSQL
     db_host: str = "localhost"

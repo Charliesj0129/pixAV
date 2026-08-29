@@ -108,3 +108,14 @@ class TaskQueue:
         """Return the current depth of the queue."""
         n = cast(int, await cast(Any, self._redis).llen(self._queue_name))
         return n
+
+    async def processing_length(self) -> int:
+        """Return the current depth of the in-flight processing list."""
+        n = cast(int, await cast(Any, self._redis).llen(self.processing_name))
+        return n
+
+    async def total_depth(self) -> int:
+        """Return queued + in-flight depth for backpressure monitoring."""
+        queued = await self.length()
+        inflight = await self.processing_length()
+        return queued + inflight

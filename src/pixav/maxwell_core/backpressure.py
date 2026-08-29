@@ -18,8 +18,9 @@ class QueueDepthMonitor:
 
     Implements the ``BackpressureMonitor`` protocol.
 
-    Returns ``True`` (OK to dispatch) when queue depth is below the
-    critical threshold, ``False`` when backpressured.
+    Returns ``True`` (OK to dispatch) when total queue depth
+    (queued + in-flight ``:processing``) is below the critical threshold,
+    ``False`` when backpressured.
     """
 
     def __init__(
@@ -48,14 +49,30 @@ class QueueDepthMonitor:
             logger.warning("unknown queue %s, assuming OK", queue_name)
             return True
 
-        depth = await queue.length()
+        queued_depth = await queue.length()
+        processing_depth = await queue.processing_length()
+        depth = queued_depth + processing_depth
 
         if depth >= self._critical:
-            logger.warning("queue %s backpressured: depth=%d (critical=%d)", queue_name, depth, self._critical)
+            logger.warning(
+                "queue %s backpressured: total=%d queued=%d processing=%d (critical=%d)",
+                queue_name,
+                depth,
+                queued_depth,
+                processing_depth,
+                self._critical,
+            )
             return False
 
         if depth >= self._warn:
-            logger.info("queue %s elevated: depth=%d (warn=%d)", queue_name, depth, self._warn)
+            logger.info(
+                "queue %s elevated: total=%d queued=%d processing=%d (warn=%d)",
+                queue_name,
+                depth,
+                queued_depth,
+                processing_depth,
+                self._warn,
+            )
 
         return True
 
@@ -67,9 +84,13 @@ class QueueDepthMonitor:
         """
         result: dict[str, dict[str, int | bool]] = {}
         for name, queue in self._queues.items():
-            depth = await queue.length()
+            queued_depth = await queue.length()
+            processing_depth = await queue.processing_length()
+            depth = queued_depth + processing_depth
             result[name] = {
                 "depth": depth,
+                "queued_depth": queued_depth,
+                "processing_depth": processing_depth,
                 "ok": depth < self._critical,
                 "warn": depth >= self._warn,
                 "critical": depth >= self._critical,

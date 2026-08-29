@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from unittest.mock import AsyncMock, patch
 
-from pixav.pixel_injector.worker import run_worker
+from pixav.pixel_injector.worker import _release_upload_lock, _renew_upload_lock, run_worker
 from pixav.shared.enums import TaskState
 from pixav.shared.models import Task
 
@@ -277,3 +277,71 @@ class TestPixelInjectorWorker:
 
         service.process_task.assert_not_awaited()
         queue.ack.assert_awaited()
+
+    async def test_release_upload_lock_uses_lua_compare_and_delete(self) -> None:
+        redis_client = AsyncMock()
+
+        await _release_upload_lock(
+            redis_client,
+            lock_key="pixav:upload:lock",
+            lock_token="token-123",
+        )
+
+        redis_client.eval.assert_awaited_once()
+        args = redis_client.eval.call_args[0]
+        assert "redis.call('get'" in args[0]
+        assert args[1] == 1
+        assert args[2] == "pixav:upload:lock"
+        assert args[3] == "token-123"
+        redis_client.get.assert_not_awaited()
+        redis_client.delete.assert_not_awaited()
+
+    async def test_release_upload_lock_falls_back_when_eval_unavailable(self) -> None:
+        redis_client = AsyncMock()
+        redis_client.eval.side_effect = RuntimeError("EVAL disabled")
+        redis_client.get.return_value = "token-123"
+
+        await _release_upload_lock(
+            redis_client,
+            lock_key="pixav:upload:lock",
+            lock_token="token-123",
+        )
+
+        redis_client.get.assert_awaited_once_with("pixav:upload:lock")
+        redis_client.delete.assert_awaited_once_with("pixav:upload:lock")
+
+    async def test_renew_upload_lock_uses_lua_compare_and_expire(self) -> None:
+        redis_client = AsyncMock()
+        redis_client.eval.return_value = 1
+
+        renewed = await _renew_upload_lock(
+            redis_client,
+            lock_key="pixav:upload:lock",
+            lock_token="token-123",
+            ttl_seconds=7200,
+        )
+
+        assert renewed is True
+        redis_client.eval.assert_awaited_once()
+        args = redis_client.eval.call_args[0]
+        assert "redis.call('expire'" in args[0]
+        assert args[2] == "pixav:upload:lock"
+        assert args[3] == "token-123"
+        assert args[4] == "7200"
+
+    async def test_renew_upload_lock_falls_back_when_eval_unavailable(self) -> None:
+        redis_client = AsyncMock()
+        redis_client.eval.side_effect = RuntimeError("EVAL disabled")
+        redis_client.get.return_value = "token-123"
+        redis_client.expire.return_value = True
+
+        renewed = await _renew_upload_lock(
+            redis_client,
+            lock_key="pixav:upload:lock",
+            lock_token="token-123",
+            ttl_seconds=60,
+        )
+
+        assert renewed is True
+        redis_client.get.assert_awaited_once_with("pixav:upload:lock")
+        redis_client.expire.assert_awaited_once_with("pixav:upload:lock", 60)

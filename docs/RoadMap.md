@@ -58,17 +58,19 @@
 ### Phase 1: 最小可行性串接 (MVP E2E) - _Current_
 
 - [x] 設計資料庫 Schema (Migrations)。
-- [x] 完成 `sht_probe` 對核心論壇的爬取與 Cloudflare 繞過。
+- [x] 完成 `sht_probe` 對核心論壇的爬取與 Cloudflare 繞過，並修復環境變數載入。
 - [x] 實作 `pixel_injector` 的 Android 模擬器建立與自動化 Google 登入。
-- [ ] 完善 `media_loader` 與 qBittorrent 的掛載與自動下載。
-- [ ] 串聯全管線：從爬蟲發現影片到順利產生 Google Photos 分享網址。
+- [x] 完善 `media_loader` 與 qBittorrent 的掛載與自動連線修復。
+- [x] 修復 `maxwell_core` 任務調度的狀態寫入約束 (State Constraint) 與派發邏輯。
+- [ ] 串聯全管線：從爬蟲發現影片、透過 FFmpeg 處理到順利產生 Google Photos 分享網址。
 
 ### Phase 2: 穩定化與核心調度優化 (Stabilization)
 
+- [x] 整備 `docker-compose.prod.yml` 進入正式生產環境部署 (排除 s6-overlay 崩潰問題，並建立背景長駐 `tmux` 腳本)。
+- [x] `strm_resolver` 正確載入環境變數與 Redis 串接。
 - [ ] 在 `maxwell_core` 中實作完整的背壓 (Backpressure) 與佇列深度監控。
 - [ ] 強化錯誤處理、Retries 機制與通知警報 (Alerting)。
 - [ ] 建構 `strm_resolver` 使前端播放器可直接消耗爬取並上傳好的影片。
-- [ ] 整備 `docker-compose.prod.yml` 進入正式生產環境部署。
 
 ### Phase 3: 效能與架構演進 (High Performance & Rust Rewrite)
 
