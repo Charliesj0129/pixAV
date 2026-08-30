@@ -9,7 +9,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 from pydantic import ValidationError
@@ -23,12 +23,15 @@ from pixav.pixel_injector.uploader import UIAutomatorUploader
 from pixav.pixel_injector.verifier import GooglePhotosVerifier
 from pixav.shared.db import create_pool
 from pixav.shared.enums import TaskState, VideoStatus
+from pixav.shared.metrics import record_task_failed, record_task_processed, record_task_retried
 from pixav.shared.models import Task
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import AccountRepository, TaskRepository, VideoRepository
 
 logger = logging.getLogger(__name__)
+
+_METRICS_MODULE = "pixel_injector"
 
 
 _RELEASE_UPLOAD_LOCK_LUA = """
@@ -159,7 +162,7 @@ async def _release_upload_lock(
     lock_token: str,
 ) -> None:
     try:
-        await redis_client.eval(_RELEASE_UPLOAD_LOCK_LUA, 1, lock_key, lock_token)
+        await cast(Any, redis_client).eval(_RELEASE_UPLOAD_LOCK_LUA, 1, lock_key, lock_token)
     except Exception:
         # Fallback for Redis variants/mocks without EVAL support.
         holder = await redis_client.get(lock_key)
@@ -175,7 +178,7 @@ async def _renew_upload_lock(
     ttl_seconds: int,
 ) -> bool:
     try:
-        renewed = await redis_client.eval(_RENEW_UPLOAD_LOCK_LUA, 1, lock_key, lock_token, str(ttl_seconds))
+        renewed = await cast(Any, redis_client).eval(_RENEW_UPLOAD_LOCK_LUA, 1, lock_key, lock_token, str(ttl_seconds))
         return bool(renewed)
     except Exception:
         # Fallback for Redis variants/mocks without EVAL support.
@@ -344,6 +347,7 @@ async def _persist_success(
     if account_repo is not None and result.account_id is not None:
         uploaded_bytes = _uploaded_bytes_from_task(result)
         await account_repo.apply_upload_usage(result.account_id, uploaded_bytes)
+    record_task_processed(_METRICS_MODULE)
     logger.info("task %s complete (trace_id=%s)", result.id, result.trace_id)
 
 
@@ -369,6 +373,7 @@ async def _persist_failure(
         if video_repo is not None:
             await video_repo.update_status(result.video_id, VideoStatus.DOWNLOADED)
         await retry_queue.push(_build_retry_payload(result, next_retry))
+        record_task_retried(_METRICS_MODULE)
         logger.warning(
             "task %s failed (attempt %d/%d), requeued: %s",
             result.id,
@@ -386,6 +391,7 @@ async def _persist_failure(
     dlq_payload = _build_dlq_payload(result, error_message)
     if dlq_queue is not None:
         await dlq_queue.push(dlq_payload)
+    record_task_failed(_METRICS_MODULE)
     logger.error("task %s failed permanently: %s", result.id, error_message)
     return dlq_payload
 
@@ -522,11 +528,11 @@ async def run_worker(  # noqa: C901
                         )
                     else:
                         await _mark_uploading(task, task_repo=task_repo, video_repo=video_repo)
-                        
+
                         account = None
                         if task.account_id is not None and account_repo is not None:
                             account = await account_repo.find_by_id(task.account_id)
-                            
+
                         result = await service.process_task(task, account)
                         if result.state == TaskState.COMPLETE and result.share_url:
                             await _persist_success(

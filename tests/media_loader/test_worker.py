@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from pixav.config import Settings
-from pixav.media_loader.worker import _parse_int, _parse_uuid, run_loop
+from pixav.media_loader.worker import _parse_int, _parse_uuid, _record_task_outcome, run_loop
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import DownloadError
 from pixav.shared.models import Task
@@ -186,3 +186,23 @@ class TestMediaLoaderWorker:
         assert _parse_int("10", default=1, minimum=0) == 10
         assert _parse_int("x", default=3, minimum=0) == 3
         assert _parse_int("-5", default=3, minimum=0) == 0
+
+
+class TestRecordTaskOutcome:
+    """Terminal task states must map onto the shared Prometheus counters."""
+
+    def test_complete_counts_as_processed(self) -> None:
+        with patch("pixav.media_loader.worker.record_task_processed") as processed:
+            _record_task_outcome(TaskState.COMPLETE)
+        processed.assert_called_once_with("media_loader")
+
+    def test_failed_counts_as_failed(self) -> None:
+        with patch("pixav.media_loader.worker.record_task_failed") as failed:
+            _record_task_outcome(TaskState.FAILED)
+        failed.assert_called_once_with("media_loader")
+
+    @pytest.mark.parametrize("state", [TaskState.PENDING, TaskState.DOWNLOADING, TaskState.REMUXING])
+    def test_non_terminal_states_count_as_retried(self, state: TaskState) -> None:
+        with patch("pixav.media_loader.worker.record_task_retried") as retried:
+            _record_task_outcome(state)
+        retried.assert_called_once_with("media_loader")

@@ -8,6 +8,7 @@ import logging
 from pixav.config import Settings, get_settings
 from pixav.shared.cookies import load_cookies
 from pixav.shared.db import create_pool
+from pixav.shared.metrics import record_task_failed, record_task_processed
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import VideoRepository
@@ -19,6 +20,8 @@ from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
 from pixav.sht_probe.service import ShtProbeService
 
 logger = logging.getLogger(__name__)
+
+_METRICS_MODULE = "sht_probe"
 
 
 async def run_once(settings: Settings) -> list[str]:
@@ -105,7 +108,9 @@ async def run_once(settings: Settings) -> list[str]:
                     max_pages=settings.crawl_max_pages,
                 )
                 all_new.extend(new)
+                record_task_processed(_METRICS_MODULE, len(new))
             except Exception as exc:
+                record_task_failed(_METRICS_MODULE)
                 logger.error("crawl failed for %s: %s", url, exc)
 
         # Search Jackett queries
@@ -117,7 +122,9 @@ async def run_once(settings: Settings) -> list[str]:
                     continue
                 new = await generic_service.run_search(query)
                 all_new.extend(new)
+                record_task_processed(_METRICS_MODULE, len(new))
             except Exception as exc:
+                record_task_failed(_METRICS_MODULE)
                 logger.error("search failed for %r: %s", query, exc)
 
         logger.info("crawl cycle complete: %d new magnets total", len(all_new))
@@ -144,6 +151,7 @@ async def run_loop(settings: Settings) -> None:
         try:
             await run_once(settings)
         except Exception as exc:
+            record_task_failed(_METRICS_MODULE)
             logger.exception("crawl cycle error: %s", exc)
 
         logger.info("sleeping %ds until next crawl cycle", settings.crawl_interval_seconds)

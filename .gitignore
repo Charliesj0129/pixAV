@@ -47,3 +47,16 @@ node_modules/
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# Operational backups — contain live queue payloads, magnets and task/account IDs
+backups/
+
+# Local verification harness output (logs, per-run scratch)
+.verify/
+
+# understand-anything knowledge graph cache
+.ua/
+
+# Android platform-tools (vendored binaries, not project source)
+platform-tools/
+platform-tools-*.zip

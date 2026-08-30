@@ -15,12 +15,25 @@ from pixav.media_loader.service import MediaLoaderService
 from pixav.shared.db import create_pool
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import DownloadError
+from pixav.shared.metrics import record_task_failed, record_task_processed, record_task_retried
 from pixav.shared.models import Task
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import TaskRepository, VideoRepository
 
 logger = logging.getLogger(__name__)
+
+_METRICS_MODULE = "media_loader"
+
+
+def _record_task_outcome(state: TaskState) -> None:
+    """Translate a terminal task state into a Prometheus counter increment."""
+    if state is TaskState.COMPLETE:
+        record_task_processed(_METRICS_MODULE)
+    elif state is TaskState.FAILED:
+        record_task_failed(_METRICS_MODULE)
+    else:
+        record_task_retried(_METRICS_MODULE)
 
 
 async def run_loop(settings: Settings) -> None:  # noqa: C901
@@ -128,6 +141,7 @@ async def run_loop(settings: Settings) -> None:  # noqa: C901
 
                 try:
                     result = await service.process_task(task)
+                    _record_task_outcome(result.state)
                     logger.info(
                         "task %s result: %s (trace_id=%s)",
                         result.id,
@@ -135,6 +149,7 @@ async def run_loop(settings: Settings) -> None:  # noqa: C901
                         result.trace_id,
                     )
                 except Exception as exc:
+                    record_task_failed(_METRICS_MODULE)
                     logger.exception("unexpected error processing task %s: %s", task.id, exc)
 
                 await download_queue.ack(receipt)

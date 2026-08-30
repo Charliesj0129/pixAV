@@ -108,10 +108,11 @@ class ShtProbeService:
                         logger.warning("failed to extract from %s: %s", page_url, exc)
             else:
                 semaphore = asyncio.Semaphore(self._page_fetch_concurrency)
+                crawler = self._crawler
 
                 async def _fetch_and_extract(page_url: str) -> list[str]:
                     async with semaphore:
-                        html = await self._crawler.fetch_page_html(page_url)
+                        html = await crawler.fetch_page_html(page_url)
                         return await self._extractor.extract(html)
 
                 results = await asyncio.gather(
@@ -119,7 +120,7 @@ class ShtProbeService:
                     return_exceptions=True,
                 )
                 for page_url, result in zip(page_urls, results, strict=True):
-                    if isinstance(result, Exception):
+                    if isinstance(result, BaseException):
                         logger.warning("failed to extract from %s: %s", page_url, result)
                         continue
                     all_magnets.update(result)

@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS storage_instances (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_storage_health ON storage_instances (health);
+CREATE INDEX IF NOT EXISTS idx_storage_health ON storage_instances (health);
 
 
 -- 3. Accounts
@@ -42,10 +42,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_accounts_status ON accounts (status);
-CREATE INDEX idx_accounts_last_used ON accounts (last_used_at);
-CREATE INDEX idx_accounts_cooldown_until ON accounts (cooldown_until);
-CREATE INDEX idx_accounts_lease_expires ON accounts (lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts (status);
+CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts (last_used_at);
+CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts (cooldown_until);
+CREATE INDEX IF NOT EXISTS idx_accounts_lease_expires ON accounts (lease_expires_at);
 
 -- Circular FK for storage_instances -> accounts
 ALTER TABLE storage_instances
@@ -84,16 +84,23 @@ CREATE TABLE IF NOT EXISTS videos (
     updated_at    TIMESTAMPTZ
 );
 
-CREATE UNIQUE INDEX idx_videos_info_hash ON videos(info_hash);
-CREATE INDEX idx_videos_status ON videos (status);
-CREATE INDEX idx_videos_tags ON videos USING gin(tags);
+-- Reconcile pre-existing `videos` tables created before this schema was the
+-- source of truth, so the indexes and trigger below can be applied re-entrantly.
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS info_hash     VARCHAR(40);
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS tags          TEXT[] DEFAULT '{}';
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS quality_score INTEGER DEFAULT 0;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS search_text   tsvector;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_info_hash ON videos(info_hash);
+CREATE INDEX IF NOT EXISTS idx_videos_status ON videos (status);
+CREATE INDEX IF NOT EXISTS idx_videos_tags ON videos USING gin(tags);
 
 -- Full Text Search Index (GIN)
-CREATE INDEX idx_videos_search_text ON videos USING GIN (search_text);
+CREATE INDEX IF NOT EXISTS idx_videos_search_text ON videos USING GIN (search_text);
 -- Trigram Index for fuzzy title matching (e.g. partial codes)
-CREATE INDEX idx_videos_title_trgm ON videos USING GIN (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_videos_title_trgm ON videos USING GIN (title gin_trgm_ops);
 -- HNSW Vector Index (Cosine Similarity)
-CREATE INDEX idx_videos_embedding ON videos USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_videos_embedding ON videos USING hnsw (embedding vector_cosine_ops);
 
 
 -- 5. Tasks
@@ -116,9 +123,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at    TIMESTAMPTZ
 );
 
-CREATE INDEX idx_tasks_state ON tasks (state);
-CREATE INDEX idx_tasks_video ON tasks (video_id);
-CREATE INDEX idx_tasks_account ON tasks (account_id);
+-- Same reconciliation for pre-existing `tasks` tables.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_name    TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks (state);
+CREATE INDEX IF NOT EXISTS idx_tasks_video ON tasks (video_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_account ON tasks (account_id);
 
 
 -- 6. Triggers

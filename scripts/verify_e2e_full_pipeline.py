@@ -122,11 +122,25 @@ def _queue_names(settings: Settings, run_id: str) -> tuple[str, str, str]:
     )
 
 
-async def _create_isolated_db(settings: Settings, *, run_id: str) -> tuple[str, str]:
-    base_dsn = settings.dsn
-    admin_dsn = os.getenv("PIXAV_E2E_ADMIN_DSN", "").strip()
-    if not admin_dsn:
-        admin_dsn = _replace_db_name(base_dsn, "postgres")
+def resolve_admin_dsn(settings: Settings) -> str:
+    """Return the maintenance DSN used to create and drop isolated databases.
+
+    Creation and cleanup must resolve this identically, otherwise a
+    ``PIXAV_E2E_ADMIN_DSN`` override can create the test database on one server
+    and issue ``DROP DATABASE IF EXISTS`` against another — which reports
+    success while leaking the real database.
+    """
+    override = os.getenv("PIXAV_E2E_ADMIN_DSN", "").strip()
+    return override or _replace_db_name(settings.dsn, "postgres")
+
+
+async def _create_isolated_db(settings: Settings, *, run_id: str) -> tuple[str, str, str]:
+    """Create a throwaway database and return ``(target_dsn, db_name, admin_dsn)``.
+
+    The admin DSN is returned so callers cannot re-derive a different one for
+    cleanup.
+    """
+    admin_dsn = resolve_admin_dsn(settings)
 
     db_name = f"pixav_e2e_full_{run_id}_{uuid.uuid4().hex[:6]}"
     admin_conn = await asyncpg.connect(admin_dsn)
@@ -137,7 +151,7 @@ async def _create_isolated_db(settings: Settings, *, run_id: str) -> tuple[str, 
 
     target_dsn = _replace_db_name(admin_dsn, db_name)
     await _apply_migrations(target_dsn)
-    return target_dsn, db_name
+    return target_dsn, db_name, admin_dsn
 
 
 async def _apply_migrations(dsn: str) -> None:
@@ -228,12 +242,13 @@ async def main() -> None:
     output_dir = str(Path(settings.download_dir) / "e2e" / run_id)
 
     # DB wiring (isolated by default to avoid polluting real data)
-    admin_dsn = os.getenv("PIXAV_E2E_ADMIN_DSN", "").strip() or _replace_db_name(settings.dsn, "postgres")
+
     db_dsn = settings.dsn
     db_name = ""
+    admin_dsn = resolve_admin_dsn(settings)
     if isolated_db:
         logger.info("creating isolated E2E database (run_id=%s)", run_id)
-        db_dsn, db_name = await _create_isolated_db(settings, run_id=run_id)
+        db_dsn, db_name, admin_dsn = await _create_isolated_db(settings, run_id=run_id)
 
     pool = await asyncpg.create_pool(dsn=db_dsn, min_size=1, max_size=5)
     redis = await create_redis(settings)
@@ -472,7 +487,16 @@ async def main() -> None:
 
     finally:
         try:
-            await redis.delete(crawl_queue_name, download_queue_name, upload_queue_name)
+            # Also drop the ``:processing`` in-flight lists, otherwise an
+            # aborted run leaves claimed payloads behind under the run's keys.
+            await redis.delete(
+                crawl_queue_name,
+                download_queue_name,
+                upload_queue_name,
+                f"{crawl_queue_name}:processing",
+                f"{download_queue_name}:processing",
+                f"{upload_queue_name}:processing",
+            )
         except Exception as exc:
             logger.debug("failed to cleanup E2E redis queues: %s", exc)
         await redis.aclose()
