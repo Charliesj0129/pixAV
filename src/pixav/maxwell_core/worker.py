@@ -17,12 +17,15 @@ from pixav.maxwell_core.orchestrator import MaxwellOrchestrator
 from pixav.maxwell_core.scheduler import LruAccountScheduler
 from pixav.shared.db import create_pool
 from pixav.shared.enums import TaskState
+from pixav.shared.metrics import record_task_failed, record_task_processed, set_queue_depth
 from pixav.shared.models import Task
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import TaskRepository, VideoRepository
 
 logger = logging.getLogger(__name__)
+
+_METRICS_MODULE = "maxwell_core"
 
 
 def _parse_uuid(value: Any) -> uuid.UUID | None:
@@ -94,9 +97,11 @@ async def ingest_crawl_queue(
             await task_repo.insert(new_task)
             logger.debug("created task %s for video %s (trace_id=%s)", new_task.id, video_id, new_task.trace_id)
             created += 1
+            record_task_processed(_METRICS_MODULE)
             await crawl_queue.ack(receipt)
             acked = True
         except Exception as exc:
+            record_task_failed(_METRICS_MODULE)
             logger.exception("crawl ingest error: %s", exc)
             if receipt is not None and not acked:
                 try:
@@ -105,6 +110,15 @@ async def ingest_crawl_queue(
                     logger.error("failed to nack crawl payload: %s", nack_exc)
 
     return created
+
+
+async def _publish_queue_depths(crawl_queue: TaskQueue, queues: dict[str, TaskQueue]) -> None:
+    """Export queued + in-flight depth for every pipeline queue as a gauge."""
+    for queue in (crawl_queue, *queues.values()):
+        try:
+            set_queue_depth(queue.name, await queue.total_depth())
+        except Exception as exc:  # pragma: no cover - metrics must never break the tick
+            logger.warning("failed to publish depth for queue %s: %s", queue.name, exc)
 
 
 async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = None) -> None:
@@ -174,6 +188,7 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
                     max_retries=settings.download_max_retries,
                 )
                 stats = await orchestrator.tick()
+                await _publish_queue_depths(crawl_queue, queues)
                 if created:
                     logger.info("ingested %d crawl payload(s) into tasks", created)
                 logger.info("tick result: %s", stats)
@@ -189,7 +204,7 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
 def main() -> None:
     """Entry point for ``python -m pixav.maxwell_core.worker``."""
     import uvicorn
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI
     from fastapi.responses import PlainTextResponse
 
     from pixav.shared.metrics import get_metrics_output

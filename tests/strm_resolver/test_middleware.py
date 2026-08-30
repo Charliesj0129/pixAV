@@ -36,4 +36,4 @@ async def test_rate_limit_allows_when_redis_unavailable() -> None:
         response = await client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "module": "strm_resolver"}

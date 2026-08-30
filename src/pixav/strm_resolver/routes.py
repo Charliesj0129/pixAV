@@ -7,9 +7,10 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 
 from pixav.shared.exceptions import ResolveError
+from pixav.shared.metrics import get_metrics_output
 from pixav.strm_resolver.cache import CdnCache
 
 router = APIRouter()
@@ -189,4 +190,13 @@ async def health_check() -> dict[str, str]:
     Returns:
         Status dictionary
     """
-    return {"status": "ok"}
+    return {"status": "ok", "module": "strm_resolver"}
+
+
+@router.get("/metrics", response_class=PlainTextResponse)
+async def metrics() -> PlainTextResponse:
+    """Prometheus text-format metrics, matching the shared worker contract."""
+    return PlainTextResponse(
+        content=get_metrics_output().decode("utf-8"),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )

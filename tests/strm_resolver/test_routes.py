@@ -24,7 +24,18 @@ async def test_health_returns_ok(app):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/health")
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        assert response.json() == {"status": "ok", "module": "strm_resolver"}
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_exposes_prometheus_payload(app):
+    """Strm-Resolver must honour the shared /metrics contract, not 404."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/metrics")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        assert "pixav_tasks_processed_total" in response.text
 
 
 @pytest.mark.asyncio

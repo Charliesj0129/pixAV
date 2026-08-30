@@ -3,9 +3,10 @@ services:
     image: pgvector/pgvector:pg16
     container_name: pixav-postgres
     environment:
-      POSTGRES_USER: pixav
-      POSTGRES_PASSWORD: pixav
-      POSTGRES_DB: pixav
+      # Credentials come from .env (never hardcode them here).
+      POSTGRES_USER: ${PIXAV_DB_USER:?set PIXAV_DB_USER in .env}
+      POSTGRES_PASSWORD: ${PIXAV_DB_PASSWORD:?set PIXAV_DB_PASSWORD in .env}
+      POSTGRES_DB: ${PIXAV_DB_NAME:?set PIXAV_DB_NAME in .env}
     ports:
       - "${PIXAV_POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -13,7 +14,7 @@ services:
     networks:
       - pixav
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pixav"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -106,6 +107,13 @@ services:
     depends_on:
       - postgres
       - redis
+    # Without this the container only sees the `environment:` keys below and
+    # silently falls back to Settings() defaults for everything else —
+    # including PIXAV_PIXEL_INJECTOR_MODE, which defaults to `redroid`.
+    env_file:
+      - .env
+    # `environment:` wins over `env_file:`, so the host-network overrides below
+    # still take precedence.
     environment:
       # host network -> must follow the same published-port variables as the
       # postgres/redis services above, not the in-container ports.

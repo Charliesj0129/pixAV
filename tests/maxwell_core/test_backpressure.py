@@ -61,7 +61,9 @@ class TestQueueDepthMonitor:
         assert info["warn"] is True
         assert info["critical"] is False
 
-    async def test_processing_depth_contributes_to_backpressure(self, monitor: QueueDepthMonitor, mock_queue: AsyncMock) -> None:
+    async def test_processing_depth_contributes_to_backpressure(
+        self, monitor: QueueDepthMonitor, mock_queue: AsyncMock
+    ) -> None:
         mock_queue.length.return_value = 5
         mock_queue.processing_length.return_value = 20
 

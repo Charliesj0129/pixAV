@@ -35,17 +35,23 @@ class TaskQueue:
         return length
 
     async def pop_claim(self, timeout: int = 0) -> tuple[dict[str, Any], str] | None:
-        """Durably claim one payload using BRPOPLPUSH.
+        """Durably claim the oldest payload using ``BLMOVE LEFT RIGHT``.
+
+        ``push()`` appends to the tail, so claiming must take from the head to
+        preserve FIFO ordering; consuming from the tail would starve the oldest
+        messages whenever new work keeps arriving.
 
         The message is atomically moved from ``name`` to ``processing_name`` and
         must be completed with ``ack()`` or ``nack()`` by the consumer.
         """
         raw = cast(
             str | bytes | None,
-            await cast(Any, self._redis).brpoplpush(
+            await cast(Any, self._redis).blmove(
                 self._queue_name,
                 self.processing_name,
-                timeout=timeout,
+                timeout,
+                "LEFT",
+                "RIGHT",
             ),
         )
         if raw is None:
@@ -66,7 +72,11 @@ class TaskQueue:
         return removed > 0
 
     async def nack(self, receipt: str, *, requeue: bool = True, front: bool = False) -> bool:
-        """Reject a claimed payload and optionally requeue it."""
+        """Reject a claimed payload and optionally requeue it.
+
+        ``front=True`` pushes to the head so the payload is claimed next;
+        ``front=False`` appends to the tail behind all currently queued work.
+        """
         removed = cast(int, await cast(Any, self._redis).lrem(self.processing_name, 1, receipt))
         if removed <= 0:
             return False
@@ -78,7 +88,11 @@ class TaskQueue:
         return True
 
     async def requeue_inflight(self, max_items: int = 500) -> int:
-        """Move stuck in-flight payloads back to the main queue."""
+        """Move stuck in-flight payloads back to the head of the main queue.
+
+        Draining the processing list newest-first and pushing each to the head
+        restores the original FIFO order ahead of newly queued work.
+        """
         moved = 0
         for _ in range(max_items):
             raw = cast(

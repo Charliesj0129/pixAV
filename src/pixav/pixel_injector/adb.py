@@ -35,10 +35,10 @@ class AdbConnection:
         stdout, stderr, rc = await self._run("connect", self._target)
         if rc != 0 or "cannot" in stdout.lower():
             raise AdbError(f"ADB connect failed to {self._target}: {stdout} {stderr}")
-        
+
         # Wait for device to come fully online
         await self._run("-s", self._target, "wait-for-device")
-        
+
         # Also wait for sys.boot_completed = 1
         for _ in range(60):
             try:
