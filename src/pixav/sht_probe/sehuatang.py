@@ -54,6 +54,7 @@ class SehuatangCrawler:
         self._client_lock = asyncio.Lock()
         self._inflight_fetches: dict[str, asyncio.Task[str]] = {}
         self._inflight_lock = asyncio.Lock()
+        self._age_gate_lock = asyncio.Lock()
 
     def seed_cookies(self, cookies: dict[str, str]) -> None:
         """Seed the crawler cookie jar from an external source."""
@@ -123,32 +124,14 @@ class SehuatangCrawler:
             return html
 
         fetched = await self._fetch_via_flaresolverr(url)
-        if not self._looks_like_age_gate(fetched):
-            return fetched
-
-        safeid = self._extract_safeid(fetched)
-        if not safeid:
-            logger.warning("Sehuatang age-gate detected but safeid not found for %s", url)
-            return fetched
-
-        retry_needed = self._cookies.get("safeid") != safeid or self._cookies.get("agree") != "1"
-        if retry_needed:
-            self._cookies.update({"safeid": safeid, "agree": "1"})
-            if self._client is not None:
-                self._client.cookies.update({"safeid": safeid, "agree": "1"})
-            logger.info("Sehuatang age-gate detected for %s; retrying with safeid/agree cookies", url)
-            fetched = await self._fetch_via_flaresolverr(url)
-
-        if self._looks_like_age_gate(fetched):
-            logger.warning("Sehuatang age-gate persists after retry for %s", url)
-        return fetched
+        return await self._handle_age_gate_if_needed(url, fetched)
 
     async def _fetch_via_flaresolverr(self, url: str) -> str:
         """Fetch via FlareSolverr and merge returned cookies / user-agent."""
         result = await self._flaresolverr.get_html(
             url,
             timeout=self._timeout,
-            cookies=self._cookies,
+            cookies=dict(self._cookies),
         )
         if len(result) == 2:
             fetched, new_cookies = result
@@ -166,30 +149,42 @@ class SehuatangCrawler:
                 self._client.headers["User-Agent"] = user_agent
         return fetched
 
-    async def _handle_age_gate_if_needed(self, url: str, html: str, *, source: str) -> str:
-        """Retry once via FlareSolverr if Sehuatang returns the 18+ gate page."""
+    async def _handle_age_gate_if_needed(self, url: str, html: str) -> str:
+        """Retry once via FlareSolverr if Sehuatang returns the 18+ gate page.
+
+        The gate is cleared by the ``_safe`` cookie, whose value is the ``safeid``
+        token embedded in the gate page itself.  ``safeid``/``agree`` are sent
+        alongside it for older Discuz! deployments, but ``_safe`` is the one the
+        current site actually checks -- setting only the other two leaves the gate
+        up and the crawl silently returns zero links.
+
+        Resolution is serialized: every gated page yields its own token, and all
+        of them land in the single shared cookie jar.  Without the lock, N
+        concurrent board fetches each store their token before any of them
+        retries, so every retry goes out carrying whichever token was written
+        last and only that one page comes back real.
+        """
         if not self._looks_like_age_gate(html):
             return html
-
-        if source == "direct":
-            logger.info("Sehuatang age-gate detected on direct fetch for %s; using FlareSolverr retry", url)
 
         safeid = self._extract_safeid(html)
         if not safeid:
             logger.warning("Sehuatang age-gate detected but safeid not found for %s", url)
             return html
 
-        retry_needed = self._cookies.get(_SEHUATANG_SAFE_COOKIE) != safeid
-        if not retry_needed:
-            logger.warning("Sehuatang age-gate persists for %s with existing _safe cookie", url)
-            return html
+        async with self._age_gate_lock:
+            if self._cookies.get(_SEHUATANG_SAFE_COOKIE) == safeid:
+                logger.warning("Sehuatang age-gate persists for %s with existing _safe cookie", url)
+                return html
 
-        self._cookies.update({_SEHUATANG_SAFE_COOKIE: safeid, "safeid": safeid, "agree": "1"})
-        if self._client is not None:
-            self._client.cookies.update({_SEHUATANG_SAFE_COOKIE: safeid, "safeid": safeid, "agree": "1"})
-        logger.info("Sehuatang age-gate detected for %s; retrying with _safe cookie", url)
+            gate_cookies = {_SEHUATANG_SAFE_COOKIE: safeid, "safeid": safeid, "agree": "1"}
+            self._cookies.update(gate_cookies)
+            if self._client is not None:
+                self._client.cookies.update(gate_cookies)
+            logger.info("Sehuatang age-gate detected for %s; retrying with _safe cookie", url)
 
-        retried = await self._fetch_via_flaresolverr(url)
+            retried = await self._fetch_via_flaresolverr(url)
+
         if self._looks_like_age_gate(retried):
             logger.warning("Sehuatang age-gate persists after retry for %s", url)
         return retried

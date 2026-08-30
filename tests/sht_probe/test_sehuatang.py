@@ -131,36 +131,85 @@ def test_extract_links_canonicalizes_viewthread_pagination() -> None:
     assert links == ["https://www.sehuatang.org/forum.php?mod=viewthread&tid=123"]
 
 
-@pytest.mark.unit
-async def test_fetch_html_age_gate_retries_with_safeid_and_agree(mock_flaresolverr: AsyncMock) -> None:
-    """Age-gate page should trigger automatic safeid/agree retry via FlareSolverr."""
-    crawler = SehuatangCrawler(flaresolverr=mock_flaresolverr, request_delay_seconds=0)
-    safe_page = """
+AGE_GATE_PAGE = """
     <html><body>
     <script>var safeid='SAFE123';</script>
     <a class="enter-btn" href="./">If you are over 18，please click here</a>
     </body></html>
     """
+
+
+@pytest.mark.unit
+async def test_fetch_html_age_gate_retries_with_safe_cookie(mock_flaresolverr: AsyncMock) -> None:
+    """Age-gate page should trigger an automatic retry carrying the ``_safe`` cookie.
+
+    The cookies actually transmitted are snapshotted per call: ``_cookies`` is a
+    single mutable dict, so asserting on ``await_args_list`` directly would read
+    the post-retry state and pass even when the retry sent the wrong cookies.
+    """
+    crawler = SehuatangCrawler(flaresolverr=mock_flaresolverr, request_delay_seconds=0)
     real_page = '<html><a href="thread-1-1-1.html">T1</a></html>'
-    mock_flaresolverr.get_html.side_effect = [
-        (safe_page, {"cf_clearance": "cf1"}, "UA-1"),
+    sent_cookies: list[dict[str, str]] = []
+    responses = [
+        (AGE_GATE_PAGE, {"cf_clearance": "cf1"}, "UA-1"),
         (real_page, {"_safe": "SAFE123"}, "UA-2"),
     ]
+
+    async def _capture(_url: str, *, timeout: int, cookies: dict[str, str]) -> tuple[str, dict[str, str], str]:
+        sent_cookies.append(dict(cookies))
+        return responses[len(sent_cookies) - 1]
+
+    mock_flaresolverr.get_html.side_effect = _capture
 
     with respx.mock:
         respx.get("https://www.sehuatang.org/forum-103-1.html").mock(return_value=httpx.Response(403, text="Forbidden"))
         html = await crawler._fetch_html("https://www.sehuatang.org/forum-103-1.html")
 
     assert html == real_page
-    assert mock_flaresolverr.get_html.await_count == 2
-    second_call = mock_flaresolverr.get_html.await_args_list[1]
-    assert second_call.kwargs["cookies"]["_safe"] == "SAFE123"
-    assert second_call.kwargs["cookies"]["safeid"] == "SAFE123"
-    assert second_call.kwargs["cookies"]["agree"] == "1"
+    assert len(sent_cookies) == 2
+    assert sent_cookies[1]["_safe"] == "SAFE123"
+    assert sent_cookies[1]["safeid"] == "SAFE123"
+    assert sent_cookies[1]["agree"] == "1"
     assert crawler._cookies.get("_safe") == "SAFE123"
-    assert crawler._cookies.get("safeid") == "SAFE123"
-    assert crawler._cookies.get("agree") == "1"
     assert crawler._user_agent == "UA-2"
+
+
+@pytest.mark.unit
+async def test_fetch_html_age_gate_does_not_loop_when_safe_cookie_already_set(
+    mock_flaresolverr: AsyncMock,
+) -> None:
+    """A pre-seeded ``_safe`` matching the page token must not trigger a second fetch."""
+    crawler = SehuatangCrawler(flaresolverr=mock_flaresolverr, request_delay_seconds=0)
+    crawler.seed_cookies({"_safe": "SAFE123"})
+    mock_flaresolverr.get_html.return_value = (AGE_GATE_PAGE, {}, "UA-1")
+
+    with respx.mock:
+        respx.get("https://www.sehuatang.org/forum-103-1.html").mock(return_value=httpx.Response(403, text="Forbidden"))
+        html = await crawler._fetch_html("https://www.sehuatang.org/forum-103-1.html")
+
+    assert html == AGE_GATE_PAGE
+    assert mock_flaresolverr.get_html.await_count == 1
+
+
+@pytest.mark.unit
+async def test_seeded_safe_cookie_is_sent_on_the_first_request(mock_flaresolverr: AsyncMock) -> None:
+    """Cookies seeded from PIXAV_CRAWL_COOKIE_HEADER must reach FlareSolverr unchanged."""
+    crawler = SehuatangCrawler(flaresolverr=mock_flaresolverr, request_delay_seconds=0)
+    crawler.seed_cookies({"_safe": "SEEDED", "cPNj_2132_auth": "AUTHVAL"})
+    sent_cookies: list[dict[str, str]] = []
+
+    async def _capture(_url: str, *, timeout: int, cookies: dict[str, str]) -> tuple[str, dict[str, str], str]:
+        sent_cookies.append(dict(cookies))
+        return ('<html><a href="thread-1-1-1.html">T1</a></html>', {}, "UA-1")
+
+    mock_flaresolverr.get_html.side_effect = _capture
+
+    with respx.mock:
+        respx.get("https://www.sehuatang.org/forum-103-1.html").mock(return_value=httpx.Response(403, text="Forbidden"))
+        await crawler._fetch_html("https://www.sehuatang.org/forum-103-1.html")
+
+    assert sent_cookies[0]["_safe"] == "SEEDED"
+    assert sent_cookies[0]["cPNj_2132_auth"] == "AUTHVAL"
 
 
 @pytest.mark.unit
@@ -261,3 +310,49 @@ async def test_extractor_converts_infohash_to_magnet() -> None:
     magnets = await SehuatangExtractor().extract(html)
     assert f"magnet:?xt=urn:btih:{_INFOHASH_UPPER}" in magnets
     assert f"magnet:?xt=urn:btih:{_INFOHASH_LOWER.upper()}" in magnets
+
+
+@pytest.mark.unit
+async def test_concurrent_age_gates_each_resolve_with_their_own_token(
+    mock_flaresolverr: AsyncMock,
+) -> None:
+    """Every board page must come back real when several hit the age-gate at once.
+
+    Models the site faithfully: each gated request mints a distinct ``safeid``
+    and only accepts a retry carrying that exact token. All three gate responses
+    are held until every page has requested one, which is what forces the tasks
+    to interleave -- resolving the gate without serialization then lets the
+    tokens overwrite one another in the shared cookie jar, and all but the
+    last-written page silently comes back as the gate again.
+    """
+    pages = 3
+    crawler = SehuatangCrawler(flaresolverr=mock_flaresolverr, request_delay_seconds=0, max_board_pages=pages)
+    issued: dict[str, str] = {}
+    all_gated = asyncio.Event()
+    gated_count = 0
+
+    async def _serve(url: str, *, timeout: int, cookies: dict[str, str]) -> tuple[str, dict[str, str], str]:
+        nonlocal gated_count
+        page_id = url.rsplit("/", 1)[-1]
+        if cookies.get("_safe") is not None and cookies.get("_safe") == issued.get(page_id):
+            tid = page_id.split("-")[2].split(".")[0]
+            return (f'<html><a href="forum.php?mod=viewthread&tid={tid}">T</a></html>', {}, "UA")
+
+        issued[page_id] = f"SAFE-{page_id}"
+        gated_count += 1
+        if gated_count >= pages:
+            all_gated.set()
+        await all_gated.wait()
+        return (AGE_GATE_PAGE.replace("SAFE123", issued[page_id]), {}, "UA")
+
+    mock_flaresolverr.get_html.side_effect = _serve
+
+    with respx.mock:
+        respx.route(host="www.sehuatang.org").mock(return_value=httpx.Response(403, text="Forbidden"))
+        links = await asyncio.wait_for(
+            crawler.crawl("https://www.sehuatang.org/forum-103-1.html", r"mod=viewthread"), timeout=5
+        )
+
+    for page_id, html in crawler._page_cache.items():
+        assert not SehuatangCrawler._looks_like_age_gate(html), f"{page_id} still shows the age-gate"
+    assert len(links) == pages

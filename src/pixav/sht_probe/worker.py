@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Protocol
 
 from pixav.config import Settings, get_settings
 from pixav.shared.cookies import load_cookies
@@ -24,6 +25,31 @@ logger = logging.getLogger(__name__)
 _METRICS_MODULE = "sht_probe"
 
 
+class _SeedableCrawler(Protocol):
+    """Any crawler that accepts an externally supplied cookie jar."""
+
+    def seed_cookies(self, cookies: dict[str, str]) -> None: ...
+
+
+def _seed_crawler_cookies(settings: Settings, *crawlers: _SeedableCrawler | None) -> None:
+    """Seed the configured browser session into every crawler that needs it.
+
+    Every crawler gets the cookies, not just the generic one: unseeded,
+    Sehuatang serves the logged-out guest view, which carries the age-gate and
+    almost no thread links, so the crawl "succeeds" with nothing to show for it.
+    """
+    cookies, source = load_cookies(
+        cookie_header=settings.crawl_cookie_header,
+        cookie_file=settings.crawl_cookie_file,
+    )
+    if not cookies:
+        return
+    for crawler in crawlers:
+        if crawler is not None:
+            crawler.seed_cookies(cookies)
+    logger.info("seeded %d crawl cookie(s) (%s)", len(cookies), source)
+
+
 async def run_once(settings: Settings) -> list[str]:
     """Run a single crawl cycle against all configured seed URLs.
 
@@ -41,13 +67,6 @@ async def run_once(settings: Settings) -> list[str]:
         # Build optional components
         flaresolverr = FlareSolverrSession(settings.flaresolverr_url) if settings.flaresolverr_url else None
         crawler = HttpxCrawler(flaresolverr=flaresolverr)
-        cookies, source = load_cookies(
-            cookie_header=settings.crawl_cookie_header,
-            cookie_file=settings.crawl_cookie_file,
-        )
-        if cookies:
-            crawler.seed_cookies(cookies)
-            logger.info("seeded %d crawl cookie(s) (%s)", len(cookies), source)
         # Default generic components
         generic_extractor = BeautifulSoupExtractor()
         sehuatang_crawler = (
@@ -59,6 +78,7 @@ async def run_once(settings: Settings) -> list[str]:
             if flaresolverr
             else None
         )
+        _seed_crawler_cookies(settings, crawler, sehuatang_crawler)
         sehuatang_extractor = SehuatangExtractor()
         jackett = JackettClient(settings.jackett_url, settings.jackett_api_key) if settings.jackett_api_key else None
 

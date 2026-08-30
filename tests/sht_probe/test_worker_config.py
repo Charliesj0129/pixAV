@@ -55,3 +55,41 @@ async def test_worker_parses_tagged_seeds() -> None:
         args3, kwargs3 = calls[2]
         assert args3[0] == "http://site3.com"
         assert kwargs3["tags"] == []
+
+
+@pytest.mark.asyncio
+async def test_worker_seeds_cookies_into_both_crawlers(tmp_path) -> None:
+    """Sehuatang needs the session too, not just the generic crawler.
+
+    An unseeded SehuatangCrawler browses as a guest: the site answers with the
+    age-gate and, once that is cleared, a guest board page holding almost no
+    thread links -- so the cycle reports success while discovering nothing.
+    """
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "www.sehuatang.org\tFALSE\t/\tTRUE\t0\t_safe\tSAFEVAL\n"
+        "www.sehuatang.org\tFALSE\t/\tTRUE\t0\tcPNj_2132_auth\tAUTHVAL\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        crawl_seed_urls="",
+        crawl_queries="",
+        crawl_cookie_header="",
+        crawl_cookie_file=str(cookie_file),
+        flaresolverr_url="http://flaresolverr:8191",
+        jackett_url="",
+        jackett_api_key="",
+    )
+
+    with (
+        patch("pixav.sht_probe.worker.create_pool", new_callable=AsyncMock),
+        patch("pixav.sht_probe.worker.create_redis", new_callable=AsyncMock),
+        patch("pixav.sht_probe.worker.ShtProbeService"),
+        patch("pixav.sht_probe.worker.HttpxCrawler") as mock_httpx_crawler,
+        patch("pixav.sht_probe.worker.SehuatangCrawler") as mock_sehuatang_crawler,
+    ):
+        await run_once(settings)
+
+    expected = {"_safe": "SAFEVAL", "cPNj_2132_auth": "AUTHVAL"}
+    mock_httpx_crawler.return_value.seed_cookies.assert_called_once_with(expected)
+    mock_sehuatang_crawler.return_value.seed_cookies.assert_called_once_with(expected)

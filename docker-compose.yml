@@ -159,6 +159,10 @@ services:
       # FlareSolverrSession appends /v1 itself — the base URL must not include it.
       PIXAV_FLARESOLVERR_URL: http://flaresolverr:8191
       PIXAV_JACKETT_URL: http://jackett:9117
+    volumes:
+      # Browser-exported crawl cookies, read-only. Refresh by overwriting the file
+      # on the host and restarting this service.
+      - ./secrets:/app/secrets:ro
     ports:
       - "${PIXAV_SHT_PROBE_HEALTH_PORT:-8004}:8004"
     depends_on:

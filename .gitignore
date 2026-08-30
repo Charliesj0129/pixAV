@@ -60,3 +60,6 @@ backups/
 # Android platform-tools (vendored binaries, not project source)
 platform-tools/
 platform-tools-*.zip
+
+# Browser-exported cookies / credential material — never commit.
+secrets/
