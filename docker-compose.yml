@@ -156,7 +156,8 @@ services:
       - .env
     environment:
       <<: *worker-net
-      PIXAV_FLARESOLVERR_URL: http://flaresolverr:8191/v1
+      # FlareSolverrSession appends /v1 itself — the base URL must not include it.
+      PIXAV_FLARESOLVERR_URL: http://flaresolverr:8191
       PIXAV_JACKETT_URL: http://jackett:9117
     ports:
       - "${PIXAV_SHT_PROBE_HEALTH_PORT:-8004}:8004"
