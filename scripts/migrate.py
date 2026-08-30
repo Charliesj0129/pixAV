@@ -10,6 +10,8 @@ import os
 
 import asyncpg
 
+from pixav.config import get_settings
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,14 @@ async def run_migrations(dsn: str) -> None:
 
 
 def main() -> None:
-    dsn = os.environ.get("PIXAV_DSN", "postgresql://pixav:pixav@localhost:5432/pixav")
+    """Apply migrations against PIXAV_DSN, or the configured database.
+
+    The fallback goes through ``Settings`` rather than a literal DSN so the
+    runner picks up PIXAV_DB_HOST/PORT/USER/PASSWORD/NAME like every other
+    component — a hardcoded ``localhost`` default resolves to the container
+    itself when this runs as the compose ``migrate`` service.
+    """
+    dsn = os.environ.get("PIXAV_DSN", "").strip() or get_settings().dsn
     asyncio.run(run_migrations(dsn))
 
 

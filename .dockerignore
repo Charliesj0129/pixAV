@@ -29,3 +29,10 @@ test_*.js
 evaluate_*.js
 find_*.py
 fix_*.py
+
+# Local verification harness, operational backups, vendored binaries
+.verify
+backups
+platform-tools
+platform-tools-*.zip
+.ua

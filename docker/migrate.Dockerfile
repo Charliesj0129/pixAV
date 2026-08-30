@@ -9,8 +9,8 @@ WORKDIR /app
 # Copy project files and migrations
 COPY . .
 
-# Sync dependencies
-RUN uv sync
+# Sync runtime dependencies only (exclude local dev/test groups)
+RUN uv sync --frozen --no-group dev --no-group embeddings
 
 # Run database migrations
-CMD ["uv", "run", "python", "scripts/migrate.py"]
+CMD ["uv", "run", "--no-sync", "python", "scripts/migrate.py"]

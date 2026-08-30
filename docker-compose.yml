@@ -1,5 +1,28 @@
+# Shared defaults. Every long-running service opts into both, so an unattended
+# host neither silently loses services across a reboot nor fills its disk with
+# unbounded container logs.
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+# Pipeline workers sit on the `pixav` bridge network, so they must reach
+# postgres/redis by service name on the *container* ports. The published host
+# ports in .env do not apply inside the network, and env_file would otherwise
+# inject the host-side values.
+x-worker-net: &worker-net
+  PIXAV_DB_HOST: postgres
+  PIXAV_DB_PORT: 5432
+  PIXAV_REDIS_URL: redis://redis:6379/0
+
 services:
   postgres:
+    <<: [*restart, *logging]
     image: pgvector/pgvector:pg16
     container_name: pixav-postgres
     environment:
@@ -20,6 +43,7 @@ services:
       retries: 5
 
   redis:
+    <<: [*restart, *logging]
     image: redis:7-alpine
     container_name: pixav-redis
     ports:
@@ -35,6 +59,7 @@ services:
       retries: 5
 
   qbittorrent:
+    <<: [*restart, *logging]
     image: lscr.io/linuxserver/qbittorrent:latest
     container_name: pixav-qbittorrent
     environment:
@@ -59,6 +84,7 @@ services:
       retries: 10
 
   jackett:
+    <<: [*restart, *logging]
     image: lscr.io/linuxserver/jackett:latest
     container_name: pixav-jackett
     environment:
@@ -73,6 +99,7 @@ services:
       - pixav
 
   flaresolverr:
+    <<: [*restart, *logging]
     image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: pixav-flaresolverr
     ports:
@@ -84,6 +111,7 @@ services:
       - pixav
 
   stash:
+    <<: [*restart, *logging]
     image: stashapp/stash:latest
     container_name: pixav-stash
     ports:
@@ -96,17 +124,140 @@ services:
     networks:
       - pixav
 
+  # ── Schema gate ────────────────────────────────────────────────────────────
+  # One-shot: applies pending migrations, then exits. Every worker waits for it
+  # to succeed, so a schema change can never be raced by a worker booting
+  # against the old tables.
+  migrate:
+    <<: *logging
+    build:
+      context: .
+      dockerfile: docker/migrate.Dockerfile
+    container_name: pixav-migrate
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pixav
+
+  # ── Pipeline workers ───────────────────────────────────────────────────────
+  sht_probe:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/sht-probe.Dockerfile
+    container_name: pixav-sht-probe
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+      PIXAV_FLARESOLVERR_URL: http://flaresolverr:8191/v1
+      PIXAV_JACKETT_URL: http://jackett:9117
+    ports:
+      - "${PIXAV_SHT_PROBE_HEALTH_PORT:-8004}:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8004/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  maxwell_core:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/maxwell-core.Dockerfile
+    container_name: pixav-maxwell-core
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+    ports:
+      - "${PIXAV_MAXWELL_CORE_HEALTH_PORT:-8001}:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  media_loader:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/media-loader.Dockerfile
+    container_name: pixav-media-loader
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+      PIXAV_QBIT_URL: http://qbittorrent:${PIXAV_QBIT_PORT:-8085}
+      PIXAV_STASH_URL: http://stash:9999
+    ports:
+      - "${PIXAV_MEDIA_LOADER_HEALTH_PORT:-8002}:8002"
+    volumes:
+      # local_path is a workdir-relative path shared with pixel_injector and
+      # strm_resolver, so all three must see ./data at the same location.
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      qbittorrent:
+        condition: service_healthy
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8002/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   pixel_injector:
+    <<: [*restart, *logging]
     build:
       context: .
       dockerfile: docker/pixel-injector.Dockerfile
+    container_name: pixav-pixel-injector
     # Use host network so we can connect to spawned sibling containers on localhost mapped ports
     network_mode: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # Without this the container only sees the `environment:` keys below and
     # silently falls back to Settings() defaults for everything else —
     # including PIXAV_PIXEL_INJECTOR_MODE, which defaults to `redroid`.
@@ -124,6 +275,42 @@ services:
       PIXAV_QUEUE_UPLOAD: pixav:upload
       PIXAV_QUEUE_UPLOAD_DLQ: pixav:upload:dlq
       # PIXAV_REDROID_NETWORK: pixav_pixav # No longer needed if using host ports
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:${PIXAV_PIXEL_INJECTOR_HEALTH_PORT:-8003}/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  strm_resolver:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/strm-resolver.Dockerfile
+    container_name: pixav-strm-resolver
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+    ports:
+      - "${PIXAV_RESOLVER_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   pgdata:
