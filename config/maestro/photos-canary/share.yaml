@@ -1,0 +1,6 @@
+appId: com.google.android.apps.photos
+---
+- assertVisible: "pixav-canary-6dbac1f5a925-2160p.mp4"
+- tapOn:
+    id: "com.google.android.apps.photos:id/collapse_info_panel_fab"
+- tapOn: "Share"

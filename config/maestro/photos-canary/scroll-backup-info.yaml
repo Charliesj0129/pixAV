@@ -1,0 +1,8 @@
+appId: com.google.android.apps.photos
+---
+- scrollUntilVisible:
+    element: "Backed up"
+    direction: DOWN
+    timeout: 20000
+- assertVisible: "Original quality"
+- assertVisible: "This item doesn't take up space in your account storage.*"

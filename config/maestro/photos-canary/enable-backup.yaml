@@ -1,0 +1,6 @@
+appId: com.google.android.apps.photos
+---
+- assertVisible:
+    id: "com.google.android.apps.photos:id/onboarding_disclaimer"
+- tapOn:
+    id: "com.google.android.apps.photos:id/onboarding_action_button"

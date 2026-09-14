@@ -1,0 +1,6 @@
+appId: com.google.android.apps.photos
+---
+- tapOn: "Share"
+- extendedWaitUntil:
+    visible: "Share 1 video"
+    timeout: 15000

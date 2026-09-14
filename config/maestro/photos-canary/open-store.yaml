@@ -1,0 +1,3 @@
+appId: com.android.vending
+---
+- openLink: "market://details?id=com.google.android.apps.photos"

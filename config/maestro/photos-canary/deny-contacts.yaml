@@ -1,0 +1,5 @@
+appId: com.google.android.apps.photos
+---
+- assertVisible: "Allow Photos to access your contacts?"
+- tapOn:
+    id: "com.android.permissioncontroller:id/permission_deny_button"

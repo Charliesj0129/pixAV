@@ -1,0 +1,4 @@
+appId: com.google.android.apps.photos
+---
+- assertVisible: "Backed up"
+- tapOn: "pixav-canary-6dbac1f5a925-2160p.mp4"

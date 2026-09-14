@@ -1,0 +1,5 @@
+appId: com.google.android.apps.photos
+---
+- assertVisible: "Share 1 video"
+- assertVisible: "1 item selected"
+- tapOn: "Create link"

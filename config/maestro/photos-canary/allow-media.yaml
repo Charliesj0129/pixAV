@@ -1,0 +1,5 @@
+appId: com.google.android.apps.photos
+---
+- assertVisible: "Allow Photos to access photos and videos on this device?"
+- tapOn:
+    id: "com.android.permissioncontroller:id/permission_allow_button"

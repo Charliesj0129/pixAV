@@ -1,0 +1,5 @@
+appId: com.android.vending
+---
+- assertVisible: "Google Photos"
+- assertVisible: "Google LLC"
+- tapOn: "Install"

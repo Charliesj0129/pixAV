@@ -1,0 +1,7 @@
+appId: com.google.android.gms
+---
+- assertVisible: "Google Terms of Service"
+- swipe:
+    start: "50%,80%"
+    end: "50%,35%"
+- tapOn: "I agree"

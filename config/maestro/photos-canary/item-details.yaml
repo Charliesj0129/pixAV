@@ -1,0 +1,4 @@
+appId: com.google.android.apps.photos
+---
+- tapOn:
+    id: "com.google.android.apps.photos:id/photos_overflow_icon"

@@ -1,0 +1,4 @@
+# Exact observed canary item; do not reuse for another source/run.
+appId: com.google.android.apps.photos
+---
+- tapOn: "Video taken on Sep 9, 2026 9:23 AM"
