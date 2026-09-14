@@ -44,15 +44,8 @@ METHODS = {
 #: Module-level names, and where each one landed.
 FUNCTIONS = {
     "settings.py": ["now", "container"],
-    "cli.py": [
-        "preflight",
-        "checked_database",
-        "runtime_configuration",
-        "dispatch",
-        "execute",
-        "nonnegative_int",
-        "main",
-    ],
+    "guards.py": ["preflight", "checked_database"],
+    "cli.py": ["runtime_configuration", "dispatch", "execute", "nonnegative_int", "main"],
 }
 
 #: Every intended difference, and why it exists. Anything else is drift.
@@ -75,6 +68,34 @@ DIVERGENCES = [
         "execute",
         "    client = docker.from_env()\n",
         "    client = cast(Any, docker).from_env()\n",
+    ),
+    # The single entry point the consolidation exists to produce: `supervise`
+    # replaces four copies of continue_run.py and the launch.py that started them.
+    (
+        "main",
+        '            "recovery-drill",\n',
+        '            "recovery-drill",\n            "supervise",\n',
+    ),
+    (
+        "main",
+        '    parser.add_argument("--fetch-attachments", action=argparse.BooleanOptionalAction, default=None)\n',
+        '    parser.add_argument("--fetch-attachments", action=argparse.BooleanOptionalAction, default=None)\n'
+        "    # supervise: which run to carry, which instance it was authorised against,\n"
+        "    # and where its evidence goes. A fresh directory is created when omitted.\n"
+        '    parser.add_argument("--evidence", type=Path)\n'
+        '    parser.add_argument("--expect", type=Path, default=WORK / "evidence/expected-identity.json")\n'
+        '    parser.add_argument("--authorization", default="")\n'
+        '    parser.add_argument("--check", action="store_true")\n',
+    ),
+    (
+        "main",
+        '        if args.command == "status":\n            result = asyncio.run(execute(args))\n',
+        "        # supervise re-enters this CLI from disk between stage boundaries, so it\n"
+        "        # stays outside single_flight(): holding the lock would block its own child.\n"
+        '        if args.command == "supervise":\n'
+        "            result = supervise(args)\n"
+        '        elif args.command == "status":\n'
+        "            result = asyncio.run(execute(args))\n",
     ),
 ]
 
@@ -148,7 +169,8 @@ class TestMethodsMatch:
 class TestFunctionsMatch:
     @pytest.mark.parametrize(
         ("filename", "name"),
-        [(filename, name) for filename, names in FUNCTIONS.items() for name in names] + [("torrent.py", "MovieTorrent")],
+        [(filename, name) for filename, names in FUNCTIONS.items() for name in names]
+        + [("torrent.py", "MovieTorrent")],
     )
     def test_the_package_definition_is_the_frozen_definition(
         self, filename: str, name: str, frozen: tuple[dict[str, str], dict[str, dict[str, str]]]
@@ -157,9 +179,9 @@ class TestFunctionsMatch:
         original, _ = frozen
 
         assert name in package, f"{filename} lost {name}"
-        assert package[name] == expected(name, original[name]), (
-            f"{filename}::{name} no longer matches scripts/first_4k_movie.py."
-        )
+        assert package[name] == expected(
+            name, original[name]
+        ), f"{filename}::{name} no longer matches scripts/first_4k_movie.py."
 
 
 class TestPackageShape:

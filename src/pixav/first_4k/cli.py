@@ -13,26 +13,23 @@ from pathlib import Path
 from typing import Any, cast
 
 import asyncpg
-import redis.asyncio as aioredis
 
 import docker
 from pixav.config import get_settings
-from pixav.media_loader.video_parts import TARGET_BYTES, MediaOperationError, disk_budget, sha256
+from pixav.media_loader.video_parts import TARGET_BYTES, MediaOperationError, sha256
 from pixav.pixel_injector.canary import CanaryBlockedError, private_directory, single_flight, write_private
 from pixav.pixel_injector.maestro_parts import UserActionRequiredError
 from pixav.pixel_injector.profiles import get_profile
-from pixav.shared.instance import database_identity, redis_identity
 from pixav.shared.migrations import run_migrations
 
 from .contracts import RunHeartbeat, read_status, resolve_configuration
 from .discovery import collect_boards
 from .flow import MovieFlow
+from .guards import checked_database, preflight
 from .recovery import drill
 from .settings import (
     DSN,
     MEDIA,
-    PROJECT,
-    REDIS,
     ROOT,
     SELECTION_VERSION,
     SUCCESS_STATUSES,
@@ -41,99 +38,7 @@ from .settings import (
     container,
     now,
 )
-
-
-async def preflight(client: Any, args: argparse.Namespace) -> dict:
-    for name in ("downloads", "parts", "playback", "evidence", "guest"):
-        private_directory(WORK / name)
-    db = container(client, "postgres")
-    redis_container = container(client, "redis")
-    for service, name in ((db, "movie_postgres"), (redis_container, "movie_redis")):
-        mounts = [m for m in service.attrs["Mounts"] if m.get("Type") == "volume"]
-        if len(mounts) != 1 or mounts[0].get("Name") != f"{PROJECT}_{name}":
-            raise CanaryBlockedError("database persistence is not owned by the isolated project")
-    for service, destination in (("qbittorrent", "/downloads"), ("qbittorrent", "/config")):
-        item = container(client, service)
-        mounts = [m for m in item.attrs["Mounts"] if m["Destination"] == destination]
-        expected = WORK / ("downloads" if destination == "/downloads" else "qbit-config")
-        if len(mounts) != 1 or Path(mounts[0]["Source"]) != expected:
-            raise CanaryBlockedError("qBit mount is not the isolated owned directory")
-    conn = await asyncpg.connect(DSN)
-    redis = aioredis.from_url(REDIS)
-    try:
-        identity = await database_identity(conn)
-        observed = db.exec_run(
-            [
-                "psql",
-                "-U",
-                "pixav_test",
-                "-d",
-                "pixav_first_4k",
-                "-Atc",
-                "SELECT system_identifier FROM pg_control_system()",
-            ]
-        )
-        if (
-            observed.exit_code
-            or identity != observed.output.decode().strip()
-            or await conn.fetchval("SELECT current_database()") != "pixav_first_4k"
-        ):
-            raise CanaryBlockedError("PostgreSQL instance identity mismatch")
-        redis_id = await redis_identity(redis)
-        observed_redis = redis_container.exec_run(["redis-cli", "INFO", "server"])
-        if observed_redis.exit_code or f"run_id:{redis_id}" not in observed_redis.output.decode():
-            raise CanaryBlockedError("Redis instance identity mismatch")
-    finally:
-        await redis.aclose()
-        await conn.close()
-    profile = get_profile("gphotos_pixel_xl_v1", path=ROOT / "config/android_profiles.yml")
-    for image in (profile.image, MEDIA, TOOLS):
-        client.images.get(image)
-    # Preflight checks the latch, not allocations already made by an earlier run.
-    # Each allocating stage reserves its own remaining peak below.
-    space = disk_budget(
-        [
-            (WORK / "downloads", 0),
-            (WORK / "parts", 0),
-            (WORK / "playback", 0),
-            (WORK / "guest", 0),
-        ]
-    )
-    if not all(item["ready"] for item in space):
-        raise CanaryBlockedError("peak media allocation would cross 100 GiB / 10 percent disk latch")
-    return {"db_identity": identity, "redis_identity": redis_id, "disk": space, "at": now(), "vpn": "OPEN"}
-
-
-async def checked_database(client: Any) -> Any:
-    """Read-only identity check usable with stopped non-DB dependencies."""
-    db = await asyncio.to_thread(container, client, "postgres")
-    mounts = [m for m in db.attrs["Mounts"] if m.get("Type") == "volume"]
-    if len(mounts) != 1 or mounts[0].get("Name") != f"{PROJECT}_movie_postgres":
-        raise CanaryBlockedError("isolated PostgreSQL volume mismatch")
-    conn = await asyncpg.connect(DSN)
-    try:
-        observed = await asyncio.to_thread(
-            db.exec_run,
-            [
-                "psql",
-                "-U",
-                "pixav_test",
-                "-d",
-                "pixav_first_4k",
-                "-Atc",
-                "SELECT system_identifier FROM pg_control_system()",
-            ],
-        )
-        if (
-            observed.exit_code
-            or observed.output.decode().strip() != await database_identity(conn)
-            or await conn.fetchval("SELECT current_database()") != "pixav_first_4k"
-        ):
-            raise CanaryBlockedError("PostgreSQL instance identity mismatch")
-        return conn
-    except BaseException:
-        await conn.close()
-        raise
+from .supervisor import run as supervise
 
 
 def runtime_configuration(client: Any) -> dict:
@@ -314,6 +219,7 @@ def main() -> int:
             "prepare-playback",
             "status",
             "recovery-drill",
+            "supervise",
         ),
     )
     parser.add_argument("--board")
@@ -330,11 +236,21 @@ def main() -> int:
     # Off by default: the attachment endpoint answers this client with a
     # Cloudflare interstitial. Extra trackers reach the same swarms.
     parser.add_argument("--fetch-attachments", action=argparse.BooleanOptionalAction, default=None)
+    # supervise: which run to carry, which instance it was authorised against,
+    # and where its evidence goes. A fresh directory is created when omitted.
+    parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--expect", type=Path, default=WORK / "evidence/expected-identity.json")
+    parser.add_argument("--authorization", default="")
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     os.umask(0o077)
     try:
-        if args.command == "status":
+        # supervise re-enters this CLI from disk between stage boundaries, so it
+        # stays outside single_flight(): holding the lock would block its own child.
+        if args.command == "supervise":
+            result = supervise(args)
+        elif args.command == "status":
             result = asyncio.run(execute(args))
         else:
             with single_flight():

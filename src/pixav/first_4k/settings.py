@@ -41,6 +41,10 @@ SUCCESS_STATUSES = {
     "STATUS",
     "NO_RUN",
     "RECOVERY_DRILL_COMPLETE",
+    # `supervise` carries a run across stage boundaries. Stopping for inspection
+    # is deliberately absent: it must not exit zero.
+    "SUPERVISION_CHECKED",
+    "SUPERVISION_COMPLETE",
 }
 
 
