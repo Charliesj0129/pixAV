@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Minimal SQL migration runner — applies numbered .sql files in order."""
+"""Operator entry point for the migration runner.
+
+The ordering rules and the applier live in ``pixav.shared.migrations``; this
+file stays because ``docker/migrate.Dockerfile`` runs it by path, and because
+the single-film CLI imports ``run_migrations`` from here while a run is in
+flight — a supervisor re-executes that CLI from disk between segments.
+"""
 
 from __future__ import annotations
 
@@ -7,67 +13,13 @@ import argparse
 import asyncio
 import logging
 import os
-from pathlib import Path
-
-import asyncpg
 
 from pixav.config import get_settings
+from pixav.shared.migrations import MIGRATIONS_DIR, run_migrations, select_pending
+
+__all__ = ["MIGRATIONS_DIR", "main", "run_migrations", "select_pending"]
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger(__name__)
-
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
-
-
-def select_pending(filenames: list[str], applied: set[str], until: str | None = None) -> list[str]:
-    """Return the migrations to run, in order, stopping after ``until``.
-
-    ``until`` exists for expand/contract deployments. A schema change is often
-    split into an additive half that is safe to apply while the old code is
-    still serving traffic, and a contracting half that is not. Without a stop
-    point the only way to apply the safe half alone is to run raw SQL by hand
-    and hand-write the ``_migrations`` row, which is exactly the moment an
-    operator mistypes and leaves the ledger disagreeing with the schema.
-
-    An ``until`` that names no migration is an error rather than a no-op: a
-    typo must not silently apply everything.
-    """
-    ordered = sorted(filenames)
-    if until is not None:
-        if until not in ordered:
-            raise ValueError(f"--until names no migration: {until}")
-        ordered = ordered[: ordered.index(until) + 1]
-    return [name for name in ordered if name not in applied]
-
-
-async def run_migrations(dsn: str, *, until: str | None = None) -> list[str]:
-    """Apply every pending migration up to ``until``; return what was applied."""
-    conn: asyncpg.Connection = await asyncpg.connect(dsn)
-    try:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS _migrations (
-                filename TEXT PRIMARY KEY,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """)
-
-        applied: set[str] = {row["filename"] for row in await conn.fetch("SELECT filename FROM _migrations")}
-        available = [path.name for path in MIGRATIONS_DIR.glob("*.sql")]
-        pending = select_pending(available, applied, until)
-
-        if until is not None:
-            logger.info("stopping after %s", until)
-
-        for name in pending:
-            logger.info("apply %s", name)
-            sql = (MIGRATIONS_DIR / name).read_text(encoding="utf-8")
-            await conn.execute(sql)
-            await conn.execute("INSERT INTO _migrations (filename) VALUES ($1)", name)
-
-        logger.info("migrations complete (%d applied)", len(pending))
-        return pending
-    finally:
-        await conn.close()
 
 
 def main() -> None:
