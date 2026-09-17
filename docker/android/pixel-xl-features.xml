@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Bake into the golden image at /system/etc/sysconfig/pixel-xl-features.xml.
+
+  AOSP's SystemConfig.readAllPermissions() reads <feature name="..."/> from
+  /system/etc/sysconfig and /system/etc/permissions and calls addFeature() into
+  the set that PackageManager.hasSystemFeature() answers from. This is the
+  standard mechanism an OEM uses to declare device capabilities, which is why it
+  needs no root, no hooking, and no module: the feature is simply true.
+
+  This is the second of the two layers Google Photos checks for the
+  original-quality entitlement. The first (Build.MODEL and friends) is supplied
+  by the ro.* container arguments in config/android_profiles.yml.
+
+  Verify with: adb shell pm list features | grep PIXEL
+-->
+<permissions>
+    <feature name="com.google.android.feature.PIXEL_EXPERIENCE" />
+    <feature name="com.google.android.feature.PIXEL_2016_EXPERIENCE" />
+    <feature name="com.google.android.apps.photos.NEXUS_PRELOAD" />
+</permissions>

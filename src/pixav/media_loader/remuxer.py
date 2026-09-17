@@ -7,9 +7,59 @@ import logging
 import os
 from pathlib import Path
 
-from pixav.shared.exceptions import RemuxError
+from pixav.shared.exceptions import MediaDependencyError, RemuxError
 
 logger = logging.getLogger(__name__)
+
+_MEDIA_EXTENSIONS = frozenset({".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".webm"})
+_SAMPLE_TOKENS = frozenset({"sample", "trailer"})
+
+
+def _has_symlink(path: Path) -> bool:
+    return any(part.is_symlink() for part in (path, *path.parents))
+
+
+def _download_root(download_path: str) -> Path:
+    original = Path(download_path).expanduser()
+    if _has_symlink(original):
+        raise RemuxError("symlink in downloaded media path")
+    try:
+        return original.resolve(strict=True)
+    except OSError as exc:
+        raise RemuxError(f"download path not found: {download_path}") from exc
+
+
+def select_media_input(download_path: str) -> str:
+    """Select the largest supported file, excluding samples and symlinks."""
+    root = _download_root(download_path)
+    if root.is_file():
+        return os.fspath(root)
+    if not root.is_dir():
+        raise RemuxError(f"download path is neither a file nor directory: {download_path}")
+
+    candidates: list[tuple[int, str, Path]] = []
+    for candidate in root.rglob("*"):
+        if _has_symlink(candidate):
+            continue
+        if candidate.suffix.casefold() not in _MEDIA_EXTENSIONS:
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file():
+            continue
+        stem = resolved.stem.replace("-", " ").replace("_", " ")
+        tokens = {part.casefold() for part in stem.split()}
+        if tokens & _SAMPLE_TOKENS:
+            continue
+        candidates.append((resolved.stat().st_size, os.fspath(resolved), resolved))
+
+    if not candidates:
+        raise RemuxError(f"no supported media file found under: {download_path}")
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return os.fspath(candidates[0][2])
 
 
 class FFmpegRemuxer:
@@ -45,6 +95,8 @@ class FFmpegRemuxer:
             "-y",  # overwrite output
             "-i",
             input_path,
+            "-map",
+            "0",  # preserve every stream
             "-c",
             "copy",  # stream copy — no re-encoding
             "-movflags",
@@ -66,13 +118,18 @@ class FFmpegRemuxer:
             )
         except asyncio.TimeoutError as exc:
             proc.kill()
-            raise RemuxError(f"FFmpeg timed out after {self._timeout}s") from exc
+            await proc.wait()
+            raise MediaDependencyError(f"FFmpeg timed out after {self._timeout}s") from exc
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
         except FileNotFoundError as exc:
-            raise RemuxError(f"FFmpeg binary not found: {self._ffmpeg_bin}") from exc
+            raise MediaDependencyError(f"FFmpeg binary not found: {self._ffmpeg_bin}") from exc
 
         if proc.returncode != 0:
             err_msg = stderr.decode(errors="replace")[-500:] if stderr else "unknown error"
-            raise RemuxError(f"FFmpeg failed (rc={proc.returncode}): {err_msg}")
+            raise MediaDependencyError(f"FFmpeg failed (rc={proc.returncode}): {err_msg}")
 
         # Verify output was created
         if not os.path.isfile(output_path):
@@ -82,7 +139,7 @@ class FFmpegRemuxer:
         logger.info("remux complete: %s (%.1f MB)", output_path, out_size / 1_048_576)
 
     @staticmethod
-    def make_output_path(input_path: str, output_dir: str) -> str:
+    def make_output_path(input_path: str, output_dir: str, *, unique_key: str | None = None) -> str:
         """Generate the output path by changing extension to .mp4.
 
         Args:
@@ -93,4 +150,8 @@ class FFmpegRemuxer:
             Output file path with .mp4 extension.
         """
         stem = Path(input_path).stem
-        return str(Path(output_dir) / f"{stem}.mp4")
+        parent = Path(output_dir) / unique_key if unique_key else Path(output_dir)
+        output = parent / f"{stem}.mp4"
+        if output.resolve(strict=False) == Path(input_path).resolve(strict=False):
+            output = parent / f"{stem}.remuxed.mp4"
+        return str(output)

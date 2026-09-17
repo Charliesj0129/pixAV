@@ -3,7 +3,7 @@ FROM python:3.12-slim
 # Install uv and system dependencies
 RUN pip install --no-cache-dir uv && \
     apt-get update && \
-    apt-get install -y --no-install-recommends android-tools-adb && \
+    apt-get install -y --no-install-recommends android-tools-adb ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Set working directory

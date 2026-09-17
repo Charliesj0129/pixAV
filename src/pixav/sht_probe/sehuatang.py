@@ -11,7 +11,9 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup, SoupStrainer
 
+from pixav.shared.metrics import record_watermark_rejected
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
+from pixav.sht_probe.models import MagnetCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,44 @@ _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s\"'<>]*")
 _INFOHASH_RE = re.compile(r"\b([a-fA-F0-9]{40})\b")
 _SAFEID_RE = re.compile(r"var\s+safeid='([^']+)'")
 _ANCHOR_ONLY = SoupStrainer("a")
+
+# Discuz! post template fields, e.g. "【影片容量】：2.27G". The label wording varies
+# across boards ("影片容量" / "容量" / "文件大小"), and the separator may be the
+# full-width colon. Only these observed shapes are accepted; nothing is inferred.
+_SIZE_FIELD_RE = re.compile(
+    r"(?:影片容量|文件大小|檔案大小|文件容量|容量|大小)\s*[】\]]?\s*[:：]\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*(TB|GB|MB|KB|T|G|M|K)\b",
+    re.IGNORECASE,
+)
+_SIZE_UNIT_BYTES = {
+    "K": 1024,
+    "KB": 1024,
+    "M": 1024**2,
+    "MB": 1024**2,
+    "G": 1024**3,
+    "GB": 1024**3,
+    "T": 1024**4,
+    "TB": 1024**4,
+}
+# A resolution claim, not a measurement: the real gate stays PartMedia.validate_source().
+_RESOLUTION_HINT_RE = re.compile(r"(?<![0-9a-z])(2160p?|4k|uhd)(?![0-9a-z])", re.IGNORECASE)
+
+
+def _is_obfuscated_text(info_hash: str) -> bool:
+    """Return True when a 40-hex string is XOR-obfuscated ASCII, not an info hash.
+
+    Sehuatang stamps pages with its contact address encoded as 20 bytes: a random
+    key byte followed by ``sehuatang@gmail.com`` XOR-ed with that key. It matches
+    the bare-info-hash pattern exactly, so 27% of discovered "magnets" were this
+    watermark rather than a torrent. A real info hash is SHA-1 output, so the odds
+    of all 19 trailing bytes decoding to printable ASCII are negligible.
+    """
+    try:
+        raw = bytes.fromhex(info_hash)
+    except ValueError:
+        return True
+    key = raw[0]
+    return all(0x20 <= byte ^ key <= 0x7E for byte in raw[1:])
 
 
 class SehuatangCrawler:
@@ -55,6 +95,8 @@ class SehuatangCrawler:
         self._inflight_fetches: dict[str, asyncio.Task[str]] = {}
         self._inflight_lock = asyncio.Lock()
         self._age_gate_lock = asyncio.Lock()
+        self.age_gate_detected = 0
+        self.age_gate_persisted = 0
 
     def seed_cookies(self, cookies: dict[str, str]) -> None:
         """Seed the crawler cookie jar from an external source."""
@@ -167,6 +209,8 @@ class SehuatangCrawler:
         if not self._looks_like_age_gate(html):
             return html
 
+        self.age_gate_detected += 1
+
         safeid = self._extract_safeid(html)
         if not safeid:
             logger.warning("Sehuatang age-gate detected but safeid not found for %s", url)
@@ -186,6 +230,7 @@ class SehuatangCrawler:
             retried = await self._fetch_via_flaresolverr(url)
 
         if self._looks_like_age_gate(retried):
+            self.age_gate_persisted += 1
             logger.warning("Sehuatang age-gate persists after retry for %s", url)
         return retried
 
@@ -380,9 +425,79 @@ class SehuatangExtractor:
             magnets.add(match.group(0))
 
         # 3. Sehuatang specific: catch raw 40-char hex info hashes often posted as text
+        watermarks = 0
         for match in _INFOHASH_RE.finditer(html):
-            # Convert to magnet
-            magnets.add(f"magnet:?xt=urn:btih:{match.group(1).upper()}")
+            info_hash = match.group(1)
+            if _is_obfuscated_text(info_hash):
+                watermarks += 1
+                record_watermark_rejected()
+                continue
+            magnets.add(f"magnet:?xt=urn:btih:{info_hash.upper()}")
 
+        if watermarks:
+            # Otherwise the filter is invisible: "discarded everything" and
+            # "found nothing" both surface as new=0 in the cycle summary.
+            logger.info("SehuatangExtractor discarded %d watermark hash(es)", watermarks)
         logger.debug("SehuatangExtractor extracted %d magnet(s)", len(magnets))
         return list(magnets)
+
+    async def extract_candidates(self, html: str, source_url: str) -> list[MagnetCandidate]:
+        """Attach the Discuz thread title to every magnet, including bare hashes."""
+        magnets = await self.extract(html)
+        title = self.extract_title(html)
+        return [MagnetCandidate(uri=uri, title=title, source_url=source_url) for uri in magnets]
+
+    @staticmethod
+    def parse_size_bytes(text: str) -> int:
+        """Read a Discuz! post's declared file size, or 0 when it does not state one."""
+        match = _SIZE_FIELD_RE.search(text)
+        if match is None:
+            return 0
+        unit = _SIZE_UNIT_BYTES.get(match.group(2).upper())
+        if unit is None:
+            return 0
+        return int(float(match.group(1)) * unit)
+
+    @staticmethod
+    def _post_body_text(html: str) -> str:
+        """Text of the opening post only.
+
+        Discuz! renders site chrome such as the "visited boards" list on every
+        thread, and one of those board names is "4K原版". Reading the whole page
+        would hand every thread a 4K claim it never made.
+        """
+        soup = BeautifulSoup(html, "lxml")
+        body = soup.select_one("[id^=postmessage_]") or soup.select_one("td.t_f")
+        return (body or soup).get_text(" ", strip=True)
+
+    def extract_details(self, html: str) -> dict[str, object]:
+        """Poster-declared size and resolution claim, used only to order candidates.
+
+        These are the uploader's words, never a measurement. Selection may rank and
+        pre-reject on them, but acceptance still comes from probing the real file.
+        """
+        text = self._post_body_text(html)
+        hint = _RESOLUTION_HINT_RE.search(text) or _RESOLUTION_HINT_RE.search(self.extract_title(html))
+        return {
+            "size_bytes": self.parse_size_bytes(text),
+            "resolution_hint": hint.group(1).lower() if hint else None,
+        }
+
+    @staticmethod
+    def extract_title(html: str) -> str:
+        soup = BeautifulSoup(html, "lxml")
+        subject = soup.select_one("#thread_subject")
+        if subject is not None:
+            title = subject.get_text(" ", strip=True)
+            if title:
+                return title
+        if soup.title is not None:
+            title = soup.title.get_text(" ", strip=True)
+            # Discuz commonly appends the site name after a dash/pipe.
+            for separator in (" - ", " | ", " – "):
+                if separator in title:
+                    title = title.split(separator, 1)[0].strip()
+                    break
+            if title:
+                return title
+        return "Untitled"

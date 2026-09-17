@@ -11,14 +11,21 @@ import httpx
 
 from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.exceptions import VerificationError
+from pixav.shared.logging import install_http_url_log_redaction
 
 logger = logging.getLogger(__name__)
 
 # Pattern for Google Photos share URLs
-_SHARE_URL_PATTERN = re.compile(r"https://photos\.app\.goo\.gl/\w+")
+_SHARE_URL_PATTERN = re.compile(r"https://photos\.app\.goo\.gl/[A-Za-z0-9_-]+")
 
 # Logcat tag for Google Photos activity
 _PHOTOS_LOGCAT_FILTER = "GooglePhotos"
+
+
+def extract_share_url(text: str) -> str | None:
+    """Return a complete Google Photos short URL without trailing log punctuation."""
+    match = _SHARE_URL_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 class GooglePhotosVerifier:
@@ -34,6 +41,7 @@ class GooglePhotosVerifier:
         adb: _AdbClient | None = None,
         timeout: int = 15,
     ) -> None:
+        install_http_url_log_redaction()
         self._adb = adb
         self._http_timeout = timeout
 
@@ -70,13 +78,18 @@ class GooglePhotosVerifier:
             try:
                 # Read recent logcat from the container
                 output = await self._adb.shell(f"logcat -d -t 100 -s {_PHOTOS_LOGCAT_FILTER}")
-                match = _SHARE_URL_PATTERN.search(output)
-                if match:
-                    url = match.group(0)
-                    logger.info("found share URL in %s: %s", session.container_id[:12], url)
+                url = extract_share_url(output)
+                if url:
+                    # The short-link suffix is an access token. Never emit it to
+                    # container logs or centralized log collectors.
+                    logger.info("found share URL in %s (token redacted)", session.container_id[:12])
                     return url
             except Exception as exc:
-                logger.debug("logcat poll error on %s: %s", session.container_id[:12], exc)
+                logger.debug(
+                    "logcat poll error on %s (%s)",
+                    session.container_id[:12],
+                    type(exc).__name__,
+                )
 
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
@@ -100,14 +113,16 @@ class GooglePhotosVerifier:
                 resp = await client.head(share_url)
                 is_valid = resp.status_code < 400
                 logger.info(
-                    "share URL validation: %s → %d (%s)",
-                    share_url,
+                    "share URL validation: token redacted → %d (%s)",
                     resp.status_code,
                     "valid" if is_valid else "invalid",
                 )
                 return is_valid
         except httpx.HTTPError as exc:
-            logger.warning("share URL validation failed: %s → %s", share_url, exc)
+            logger.warning(
+                "share URL validation failed (%s; token redacted)",
+                type(exc).__name__,
+            )
             return False
 
 

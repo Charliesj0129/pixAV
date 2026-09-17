@@ -9,6 +9,18 @@ from typing import Any, Protocol, runtime_checkable
 class TorrentClient(Protocol):
     """Protocol for torrent client implementations."""
 
+    async def health_check(self) -> str:
+        """Return the server version after a connectivity check."""
+        ...
+
+    async def reconcile_download(self, info_hash: str, operation_id: str) -> str:
+        """Reuse the owned torrent and artifact, reconciling before any add.
+
+        Unknown ownership raises TorrentOwnershipError; a timeout or missing
+        peer observation does not independently prove SourceUnavailable.
+        """
+        ...
+
     async def add_magnet(self, uri: str) -> str:
         """Add a magnet URI to the torrent client.
 
@@ -20,15 +32,20 @@ class TorrentClient(Protocol):
         """
         ...
 
-    async def wait_complete(self, torrent_hash: str, timeout: int = 3600) -> str:
+    async def wait_complete(self, torrent_hash: str, timeout: int | None = None) -> str:
         """Wait for a torrent to complete downloading.
 
         Args:
             torrent_hash: Hash of the torrent to wait for.
-            timeout: Maximum time to wait in seconds (default: 3600).
+            timeout: Maximum time to wait in seconds. ``None`` uses the
+                implementation's configured download timeout.
 
         Returns:
-            Path to the downloaded content.
+            Path to the downloaded content in the caller's filesystem
+            namespace, not the torrent client's container namespace.
+
+        Raises:
+            SourceUnavailableError: The source candidate is dead (no swarm).
         """
 
     async def delete_torrent(self, torrent_hash: str, delete_files: bool = True) -> None:

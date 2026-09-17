@@ -1,0 +1,160 @@
+groups:
+  - name: pixav-availability
+    rules:
+      - alert: PixavTargetDown
+        expr: up{job=~"pixav-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pixAV target down: {{ $labels.instance }}"
+
+      - alert: PixavWorkerHeartbeatStale
+        expr: time() - pixav_worker_heartbeat_timestamp_seconds > 120 or pixav_worker_ready == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker heartbeat stale or unready: {{ $labels.module }}"
+
+      - alert: PixavWatchdogRestart
+        expr: changes(pixav_worker_start_time_seconds[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker restarted: {{ $labels.module }}"
+
+  - name: pixav-crawler
+    rules:
+      - alert: PixavCrawlConsecutiveEmpty
+        expr: pixav_crawl_consecutive_empty_cycles{module="sht_probe"} >= 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "Crawler extracted zero magnets for three cycles"
+
+      - alert: PixavCrawlCycleOverdue
+        expr: time() - pixav_crawl_last_completed_timestamp_seconds{module="sht_probe"} > pixav_crawl_interval_seconds{module="sht_probe"} + 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Crawler has not completed within interval plus 15 minutes"
+
+      - alert: PixavCrawlAgeGatePersistent
+        expr: pixav_crawl_age_gate_active{module="sht_probe"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sehuatang age gate remains active"
+
+      - alert: PixavUntitledRejected
+        expr: increase(pixav_crawl_untitled_rejected_total{module="sht_probe"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sehuatang candidates were rejected for missing titles"
+
+      - alert: PixavCrawlCookieError
+        expr: increase(pixav_crawl_cookie_errors_total{module="sht_probe"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Crawler cookie configuration is {{ $labels.reason }}"
+
+      - alert: PixavCrawlCycleTimeout
+        expr: increase(pixav_crawl_cycle_timeouts_total{module="sht_probe"}[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Crawler cycle exceeded interval plus 15 minute grace"
+
+  - name: pixav-pipeline
+    rules:
+      - alert: PixavTerminalDLQ
+        expr: increase(pixav_dlq_terminal_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "New terminal {{ $labels.stage }} DLQ task"
+
+      - alert: PixavRetryBurst
+        expr: increase(pixav_tasks_retried_total[15m]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retry volume increased sharply in {{ $labels.module }}"
+
+      - alert: PixavQueueNoProgress
+        expr: max(pixav_queue_depth) > 0 and sum(increase(pixav_tasks_processed_total[30m])) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline queues have had no progress for 30 minutes"
+
+      - alert: PixavDownloadPaused
+        expr: pixav_download_paused == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Downloads are latched paused by the disk guard"
+
+      - alert: PixavDiskLowWarning
+        expr: pixav_disk_free_percent < 20 and pixav_disk_free_percent >= 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Download filesystem below 20% free"
+
+      - alert: PixavDiskLowCritical
+        expr: pixav_disk_free_percent < 10 or pixav_disk_free_bytes < 107374182400
+        labels:
+          severity: critical
+        annotations:
+          summary: "Download filesystem below 100 GiB or 10% free"
+
+      - alert: PixavLocalCleanupFailure
+        expr: increase(pixav_local_cleanup_failures_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Local media janitor failed to clean one or more files"
+
+      # gluetun's kill switch is what prevents a leak; this only says one is
+      # happening anyway, which means the topology is not what we think it is.
+      - alert: PixavVpnEgressLeak
+        expr: pixav_vpn_egress_state{state="leaking"} == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Torrent egress matches the host's public address"
+
+      # Not a leak — a blind spot. The sentinel is gone, or the tunnel cannot
+      # carry the probe. Treated as sustained rather than instant because a
+      # single missed observation is ordinary.
+      - alert: PixavVpnEgressUnknown
+        expr: pixav_vpn_egress_state{state="unknown"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "VPN egress isolation cannot be confirmed"
+
+      - alert: PixavStashEnrichmentFailure
+        expr: increase(pixav_stash_enrichment_failures_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Optional Stash enrichment failed"
+
+  - name: pixav-heartbeat
+    rules:
+      - alert: PixavDailyTelegramHeartbeat
+        expr: vector(1)
+        labels:
+          severity: heartbeat
+        annotations:
+          summary: "pixAV daily monitoring heartbeat"

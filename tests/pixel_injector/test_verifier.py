@@ -9,8 +9,18 @@ import pytest
 import respx
 
 from pixav.pixel_injector.session import RedroidSession
-from pixav.pixel_injector.verifier import GooglePhotosVerifier
+from pixav.pixel_injector.verifier import GooglePhotosVerifier, extract_share_url
 from pixav.shared.exceptions import VerificationError
+
+
+def test_extract_share_url_accepts_hyphen_and_underscore_without_punctuation() -> None:
+    assert extract_share_url("shared=https://photos.app.goo.gl/Ab-Cd_12), next") == (
+        "https://photos.app.goo.gl/Ab-Cd_12"
+    )
+
+
+def test_extract_share_url_returns_none_when_absent() -> None:
+    assert extract_share_url("upload complete but private") is None
 
 
 class TestGooglePhotosVerifier:
@@ -72,6 +82,13 @@ class TestGooglePhotosVerifier:
         assert await verifier.validate_share_url("https://photos.app.goo.gl/expired") is False
 
     @respx.mock
-    async def test_validate_share_url_connection_error(self, verifier: GooglePhotosVerifier) -> None:
-        respx.head("https://photos.app.goo.gl/bad").mock(side_effect=httpx.ConnectError("refused"))
-        assert await verifier.validate_share_url("https://photos.app.goo.gl/bad") is False
+    async def test_validate_share_url_connection_error(
+        self,
+        verifier: GooglePhotosVerifier,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        secret_url = "https://photos.app.goo.gl/synthetic-secret"
+        respx.head(secret_url).mock(side_effect=httpx.ConnectError(f"refused {secret_url}"))
+        with caplog.at_level("WARNING"):
+            assert await verifier.validate_share_url(secret_url) is False
+        assert "synthetic-secret" not in caplog.text

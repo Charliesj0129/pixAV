@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, TypedDict, runtime_checkable
 
 
 @runtime_checkable
@@ -37,16 +37,27 @@ class MagnetExtractor(Protocol):
         ...
 
 
-@runtime_checkable
-class JackettSearcher(Protocol):
-    """Protocol for searching torrent indexers via Jackett."""
+class IndexerResult(TypedDict):
+    """Normalized discovery candidate returned by any indexer adapter."""
 
-    async def search(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        """Search torrent indexers and return result dicts.
+    title: str
+    magnet_uri: str | None
+    source_url: str
+    size: int
+    seeders: int
+
+
+@runtime_checkable
+class IndexerAdapter(Protocol):
+    """Domain boundary for Jackett/Cardigann or a retained source adapter."""
+
+    async def search(self, query: str, *, limit: int = 50) -> list[IndexerResult]:
+        """Search an indexer and return normalized candidates.
 
         Each result dict contains at least:
             - title: str
             - magnet_uri: str | None
+            - source_url: str
             - size: int  (bytes)
             - seeders: int
 
@@ -58,6 +69,11 @@ class JackettSearcher(Protocol):
             List of result dicts.
         """
         ...
+
+
+# Compatibility name for existing imports while callers migrate to the domain
+# contract. This is one protocol, not a second execution path.
+JackettSearcher = IndexerAdapter
 
 
 @runtime_checkable

@@ -1,3 +1,16 @@
 appId: com.google.android.apps.photos
 ---
-- launchApp
+# stopApp is off deliberately. Maestro force-stops the app before launching by
+# default, which discards whatever the previous attempt left on screen --
+# including a share sheet a retry is meant to resume -- and, when that teardown
+# is still in flight, loses the launch itself and leaves the previous app in
+# front.
+#
+# What this cannot do is leave a screen: Android resumes an existing task at its
+# top activity, so an attempt that died on the item pager stays on the pager.
+# Anything that needs the Photos home screen wants
+# MaestroPartUploader._open_photos_home(), which sends the same launcher intent
+# with CLEAR_TOP over ADB.
+- launchApp:
+    appId: com.google.android.apps.photos
+    stopApp: false

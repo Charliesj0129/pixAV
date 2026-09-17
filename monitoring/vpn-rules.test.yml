@@ -1,0 +1,45 @@
+rule_files:
+  - /etc/prometheus/rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: leaking-fires-without-deliberately-bypassing-the-live-kill-switch
+    interval: 1m
+    input_series:
+      - series: 'pixav_vpn_egress_state{state="leaking"}'
+        values: "0 1 1"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: PixavVpnEgressLeak
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: PixavVpnEgressLeak
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              state: leaking
+            exp_annotations:
+              summary: Torrent egress matches the host's public address
+
+  - name: unknown-needs-fifteen-minutes-and-resolves
+    interval: 1m
+    input_series:
+      - series: 'pixav_vpn_egress_state{state="unknown"}'
+        # t=0..16 unknown, then the sentinel/reference comparison recovers.
+        values: "1x16 0"
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: PixavVpnEgressUnknown
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: PixavVpnEgressUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              state: unknown
+            exp_annotations:
+              summary: VPN egress isolation cannot be confirmed
+      - eval_time: 17m
+        alertname: PixavVpnEgressUnknown
+        exp_alerts: []

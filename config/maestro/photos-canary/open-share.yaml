@@ -1,6 +1,21 @@
 appId: com.google.android.apps.photos
 ---
 - tapOn: "Share"
+# Photos asks for contacts when the share sheet opens, and the dialog covers the
+# sheet until it is answered. Both shapes of the dialog are answered here, for
+# the reason given in deny-contacts.yaml; the assertion is what proves the sheet
+# is no longer covered.
+- runFlow:
+    when:
+      visible: "Allow Photos to access your contacts?"
+    commands:
+      - tapOn:
+          id: "com.android.permissioncontroller:id/permission_deny_button"
+          optional: true
+      - tapOn:
+          id: "com.android.permissioncontroller:id/permission_deny_and_dont_ask_again_button"
+          optional: true
+      - assertNotVisible: "Allow Photos to access your contacts?"
 - extendedWaitUntil:
     visible: "Share 1 video"
     timeout: 15000

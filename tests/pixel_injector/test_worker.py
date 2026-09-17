@@ -6,9 +6,19 @@ import asyncio
 import uuid
 from unittest.mock import AsyncMock, patch
 
-from pixav.pixel_injector.worker import _release_upload_lock, _renew_upload_lock, run_worker
+import pytest
+
+from pixav.config import Settings
+from pixav.pixel_injector.worker import _release_upload_lock, _renew_upload_lock, run_from_settings, run_worker
 from pixav.shared.enums import TaskState
 from pixav.shared.models import Task
+
+
+def unmanaged_task_repo() -> AsyncMock:
+    """A task repository for a video the managed authority has not admitted."""
+    repo = AsyncMock()
+    repo.is_managed_video.return_value = False
+    return repo
 
 
 class TestPixelInjectorWorker:
@@ -44,6 +54,7 @@ class TestPixelInjectorWorker:
 
         service.process_task.side_effect = _process
         task_repo = AsyncMock()
+        task_repo.is_managed_video.return_value = False
         video_repo = AsyncMock()
 
         await run_worker(
@@ -61,6 +72,40 @@ class TestPixelInjectorWorker:
             video_id,
             share_url="https://photos.app.goo.gl/abc123",
         )
+
+    async def test_managed_video_is_refused_before_any_upload_bdd_019(self) -> None:
+        """The legacy uploader stands down rather than race the authority."""
+        video_id = uuid.uuid4()
+        task_id = uuid.uuid4()
+        queue = AsyncMock()
+        queue.pop_claim.side_effect = [
+            (
+                {
+                    "id": str(task_id),
+                    "video_id": str(video_id),
+                    "local_path": "/tmp/video.mp4",
+                    "queue_name": "pixav:upload",
+                },
+                "receipt-1",
+            ),
+            None,
+        ]
+        service = AsyncMock()
+        task_repo = AsyncMock()
+        task_repo.is_managed_video.return_value = True
+
+        await run_worker(
+            queue=queue,
+            service=service,
+            task_repo=task_repo,
+            video_repo=AsyncMock(),
+            poll_timeout=0,
+            max_tasks=1,
+        )
+
+        service.process_task.assert_not_awaited()
+        task_repo.update_state.assert_not_awaited()
+        queue.ack.assert_awaited_once_with("receipt-1")
 
     async def test_run_worker_persists_failure(self) -> None:
         video_id = uuid.uuid4()
@@ -95,6 +140,7 @@ class TestPixelInjectorWorker:
 
         service.process_task.side_effect = _process
         task_repo = AsyncMock()
+        task_repo.is_managed_video.return_value = False
         video_repo = AsyncMock()
 
         await run_worker(
@@ -215,6 +261,7 @@ class TestPixelInjectorWorker:
 
         service.process_task.side_effect = _process
         task_repo = AsyncMock()
+        task_repo.is_managed_video.return_value = False
         video_repo = AsyncMock()
         account_repo = AsyncMock()
 
@@ -252,6 +299,7 @@ class TestPixelInjectorWorker:
         stop_event = asyncio.Event()
         service = AsyncMock()
         task_repo = AsyncMock()
+        task_repo.is_managed_video.return_value = False
         task_repo.find_by_id.return_value = Task(
             id=task_id,
             video_id=video_id,
@@ -345,3 +393,86 @@ class TestPixelInjectorWorker:
         assert renewed is True
         redis_client.get.assert_awaited_once_with("pixav:upload:lock")
         redis_client.expire.assert_awaited_once_with("pixav:upload:lock", 60)
+
+    async def test_guarded_one_shot_exits_after_exact_payload(self) -> None:
+        task_id = uuid.uuid4()
+        video_id = uuid.uuid4()
+        queue = AsyncMock()
+        queue.name = "pixav:upload"
+        queue.requeue_inflight.return_value = 0
+        queue.pop_claim.return_value = (
+            {
+                "task_id": str(task_id),
+                "video_id": str(video_id),
+                "local_path": "/tmp/video.mp4",
+                "queue_name": "pixav:upload",
+            },
+            "receipt-1",
+        )
+        service = AsyncMock()
+        service.process_task.return_value = Task(
+            id=task_id,
+            video_id=video_id,
+            state=TaskState.COMPLETE,
+            queue_name="pixav:upload",
+            local_path="/tmp/video.mp4",
+            share_url=f"pixav-local://{video_id}",
+        )
+
+        await run_worker(
+            queue=queue,
+            service=service,
+            task_repo=unmanaged_task_repo(),
+            video_repo=AsyncMock(),
+            poll_timeout=0,
+            max_tasks=1,
+            expected_task_id=task_id,
+            expected_video_id=video_id,
+        )
+
+        queue.ack.assert_awaited_once_with("receipt-1")
+        assert queue.pop_claim.await_count == 1
+
+    async def test_guarded_one_shot_restores_mismatched_head(self) -> None:
+        expected_task_id = uuid.uuid4()
+        expected_video_id = uuid.uuid4()
+        queue = AsyncMock()
+        queue.name = "pixav:upload"
+        queue.requeue_inflight.return_value = 0
+        queue.pop_claim.return_value = (
+            {"task_id": str(uuid.uuid4()), "video_id": str(expected_video_id)},
+            "receipt-1",
+        )
+        service = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="upload queue head changed"):
+            await run_worker(
+                queue=queue,
+                service=service,
+                poll_timeout=0,
+                max_tasks=1,
+                expected_task_id=expected_task_id,
+                expected_video_id=expected_video_id,
+            )
+
+        queue.nack.assert_awaited_once_with("receipt-1", requeue=True, front=True)
+        queue.ack.assert_not_awaited()
+        service.process_task.assert_not_awaited()
+
+    async def test_settings_worker_checks_database_identity_before_wiring_service(self) -> None:
+        pool = AsyncMock()
+        pool.fetchval.return_value = "other-cluster"
+        redis = AsyncMock()
+        settings = Settings(vpn_egress_echo_url="")
+
+        with (
+            patch("pixav.pixel_injector.worker.create_pool", new=AsyncMock(return_value=pool)),
+            patch("pixav.pixel_injector.worker.create_redis", new=AsyncMock(return_value=redis)),
+            patch("pixav.pixel_injector.worker.LocalPixelInjectorService") as local_service,
+        ):
+            with pytest.raises(RuntimeError, match="database identity mismatch"):
+                await run_from_settings(settings, expected_db_identity="expected-cluster", max_tasks=1)
+
+        local_service.assert_not_called()
+        redis.aclose.assert_awaited_once()
+        pool.close.assert_awaited_once()

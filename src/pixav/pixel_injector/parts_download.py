@@ -6,6 +6,7 @@ publish a database row; the parent checks the report before committing readiness
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -13,9 +14,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pixav.media_loader.preparation import inspect_media
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary, sha256
 from pixav.pixel_injector.canary_download import extract_original
 from pixav.shared.models import VideoPart
+from pixav.shared.storage_models import TransferableFile
 
 
 def quarantine(root: Path, *paths: Path) -> Path:
@@ -33,7 +36,22 @@ def quarantine(root: Path, *paths: Path) -> Path:
     return holding
 
 
-def download_original(part: VideoPart, root: Path) -> dict:
+def observed_media(path: Path) -> dict:
+    """Probe the bytes that were actually retrieved, not the ones expected.
+
+    Size and hash prove these are the bytes the manifest asked for. They cannot
+    say what media those bytes are, so whole-asset consistency -- duration,
+    codecs, container -- has nothing to check against unless the read-back
+    reports what it saw. ffprobe is already present in this image.
+
+    This process is a synchronous container entry point with no running event
+    loop of its own, so the shared async probe is driven directly rather than
+    duplicated as a second ffprobe call site.
+    """
+    return json.loads(asyncio.run(inspect_media(str(path))).model_dump_json())
+
+
+def download_original(part: TransferableFile, root: Path) -> dict:
     from playwright.sync_api import sync_playwright
 
     if not part.share_url or not part.share_url.startswith(
@@ -61,7 +79,10 @@ def download_original(part: VideoPart, root: Path) -> dict:
                 or report.get("method") != "photos-original-browser"
             ):
                 raise ValueError("cached Photos original is corrupt; retained for inspection")
-            return report
+            # A receipt written before the observation was part of the contract
+            # describes bytes that are still here and still hash correctly, so
+            # the observation is recomputed rather than the download repeated.
+            return {**report, "observed": observed_media(destination)}
     elif any(p.exists() or p.is_symlink() for p in (stray, receipt)):
         # A half-written extraction would make the retry fail its exclusive open.
         quarantine(root, stray, receipt)
@@ -93,6 +114,7 @@ def download_original(part: VideoPart, root: Path) -> dict:
         "sha256": part.sha256,
         "at": datetime.now(timezone.utc).isoformat(),
         "browser": version,
+        "observed": observed_media(destination),
     }
     # Crash after byte publication leaves an untrusted cached file, never inferred success.
     with receipt.open("x") as handle:

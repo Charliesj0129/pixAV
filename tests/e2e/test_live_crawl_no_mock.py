@@ -28,11 +28,12 @@ from pixav.shared.repository import VideoRepository
 from pixav.sht_probe.crawler import HttpxCrawler
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
 from pixav.sht_probe.service import ShtProbeService
+from scripts.integration_guard import require_test_database, require_test_redis
 
 pytestmark = pytest.mark.e2e_live
 
-_DEFAULT_ADMIN_DSN = "postgresql://pixav:pixav@localhost:5432/postgres"
-_DEFAULT_REDIS_URL = "redis://localhost:6379/15"
+_DEFAULT_ADMIN_DSN = "postgresql://pixav_test:integration-only@127.0.0.1:15432/pixav_integration"
+_DEFAULT_REDIS_URL = "redis://127.0.0.1:16379/0"
 _DEFAULT_THREAD_PATTERN = r"(viewthread|thread)"
 
 
@@ -67,6 +68,7 @@ async def live_db_dsn() -> str:
 
     admin_conn = await asyncpg.connect(admin_dsn)
     try:
+        await require_test_database(admin_conn)
         await admin_conn.execute(f'CREATE DATABASE "{db_name}"')
     except Exception:
         await admin_conn.close()
@@ -74,13 +76,13 @@ async def live_db_dsn() -> str:
     await admin_conn.close()
 
     target_dsn = _replace_db_name(admin_dsn, db_name)
-    await _apply_all_migrations(target_dsn)
-
     try:
+        await _apply_all_migrations(target_dsn)
         yield target_dsn
     finally:
         admin_conn = await asyncpg.connect(admin_dsn)
         try:
+            await require_test_database(admin_conn)
             await admin_conn.execute(
                 """
                 SELECT pg_terminate_backend(pid)
@@ -102,14 +104,13 @@ async def live_redis() -> aioredis.Redis:
     client: aioredis.Redis = aioredis.from_url(redis_url, decode_responses=True)
     try:
         await client.ping()
+        await require_test_redis(client)
     except Exception:
         await client.aclose()
         raise
-    await client.flushdb()
     try:
         yield client
     finally:
-        await client.flushdb()
         await client.aclose()
 
 
@@ -142,11 +143,8 @@ async def test_live_seed_crawl_no_mock(
     if cookies:
         crawler.seed_cookies(cookies)
 
-    # Check seed connectivity
-    await crawler.fetch_page_html(seed_url)
-
     pool = await asyncpg.create_pool(dsn=live_db_dsn, min_size=1, max_size=3)
-    queue_name = f"pixav:e2e:live_crawl:{uuid.uuid4().hex[:8]}"
+    queue_name = f"pixav:e2e:live_crawl:{uuid.uuid4().hex}"
     queue = TaskQueue(redis=live_redis, queue_name=queue_name)
     repo = VideoRepository(pool)
     service = ShtProbeService(
@@ -158,6 +156,7 @@ async def test_live_seed_crawl_no_mock(
     )
 
     try:
+        await crawler.fetch_page_html(seed_url)
         new_magnets = await service.run_crawl(
             seed_url,
             link_pattern=link_pattern,
@@ -180,4 +179,11 @@ async def test_live_seed_crawl_no_mock(
         assert isinstance(tags, list)
         assert "e2e-live" in tags
     finally:
-        await pool.close()
+        try:
+            await require_test_redis(live_redis)
+            await live_redis.delete(queue.name, queue.processing_name)
+        finally:
+            await pool.close()
+            close_crawler = getattr(crawler, "aclose", None)
+            if close_crawler is not None:
+                await close_crawler()

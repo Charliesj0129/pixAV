@@ -58,30 +58,112 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Network isolation ──────────────────────────────────────────────────────
+  # Measured on this host 2026-08-30, directly from qBittorrent's own API:
+  #   connection_status = firewalled, dht_nodes = 0, total_peer_connections = 0
+  # while an HTTPS/443 tracker was simultaneously reporting `peers=9 seeds=2`.
+  # The network reaches trackers but blocks BitTorrent peer traffic itself, so
+  # this is not a privacy measure — without it no download can occur at all.
+  #
+  # Prevention over detection: gluetun's firewall drops every packet that is not
+  # inside the tunnel, so a VPN outage makes downloading structurally impossible
+  # rather than merely alarming. qBittorrent has no network namespace of its own
+  # and therefore no path around it.
+  gluetun:
+    <<: [*restart, *logging]
+    # Immutable image used by the Phase 0 kernel probe. The v3 tag alone moved
+    # after that evidence was captured, so the digest is the actual contract.
+    image: qmcgaw/gluetun:v3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
+    container_name: pixav-gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # Credentials come from .env (never hardcode them here). An unset value is
+      # deliberately NOT a compose interpolation error: `:?` would also break
+      # `docker compose ps|logs|down`, leaving the operator unable to inspect or
+      # stop a running stack. The fail-closed guarantee never depended on it —
+      # gluetun cannot pass its tunnel healthcheck without credentials and
+      # qBittorrent waits on `service_healthy`, so no VPN still means no traffic.
+      VPN_SERVICE_PROVIDER: ${PIXAV_VPN_SERVICE_PROVIDER:-}
+      VPN_TYPE: ${PIXAV_VPN_TYPE:-wireguard}
+      WIREGUARD_PRIVATE_KEY: ${PIXAV_WIREGUARD_PRIVATE_KEY:-}
+      WIREGUARD_ADDRESSES: ${PIXAV_WIREGUARD_ADDRESSES:-}
+      OPENVPN_USER: ${PIXAV_OPENVPN_USER:-}
+      OPENVPN_PASSWORD: ${PIXAV_OPENVPN_PASSWORD:-}
+      SERVER_COUNTRIES: ${PIXAV_VPN_SERVER_COUNTRIES:-}
+      # ProtonVPN names its P2P-capable pool "port-forwarding" in the server
+      # metadata. Filtering is independent from actually enabling a forwarded
+      # port, which is unnecessary for the Phase 0 connectivity gate.
+      PORT_FORWARD_ONLY: ${PIXAV_VPN_PORT_FORWARD_ONLY:-off}
+      FIREWALL: "on"
+      # Let the pixav bridge reach the WebUI published below. Without this the
+      # firewall also drops replies to media_loader on the Docker network.
+      FIREWALL_OUTBOUND_SUBNETS: ${PIXAV_VPN_LAN_SUBNETS:-172.16.0.0/12}
+    # qBittorrent shares this namespace, so its ports are published here.
+    ports:
+      - "${PIXAV_QBIT_PORT:-8085}:${PIXAV_QBIT_PORT:-8085}"
+      - "6881:6881"
+      - "6881:6881/udp"
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   qbittorrent:
     <<: [*restart, *logging]
-    image: lscr.io/linuxserver/qbittorrent:latest
+    # Phase 0 is an amd64 WSL runtime. Pin both the application/build tag and
+    # its platform manifest so an unrelated LinuxServer rebuild cannot enter a
+    # leak/download gate run.
+    image: lscr.io/linuxserver/qbittorrent:5.2.3_v2.0.14-ls474@sha256:a7dc3bef7fe25c4d0bbf821f188edf78198d9db1920841b232aa89dff7f00cfe
     container_name: pixav-qbittorrent
+    # No network namespace of its own: every packet goes through gluetun's
+    # firewall, so "VPN down" means "no traffic", not "traffic over the real IP".
+    network_mode: "service:gluetun"
     environment:
       PUID: 1000
       PGID: 1000
       TZ: UTC
       # Keep container port == host port to avoid WebUI Host header validation issues.
       WEBUI_PORT: ${PIXAV_QBIT_PORT:-8085}
-    ports:
-      - "${PIXAV_QBIT_PORT:-8085}:${PIXAV_QBIT_PORT:-8085}"
-      - "6881:6881"
-      - "6881:6881/udp"
     volumes:
       - qbit-config:/config
       - ./data/downloads:/downloads
-    networks:
-      - pixav
+    depends_on:
+      gluetun:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:$${WEBUI_PORT:-8080}/ >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # Reports what the internet sees as the source of qBittorrent's traffic. It
+  # shares gluetun's namespace because that is the only place the question can
+  # be asked, and it does nothing else there: it moves no torrents and gates no
+  # downloads. media_loader compares its report against its own public address.
+  vpn_sentinel:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/media-loader.Dockerfile
+    container_name: pixav-vpn-sentinel
+    command: ["uv", "run", "--no-sync", "python", "-m", "pixav.shared.vpn_sentinel"]
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   jackett:
     <<: [*restart, *logging]
@@ -123,6 +205,7 @@ services:
       - ./data/stash:/data
     networks:
       - pixav
+    profiles: ["stash"]
 
   # ── Schema gate ────────────────────────────────────────────────────────────
   # One-shot: applies pending migrations, then exits. Every worker waits for it
@@ -191,6 +274,8 @@ services:
       - .env
     environment:
       <<: *worker-net
+      PIXAV_DB_USER: ${PIXAV_MAXWELL_DB_USER:-${PIXAV_DB_USER}}
+      PIXAV_DB_PASSWORD: ${PIXAV_MAXWELL_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
     ports:
       - "${PIXAV_MAXWELL_CORE_HEALTH_PORT:-8001}:8001"
     depends_on:
@@ -219,7 +304,11 @@ services:
       - .env
     environment:
       <<: *worker-net
-      PIXAV_QBIT_URL: http://qbittorrent:${PIXAV_QBIT_PORT:-8085}
+      PIXAV_DB_USER: ${PIXAV_ACTIVITY_DB_USER:-${PIXAV_DB_USER}}
+      PIXAV_DB_PASSWORD: ${PIXAV_ACTIVITY_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
+      # qBittorrent shares gluetun's network namespace and has no name of its
+      # own on this network, so the WebUI is reached via gluetun.
+      PIXAV_QBIT_URL: http://gluetun:${PIXAV_QBIT_PORT:-8085}
       PIXAV_STASH_URL: http://stash:9999
     ports:
       - "${PIXAV_MEDIA_LOADER_HEALTH_PORT:-8002}:8002"
@@ -253,6 +342,11 @@ services:
     container_name: pixav-pixel-injector
     # Use host network so we can connect to spawned sibling containers on localhost mapped ports
     network_mode: host
+    extra_hosts:
+      # Docker Desktop publishes a sibling Redroid's dynamic ADB port on the
+      # daemon host, not on this container's 127.0.0.1. ``host-gateway`` keeps
+      # the same name usable on native Linux engines.
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
@@ -276,12 +370,63 @@ services:
       PIXAV_DB_HOST: localhost
       PIXAV_DB_PORT: ${PIXAV_POSTGRES_PORT:-5432}
       PIXAV_REDIS_URL: redis://localhost:${PIXAV_REDIS_PORT:-6379}/0
+      PIXAV_REDROID_ADB_HOST: host.docker.internal
+      # One-off Google experiment runs as root for docker.sock access; hand its
+      # private bind-mounted evidence back to the WSL operator.
+      PIXAV_EVIDENCE_UID: ${PIXAV_EVIDENCE_UID:-1000}
+      PIXAV_EVIDENCE_GID: ${PIXAV_EVIDENCE_GID:-1000}
       # Ensure config matches internal docker network
       PIXAV_QUEUE_UPLOAD: pixav:upload
       PIXAV_QUEUE_UPLOAD_DLQ: pixav:upload:dlq
+      # Same reason as storage_worker below: sibling bind sources are host paths.
+      PIXAV_HOST_PROJECT_ROOT: ${PIXAV_HOST_PROJECT_ROOT:-${PWD}}
       # PIXAV_REDROID_NETWORK: pixav_pixav # No longer needed if using host ports
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:${PIXAV_PIXEL_INJECTOR_HEALTH_PORT:-8003}/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # The managed storage worker runs alone because its database login must not
+  # be a member of the execution authority, while the legacy pixel_injector loop
+  # above needs writes only the authority holds. One process cannot be both.
+  storage_worker:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/pixel-injector.Dockerfile
+    container_name: pixav-storage-worker
+    command: ["uv", "run", "--no-sync", "python", "-m", "pixav.pixel_injector.storage_worker"]
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+      PIXAV_DB_USER: ${PIXAV_ACTIVITY_DB_USER:-${PIXAV_DB_USER}}
+      PIXAV_DB_PASSWORD: ${PIXAV_ACTIVITY_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
+      # Bind-mount sources for the guest and tools containers are resolved by
+      # the Docker daemon on its own host, not inside this container. Without
+      # this the daemon would create empty host directories and the guest would
+      # mount those instead of the staged bytes, with no error anywhere.
+      PIXAV_HOST_PROJECT_ROOT: ${PIXAV_HOST_PROJECT_ROOT:-${PWD}}
+    ports:
+      - "${PIXAV_STORAGE_WORKER_HEALTH_PORT:-8005}:8005"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The worker hashes the staged artifact itself before the guest is asked
+      # to accept it, so it needs the same view of ./data as the guest's mount.
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8005/health',timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -317,12 +462,73 @@ services:
       retries: 3
       start_period: 60s
 
+  prometheus:
+    <<: [*restart, *logging]
+    image: prom/prometheus:v3.5.0@sha256:8672a850efe2f9874702406c8318704edb363587f8c2ca88586b4c8fdb5cea24
+    container_name: pixav-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=2GB
+    ports:
+      - "${PIXAV_PROMETHEUS_PORT:-9090}:9090"
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - alertmanager
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  alertmanager:
+    <<: [*restart, *logging]
+    # chat_id_file support was added in Alertmanager 0.31.
+    image: prom/alertmanager:v0.34.0@sha256:268d4bf0e4bc0fe6dbdef6a59ce81a2918c88458bf8edf7dd0572ad372a093e6
+    container_name: pixav-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "${PIXAV_ALERTMANAGER_PORT:-9093}:9093"
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    secrets:
+      - telegram_bot_token
+      - telegram_chat_id
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 volumes:
   pgdata:
   redis-data:
   qbit-config:
   jackett-config:
   stash-config:
+  prometheus-data:
+  alertmanager-data:
+
+secrets:
+  telegram_bot_token:
+    file: ${PIXAV_TELEGRAM_BOT_TOKEN_FILE:-./secrets/telegram_bot_token}
+  telegram_chat_id:
+    file: ${PIXAV_TELEGRAM_CHAT_ID_FILE:-./secrets/telegram_chat_id}
 
 networks:
   pixav:

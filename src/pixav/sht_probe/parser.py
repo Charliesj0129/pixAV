@@ -8,6 +8,8 @@ from typing import cast
 
 from bs4 import BeautifulSoup
 
+from pixav.sht_probe.models import MagnetCandidate
+
 logger = logging.getLogger(__name__)
 
 # Match magnet URIs embedded in href or JS strings
@@ -48,3 +50,14 @@ class BeautifulSoupExtractor:
 
         logger.debug("extracted %d magnet(s)", len(magnets))
         return list(magnets)
+
+    async def extract_candidates(self, html: str, source_url: str) -> list[MagnetCandidate]:
+        magnets = await self.extract(html)
+        return [MagnetCandidate(uri=uri, title=_title_from_uri(uri), source_url=source_url) for uri in magnets]
+
+
+def _title_from_uri(uri: str) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    title = parse_qs(urlparse(uri).query).get("dn", [""])[0].strip()
+    return title or "Untitled"

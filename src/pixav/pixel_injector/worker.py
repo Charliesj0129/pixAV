@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import json
 import logging
 import os
-import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -22,16 +22,43 @@ from pixav.pixel_injector.service import LocalPixelInjectorService, PixelInjecto
 from pixav.pixel_injector.uploader import UIAutomatorUploader
 from pixav.pixel_injector.verifier import GooglePhotosVerifier
 from pixav.shared.db import create_pool
+from pixav.shared.dead_letter import DeadLetterStore
 from pixav.shared.enums import TaskState, VideoStatus
 from pixav.shared.metrics import record_task_failed, record_task_processed, record_task_retried
 from pixav.shared.models import Task
+from pixav.shared.pause import is_paused_value
+from pixav.shared.phase0_timing import phase0_span
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import AccountRepository, TaskRepository, VideoRepository
+from pixav.shared.retry import DEFAULT_RETRY_BACKOFF_SECONDS, parse_retry_backoff, retry_deadline
 
 logger = logging.getLogger(__name__)
 
 _METRICS_MODULE = "pixel_injector"
+
+
+class _OneShotGuardError(RuntimeError):
+    """Abort a guarded one-shot without consuming a different queue item."""
+
+
+def _assert_expected_payload(
+    payload: dict[str, Any],
+    *,
+    expected_task_id: uuid.UUID | None,
+    expected_video_id: uuid.UUID | None,
+) -> None:
+    if expected_task_id is None and expected_video_id is None:
+        return
+
+    observed_task_id = _safe_uuid(payload.get("task_id"))
+    observed_video_id = _safe_uuid(payload.get("video_id"))
+    if observed_task_id != expected_task_id or observed_video_id != expected_video_id:
+        raise _OneShotGuardError(
+            "upload queue head changed: "
+            f"expected task={expected_task_id} video={expected_video_id}, "
+            f"observed task={observed_task_id} video={observed_video_id}"
+        )
 
 
 _RELEASE_UPLOAD_LOCK_LUA = """
@@ -64,22 +91,6 @@ def _task_from_payload(payload: dict[str, Any], *, default_max_retries: int) -> 
     return Task.model_validate(normalized)
 
 
-def _build_retry_payload(task: Task, retries: int) -> dict[str, str | int]:
-    payload: dict[str, str | int] = {
-        "task_id": str(task.id),
-        "video_id": str(task.video_id),
-        "queue_name": task.queue_name,
-        "retries": retries,
-        "max_retries": task.max_retries,
-        "trace_id": task.trace_id,
-    }
-    if task.local_path:
-        payload["local_path"] = task.local_path
-    if task.account_id is not None:
-        payload["account_id"] = str(task.account_id)
-    return payload
-
-
 def _build_dlq_payload(task: Task, error_message: str) -> dict[str, str | int]:
     payload: dict[str, str | int] = {
         "task_id": str(task.id),
@@ -90,7 +101,6 @@ def _build_dlq_payload(task: Task, error_message: str) -> dict[str, str | int]:
         "max_retries": task.max_retries,
         "error_message": error_message,
         "failed_at": datetime.now(timezone.utc).isoformat(),
-        "dlq_replays": 0,
         "trace_id": task.trace_id,
     }
     if task.account_id is not None:
@@ -107,29 +117,6 @@ def _is_retryable_failure(error_message: str) -> bool:
     return not any(token in lowered for token in non_retryable_tokens)
 
 
-def _parse_backoff_seconds(raw: str) -> tuple[int, ...]:
-    values: list[int] = []
-    for token in raw.split(","):
-        stripped = token.strip()
-        if not stripped:
-            continue
-        try:
-            parsed = int(stripped)
-        except ValueError:
-            continue
-        if parsed > 0:
-            values.append(parsed)
-    if not values:
-        return (60, 300, 900)
-    return tuple(values)
-
-
-def _is_paused_value(raw: Any) -> bool:
-    if raw is None:
-        return False
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _safe_uuid(value: Any) -> uuid.UUID | None:
     if not isinstance(value, str):
         return None
@@ -141,7 +128,7 @@ def _safe_uuid(value: Any) -> uuid.UUID | None:
 
 async def _is_paused(redis_client: aioredis.Redis, pause_key: str) -> bool:
     value = await redis_client.get(pause_key)
-    return _is_paused_value(value)
+    return is_paused_value(value)
 
 
 async def _acquire_upload_lock(
@@ -210,101 +197,6 @@ async def _upload_lock_heartbeat(
             return
 
 
-async def _schedule_dlq_replay(
-    *,
-    redis_client: aioredis.Redis,
-    schedule_key: str,
-    dlq_payload: dict[str, str | int],
-    backoff_seconds: tuple[int, ...],
-    max_replays: int,
-) -> bool:
-    error_message = str(dlq_payload.get("error_message", ""))
-    if not _is_retryable_failure(error_message):
-        return False
-
-    current_replays = int(dlq_payload.get("dlq_replays", 0))
-    if current_replays >= max_replays:
-        return False
-
-    backoff_idx = min(current_replays, len(backoff_seconds) - 1)
-    delay = backoff_seconds[backoff_idx]
-
-    payload = dict(dlq_payload)
-    payload["dlq_replays"] = current_replays + 1
-
-    score = int(time.time()) + delay
-    await redis_client.zadd(schedule_key, {json.dumps(payload, sort_keys=True): score})
-    return True
-
-
-async def _replay_due_dlq(
-    *,
-    redis_client: aioredis.Redis,
-    schedule_key: str,
-    retry_queue: TaskQueue,
-    task_repo: TaskRepository | None,
-    video_repo: VideoRepository | None,
-    default_max_retries: int,
-    queue_name: str,
-    max_items: int = 20,
-) -> int:
-    now = int(time.time())
-    due_items = await redis_client.zrangebyscore(
-        schedule_key,
-        min="-inf",
-        max=now,
-        start=0,
-        num=max_items,
-    )
-
-    replayed = 0
-    for raw in due_items:
-        removed = await redis_client.zrem(schedule_key, raw)
-        if removed == 0:
-            continue
-
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("skip malformed scheduled dlq payload: %s", raw)
-            continue
-
-        task_id = payload.get("task_id")
-        video_id = payload.get("video_id")
-        if not isinstance(task_id, str) or not isinstance(video_id, str):
-            logger.warning("skip scheduled dlq payload with missing IDs: %s", payload)
-            continue
-
-        replay_payload: dict[str, str | int] = {
-            "task_id": task_id,
-            "video_id": video_id,
-            "queue_name": queue_name,
-            "retries": 0,
-            "max_retries": default_max_retries,
-        }
-        account_id = payload.get("account_id")
-        if isinstance(account_id, str):
-            replay_payload["account_id"] = account_id
-
-        await retry_queue.push(replay_payload)
-
-        task_uuid = _safe_uuid(task_id)
-        video_uuid = _safe_uuid(video_id)
-        replay_count = int(payload.get("dlq_replays", 0))
-        if task_repo is not None and task_uuid is not None:
-            await task_repo.update_state(
-                task_uuid,
-                TaskState.PENDING,
-                error_message=f"replayed from dlq ({replay_count})",
-            )
-        if video_repo is not None and video_uuid is not None:
-            await video_repo.update_status(video_uuid, VideoStatus.DOWNLOADED)
-
-        replayed += 1
-
-    return replayed
-
-
 async def _hydrate_local_path(task: Task, *, video_repo: VideoRepository | None) -> Task:
     if task.local_path:
         return task
@@ -315,6 +207,19 @@ async def _hydrate_local_path(task: Task, *, video_repo: VideoRepository | None)
     if video is None or not video.local_path:
         return task
     return task.model_copy(update={"local_path": video.local_path})
+
+
+async def _is_managed_video(task: Task, *, task_repo: TaskRepository | None) -> bool:
+    """Whether the managed execution authority already owns this video.
+
+    Two executors writing the same execution state is the failure the handover
+    contract forbids, so the legacy uploader stands down rather than racing.
+    The database trigger refuses the write anyway; this refuses the work first,
+    before a container is started or a file is pushed anywhere.
+    """
+    if task_repo is None:
+        return False
+    return await task_repo.is_managed_video(task.video_id)
 
 
 async def _is_terminal_task(task: Task, *, task_repo: TaskRepository | None) -> bool:
@@ -340,15 +245,17 @@ async def _persist_success(
     video_repo: VideoRepository | None,
     account_repo: AccountRepository | None,
 ) -> None:
-    if task_repo is not None:
-        await task_repo.update_state(result.id, TaskState.COMPLETE)
-    if video_repo is not None:
-        await video_repo.update_upload_result(result.video_id, share_url=result.share_url or "")
-    if account_repo is not None and result.account_id is not None:
-        uploaded_bytes = _uploaded_bytes_from_task(result)
-        await account_repo.apply_upload_usage(result.account_id, uploaded_bytes)
-    record_task_processed(_METRICS_MODULE)
-    logger.info("task %s complete (trace_id=%s)", result.id, result.trace_id)
+    stage = "local_finalize" if (result.share_url or "").startswith("pixav-local://") else None
+    with phase0_span(result.id, result.video_id, stage) if stage else nullcontext():
+        if task_repo is not None:
+            await task_repo.update_state(result.id, TaskState.COMPLETE)
+        if video_repo is not None:
+            await video_repo.update_upload_result(result.video_id, share_url=result.share_url or "")
+        if account_repo is not None and result.account_id is not None:
+            uploaded_bytes = _uploaded_bytes_from_task(result)
+            await account_repo.apply_upload_usage(result.account_id, uploaded_bytes)
+        record_task_processed(_METRICS_MODULE)
+        logger.info("task %s complete (trace_id=%s)", result.id, result.trace_id)
 
 
 async def _persist_failure(
@@ -356,29 +263,32 @@ async def _persist_failure(
     *,
     task_repo: TaskRepository | None,
     video_repo: VideoRepository | None,
-    retry_queue: TaskQueue | None,
-    dlq_queue: TaskQueue | None,
+    dlq_store: DeadLetterStore | None = None,
+    retry_backoff_seconds: tuple[int, ...] = DEFAULT_RETRY_BACKOFF_SECONDS,
+    failure_retention_days: int = 7,
 ) -> dict[str, str | int] | None:
     error_message = result.error_message or "upload stage failed"
     next_retry = result.retries + 1
 
-    if _is_retryable_failure(error_message) and next_retry <= result.max_retries and retry_queue is not None:
+    if _is_retryable_failure(error_message) and next_retry <= result.max_retries:
+        due = retry_deadline(next_retry, backoff_seconds=retry_backoff_seconds)
         if task_repo is not None:
             await task_repo.set_retry(
                 result.id,
                 next_retry,
                 state=TaskState.PENDING,
                 error_message=error_message,
+                retry_not_before=due,
             )
         if video_repo is not None:
             await video_repo.update_status(result.video_id, VideoStatus.DOWNLOADED)
-        await retry_queue.push(_build_retry_payload(result, next_retry))
         record_task_retried(_METRICS_MODULE)
         logger.warning(
-            "task %s failed (attempt %d/%d), requeued: %s",
+            "task %s failed (retry %d/%d), due at %s: %s",
             result.id,
             next_retry,
             result.max_retries,
+            due.isoformat(),
             error_message,
         )
         return None
@@ -387,10 +297,13 @@ async def _persist_failure(
         await task_repo.update_state(result.id, TaskState.FAILED, error_message=error_message)
     if video_repo is not None:
         await video_repo.update_status(result.video_id, VideoStatus.FAILED)
+        schedule_cleanup = getattr(video_repo, "schedule_terminal_cleanup", None)
+        if callable(schedule_cleanup):
+            await schedule_cleanup(result.video_id, retention_days=failure_retention_days)
 
     dlq_payload = _build_dlq_payload(result, error_message)
-    if dlq_queue is not None:
-        await dlq_queue.push(dlq_payload)
+    if dlq_store is not None:
+        await dlq_store.put("upload", dlq_payload)
     record_task_failed(_METRICS_MODULE)
     logger.error("task %s failed permanently: %s", result.id, error_message)
     return dlq_payload
@@ -413,8 +326,7 @@ async def run_worker(  # noqa: C901
     task_repo: TaskRepository | None = None,
     video_repo: VideoRepository | None = None,
     account_repo: AccountRepository | None = None,
-    retry_queue: TaskQueue | None = None,
-    dlq_queue: TaskQueue | None = None,
+    dlq_store: DeadLetterStore | None = None,
     redis_client: aioredis.Redis | None = None,
     default_max_retries: int = 10,
     poll_timeout: int = 5,
@@ -423,16 +335,13 @@ async def run_worker(  # noqa: C901
     enforce_single_flight: bool = True,
     upload_lock_key: str = "pixav:upload:lock",
     upload_lock_ttl_seconds: int = 7200,
-    dlq_replay_enabled: bool = True,
-    dlq_replay_max: int = 3,
-    dlq_replay_backoff_seconds: tuple[int, ...] = (60, 300, 900),
-    dlq_replay_schedule_key: str | None = None,
+    retry_backoff_seconds: tuple[int, ...] = DEFAULT_RETRY_BACKOFF_SECONDS,
+    failure_retention_days: int = 7,
+    max_tasks: int = 0,
+    expected_task_id: uuid.UUID | None = None,
+    expected_video_id: uuid.UUID | None = None,
 ) -> None:
     """Run the BLPOP consumer loop for the upload queue."""
-    retry_queue = retry_queue or queue
-    if dlq_replay_schedule_key is None:
-        dlq_replay_schedule_key = f"{queue.name}:dlq:replay"
-
     logger.info("pixel injector worker starting on queue %s", queue.name)
     try:
         recovered = int(await queue.requeue_inflight())
@@ -440,6 +349,7 @@ async def run_worker(  # noqa: C901
         recovered = 0
     if recovered:
         logger.warning("requeued %d in-flight payload(s) on %s", recovered, queue.name)
+    handled = 0
     while True:
         if stop_event is not None and stop_event.is_set():
             logger.info("stop_event set; shutting down worker")
@@ -449,33 +359,23 @@ async def run_worker(  # noqa: C901
         acked = False
         try:
             if redis_client is not None and await _is_paused(redis_client, pause_key):
+                if max_tasks > 0:
+                    raise _OneShotGuardError("global system pause became active before the guarded claim")
                 logger.info("system paused via redis key %s; skip polling", pause_key)
                 await asyncio.sleep(max(1, min(poll_timeout, 5)))
                 continue
 
-            if (
-                redis_client is not None
-                and dlq_replay_enabled
-                and dlq_queue is not None
-                and retry_queue is not None
-                and dlq_replay_max > 0
-            ):
-                replayed = await _replay_due_dlq(
-                    redis_client=redis_client,
-                    schedule_key=dlq_replay_schedule_key,
-                    retry_queue=retry_queue,
-                    task_repo=task_repo,
-                    video_repo=video_repo,
-                    default_max_retries=default_max_retries,
-                    queue_name=queue.name,
-                )
-                if replayed > 0:
-                    logger.warning("replayed %d task(s) from scheduled upload DLQ", replayed)
-
             claimed = await queue.pop_claim(timeout=poll_timeout)
             if claimed is None:
+                if max_tasks > 0:
+                    raise _OneShotGuardError("upload queue became empty before the guarded claim")
                 continue
             payload, receipt = claimed
+            _assert_expected_payload(
+                payload,
+                expected_task_id=expected_task_id,
+                expected_video_id=expected_video_id,
+            )
 
             lock_token: str | None = None
             lock_heartbeat_task: asyncio.Task[None] | None = None
@@ -488,9 +388,11 @@ async def run_worker(  # noqa: C901
                     ttl_seconds=upload_lock_ttl_seconds,
                 )
                 if not acquired:
-                    await queue.nack(receipt, requeue=True)
+                    await queue.nack(receipt, requeue=True, front=max_tasks > 0)
                     acked = True
                     logger.info("upload lock busy (%s), payload requeued", upload_lock_key)
+                    if max_tasks > 0:
+                        raise _OneShotGuardError("upload single-flight lock is already held")
                     await asyncio.sleep(1)
                     continue
                 lock_token = candidate
@@ -508,7 +410,9 @@ async def run_worker(  # noqa: C901
 
             try:
                 task = _task_from_payload(payload, default_max_retries=default_max_retries)
-                if await _is_terminal_task(task, task_repo=task_repo):
+                if await _is_managed_video(task, task_repo=task_repo):
+                    logger.warning("refusing task %s: the managed authority owns this video", task.id)
+                elif await _is_terminal_task(task, task_repo=task_repo):
                     logger.info("drop duplicate payload for terminal task %s", task.id)
                 else:
                     task = await _hydrate_local_path(task, video_repo=video_repo)
@@ -519,12 +423,13 @@ async def run_worker(  # noqa: C901
                                 "error_message": "video local_path is missing",
                             }
                         )
-                        dlq_payload = await _persist_failure(
+                        await _persist_failure(
                             result,
                             task_repo=task_repo,
                             video_repo=video_repo,
-                            retry_queue=retry_queue,
-                            dlq_queue=dlq_queue,
+                            dlq_store=dlq_store,
+                            retry_backoff_seconds=retry_backoff_seconds,
+                            failure_retention_days=failure_retention_days,
                         )
                     else:
                         await _mark_uploading(task, task_repo=task_repo, video_repo=video_repo)
@@ -541,35 +446,16 @@ async def run_worker(  # noqa: C901
                                 video_repo=video_repo,
                                 account_repo=account_repo,
                             )
-                            dlq_payload = None
                         else:
-                            dlq_payload = await _persist_failure(
+                            await _persist_failure(
                                 result,
                                 task_repo=task_repo,
                                 video_repo=video_repo,
-                                retry_queue=retry_queue,
-                                dlq_queue=dlq_queue,
+                                dlq_store=dlq_store,
+                                retry_backoff_seconds=retry_backoff_seconds,
+                                failure_retention_days=failure_retention_days,
                             )
 
-                    if (
-                        dlq_payload is not None
-                        and redis_client is not None
-                        and dlq_replay_enabled
-                        and dlq_replay_max > 0
-                        and dlq_queue is not None
-                    ):
-                        scheduled = await _schedule_dlq_replay(
-                            redis_client=redis_client,
-                            schedule_key=dlq_replay_schedule_key,
-                            dlq_payload=dlq_payload,
-                            backoff_seconds=dlq_replay_backoff_seconds,
-                            max_replays=dlq_replay_max,
-                        )
-                        if scheduled:
-                            logger.warning(
-                                "task %s scheduled for delayed DLQ replay",
-                                dlq_payload.get("task_id", "unknown"),
-                            )
             finally:
                 if lock_heartbeat_task is not None:
                     lock_heartbeat_task.cancel()
@@ -588,6 +474,17 @@ async def run_worker(  # noqa: C901
             if receipt is not None and not acked:
                 await queue.ack(receipt)
                 acked = True
+            handled += 1
+            if max_tasks > 0 and handled >= max_tasks:
+                logger.info("one-shot task limit reached (%d); exiting cleanly", max_tasks)
+                return
+        except _OneShotGuardError:
+            if receipt is not None and not acked:
+                try:
+                    await queue.nack(receipt, requeue=True, front=True)
+                except Exception as nack_exc:  # pragma: no cover - defensive logging
+                    logger.error("failed to restore guarded upload payload: %s", nack_exc)
+            raise
         except ValidationError as exc:
             logger.error("invalid upload payload: %s", exc)
             if receipt is not None and not acked:
@@ -599,96 +496,179 @@ async def run_worker(  # noqa: C901
             logger.exception("worker loop error: %s", exc)
             if receipt is not None and not acked:
                 try:
-                    await queue.nack(receipt, requeue=True)
+                    await queue.nack(receipt, requeue=True, front=max_tasks > 0)
                 except Exception as nack_exc:
                     logger.error("failed to nack payload after worker error: %s", nack_exc)
+            if max_tasks > 0:
+                raise _OneShotGuardError("guarded upload task crashed before ACK") from exc
             await asyncio.sleep(1)
 
 
-async def run_from_settings(settings: Settings) -> None:
+def _managed_storage_loop(pool, redis, settings: Settings, injector_mode: str):
+    """The managed storage claim loop, or nothing when it must not run.
+
+    Managed storage stays off rather than running through a substituted upload
+    environment: a remote success recorded from one would describe a device that
+    never existed.
+
+    It also stays off once ``PIXAV_STORAGE_WORKER_OWNER`` names a deployment,
+    because that means ``pixav.pixel_injector.storage_worker`` is running it in
+    its own process. The two cannot share this one: the activity role must not
+    be a member of the execution authority, and the legacy loop below needs
+    ``tasks``/``videos`` writes that only the authority holds.
+    """
+    from pixav.pixel_injector.photos_storage import PIXEL_COMPATIBLE_MODE
+    from pixav.pixel_injector.storage_worker import run_storage_activity_worker
+
+    if not settings.managed_media_workflow or injector_mode != PIXEL_COMPATIBLE_MODE:
+        return None
+    if settings.storage_worker_owner.strip():
+        return None
+    return run_storage_activity_worker(pool, redis, settings, owner=str(uuid.uuid4()))
+
+
+async def _run_loops(legacy, managed) -> None:
+    """Run both claim loops; the first failure stops the other and surfaces.
+
+    Neither loop may take the other's failure as permission to advance an
+    execution, so a supervisor restarts the pair rather than half of it.
+    """
+    if managed is None:
+        await legacy
+        return
+    tasks = {asyncio.ensure_future(legacy), asyncio.ensure_future(managed)}
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        task.result()
+
+
+async def run_from_settings(
+    settings: Settings,
+    *,
+    health_state: Any = None,
+    max_tasks: int = 0,
+    expected_db_identity: str | None = None,
+    expected_redis_identity: str | None = None,
+    expected_task_id: uuid.UUID | None = None,
+    expected_video_id: uuid.UUID | None = None,
+) -> None:
     """Wire dependencies from settings and start the worker loop."""
     pool = await create_pool(settings)
     redis = await create_redis(settings)
-    queue = TaskQueue(redis=redis, queue_name=settings.queue_upload)
-    dlq_queue = TaskQueue(redis=redis, queue_name=settings.queue_upload_dlq)
-    injector_mode = settings.pixel_injector_mode.strip().lower()
-    service: PixelInjector
-    if injector_mode == "local":
-        service = LocalPixelInjectorService(share_scheme=settings.pixel_injector_local_share_scheme)
-        logger.warning("pixel-injector running in LOCAL mode (no Redroid/ADB)")
-    else:
-        adb = AdbConnection()
-        service = PixelInjectorService(
-            redroid=DockerRedroidManager(
-                settings.redroid_image,
+    try:
+        if expected_redis_identity is not None:
+            observed_run_id = str((await redis.info("server")).get("run_id", ""))
+            if observed_run_id != expected_redis_identity:
+                raise RuntimeError("Redis identity changed before worker initialization")
+        if expected_db_identity is not None:
+            live_identity = str(await pool.fetchval("SELECT system_identifier FROM pg_control_system()"))
+            if live_identity != expected_db_identity:
+                raise RuntimeError(f"database identity mismatch: expected {expected_db_identity}, got {live_identity}")
+
+        queue = TaskQueue(redis=redis, queue_name=settings.queue_upload)
+        dlq_store = DeadLetterStore(
+            redis,
+            retention_days=settings.dlq_retention_days,
+            max_items_per_stage=settings.dlq_max_items_per_stage,
+        )
+        injector_mode = settings.pixel_injector_mode.strip().lower()
+        service: PixelInjector
+        if injector_mode == "local":
+            service = LocalPixelInjectorService(share_scheme=settings.pixel_injector_local_share_scheme)
+            logger.warning("pixel-injector running in LOCAL mode (no Redroid/ADB)")
+        else:
+            # A multi-gigabyte Phase 0 media transfer can legitimately exceed the
+            # old 120-second ADB subprocess default.  The service's task timeout is
+            # still the outer finite bound for the complete upload.
+            adb = AdbConnection(timeout=settings.upload_task_timeout_seconds)
+            redroid = DockerRedroidManager.from_profile_name(
+                settings.redroid_profile,
+                profiles_path=settings.redroid_profiles_path or None,
                 adb_host=settings.redroid_adb_host,
                 adb_port_start=settings.redroid_adb_port_start,
                 network=settings.redroid_network or None,
-            ),
-            uploader=UIAutomatorUploader(adb=adb),
-            verifier=GooglePhotosVerifier(adb=adb),
-            ready_timeout_seconds=settings.upload_ready_timeout_seconds,
-            verify_timeout_seconds=settings.upload_verify_timeout_seconds,
-            task_timeout_seconds=settings.upload_task_timeout_seconds,
-        )
-    task_repo = TaskRepository(pool)
-    video_repo = VideoRepository(pool)
-    account_repo = AccountRepository(pool)
-    try:
-        await run_worker(
+            )
+            await redroid.cleanup_orphans()
+            service = PixelInjectorService(
+                redroid=redroid,
+                uploader=UIAutomatorUploader(adb=adb),
+                verifier=GooglePhotosVerifier(adb=adb),
+                ready_timeout_seconds=settings.upload_ready_timeout_seconds,
+                verify_timeout_seconds=settings.upload_verify_timeout_seconds,
+                task_timeout_seconds=settings.upload_task_timeout_seconds,
+            )
+        task_repo = TaskRepository(pool)
+        video_repo = VideoRepository(pool)
+        account_repo = AccountRepository(pool)
+        if health_state is not None:
+            health_state.mark_ready()
+        legacy = run_worker(
             queue=queue,
             service=service,
             task_repo=task_repo,
             video_repo=video_repo,
             account_repo=account_repo,
-            retry_queue=queue,
-            dlq_queue=dlq_queue,
+            dlq_store=dlq_store,
             redis_client=redis,
             default_max_retries=settings.upload_max_retries,
             pause_key=settings.system_pause_key,
             enforce_single_flight=settings.upload_max_concurrency <= 1,
             upload_lock_key=settings.upload_lock_key,
             upload_lock_ttl_seconds=settings.upload_lock_ttl_seconds,
-            dlq_replay_enabled=settings.upload_dlq_replay_max > 0,
-            dlq_replay_max=settings.upload_dlq_replay_max,
-            dlq_replay_backoff_seconds=_parse_backoff_seconds(settings.upload_dlq_replay_backoff_seconds),
+            retry_backoff_seconds=parse_retry_backoff(settings.retry_backoff_seconds),
+            failure_retention_days=settings.local_cleanup_failure_days,
+            max_tasks=max_tasks,
+            expected_task_id=expected_task_id,
+            expected_video_id=expected_video_id,
         )
+        await _run_loops(legacy, _managed_storage_loop(pool, redis, settings, injector_mode))
     finally:
         await redis.aclose()
         await pool.close()
 
 
 def main() -> None:
-    import uvicorn
-
-    from pixav.shared.health import create_health_app
+    from pixav.shared.health import HealthState, create_health_app
+    from pixav.shared.health_server import run_with_health
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-tasks", type=int, default=0, help="exit after ACKing this many claimed tasks")
+    parser.add_argument("--expect-db-identity", default=None, help="refuse to run against another PostgreSQL cluster")
+    parser.add_argument("--expect-task-id", type=uuid.UUID, default=None, help="refuse to claim a different task")
+    parser.add_argument("--expect-video-id", type=uuid.UUID, default=None, help="refuse to claim a different video")
+    args = parser.parse_args()
+    if args.max_tasks < 0:
+        parser.error("--max-tasks must be zero or positive")
+    if (args.expect_task_id is None) != (args.expect_video_id is None):
+        parser.error("--expect-task-id and --expect-video-id must be provided together")
+    if args.expect_task_id is not None and args.max_tasks != 1:
+        parser.error("expected task/video guards require --max-tasks 1")
+
     settings = get_settings()
-    health_app = create_health_app("pixel_injector")
+    health_state = HealthState("pixel_injector", stale_after_seconds=settings.heartbeat_stale_seconds)
+    health_app = create_health_app("pixel_injector", state=health_state)
 
     async def _run() -> None:
-        config = uvicorn.Config(
-            health_app,
+        await run_with_health(
+            worker_coro=run_from_settings(
+                settings,
+                health_state=health_state,
+                max_tasks=args.max_tasks,
+                expected_db_identity=args.expect_db_identity,
+                expected_task_id=args.expect_task_id,
+                expected_video_id=args.expect_video_id,
+            ),
+            health_app=health_app,
             host=settings.health_host,
             port=settings.pixel_injector_health_port,
-            log_level="warning",
-            access_log=False,
+            health_state=health_state,
+            heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
         )
-        server = uvicorn.Server(config)
-        worker_task = asyncio.ensure_future(run_from_settings(settings))
-        server_task = asyncio.ensure_future(server.serve())
-        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):  # noqa: S110
-                pass
-        for t in done:
-            exc = t.exception()
-            if exc is not None:
-                raise exc
 
     asyncio.run(_run())
 

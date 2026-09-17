@@ -1,0 +1,33 @@
+# Standalone project: never merge this file with production Compose.
+name: pixav-integration
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    environment:
+      POSTGRES_USER: pixav_test
+      POSTGRES_PASSWORD: integration-only
+      POSTGRES_DB: pixav_integration
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - integration_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pixav_test -d pixav_integration"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - integration_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+volumes:
+  integration_postgres:
+  integration_redis:

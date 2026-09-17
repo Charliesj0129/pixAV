@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from typing import TYPE_CHECKING
 
 from pixav.pixel_injector.adb import AdbConnection
@@ -16,6 +17,22 @@ logger = logging.getLogger(__name__)
 
 # Default remote path in Android container for media
 _REMOTE_MEDIA_DIR = "/sdcard/DCIM/Camera"
+
+
+def media_provider_scan_command(remote_path: str) -> str:
+    """Build a shell-safe Android 13 blocking MediaProvider scan command.
+
+    MediaProvider returns a null URI when its hidden ``scan_file`` call is
+    given the ``/sdcard`` symlink.  It requires the emulated-storage path used
+    by its database.  ADB push itself can continue using ``/sdcard``.
+    """
+    if remote_path == "/sdcard":
+        provider_path = "/storage/emulated/0"
+    elif remote_path.startswith("/sdcard/"):
+        provider_path = f"/storage/emulated/0/{remote_path.removeprefix('/sdcard/')}"
+    else:
+        provider_path = remote_path
+    return f"content call --uri content://media --method scan_file --arg {shlex.quote(provider_path)}"
 
 
 class UIAutomatorUploader:
@@ -46,20 +63,20 @@ class UIAutomatorUploader:
         try:
             await self._ensure_connected(session)
 
-            logger.info("launching Google Accounts login for %s in %s", account.email, session.container_id[:12])
+            logger.info("launching Google Accounts login in %s", session.container_id[:12])
             await self._adb.shell("am start -a android.settings.ADD_ACCOUNT_SETTINGS -e account_types com.google")
             await asyncio.sleep(8)
 
             logger.info("inputting email for %s", session.container_id[:12])
             email_escaped = account.email.replace("'", "'\\''")
-            await self._adb.shell(f"input text '{email_escaped}'")
+            await self._adb.shell(f"input text '{email_escaped}'", sensitive=True)
             await asyncio.sleep(1)
             await self._adb.shell("input keyevent 66")  # ENTER
             await asyncio.sleep(8)
 
             logger.info("inputting password for %s", session.container_id[:12])
             pwd_escaped = password.replace("'", "'\\''")
-            await self._adb.shell(f"input text '{pwd_escaped}'")
+            await self._adb.shell(f"input text '{pwd_escaped}'", sensitive=True)
             await asyncio.sleep(1)
             await self._adb.shell("input keyevent 66")  # ENTER
             await asyncio.sleep(8)
@@ -113,7 +130,8 @@ class UIAutomatorUploader:
     async def trigger_upload(self, session: RedroidSession, remote_path: str) -> None:
         """Trigger media scan and Google Photos upload for a file.
 
-        Sends a media scanner broadcast so Google Photos discovers the file.
+        Uses Android MediaProvider's blocking scan call so Google Photos can
+        discover the file.
 
         Args:
             session: Target Redroid session.
@@ -124,8 +142,10 @@ class UIAutomatorUploader:
         """
         try:
             await self._ensure_connected(session)
-            # Trigger Android media scanner
-            scan_cmd = f'am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://{remote_path}"'
+            # Android 13's modular MediaProvider image has no exported
+            # MEDIA_SCANNER_SCAN_FILE receiver. Its blocking scan_file call is
+            # the platform-owned interface and returns after registration.
+            scan_cmd = media_provider_scan_command(remote_path)
             await self._adb.shell(scan_cmd)
             logger.info("triggered media scan for %s in %s", remote_path, session.container_id[:12])
         except Exception as exc:

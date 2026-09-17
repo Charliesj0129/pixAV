@@ -7,10 +7,10 @@ import uuid
 
 from pixav.maxwell_core.backpressure import QueueDepthMonitor
 from pixav.maxwell_core.dispatcher import RedisTaskDispatcher
-from pixav.maxwell_core.gc import OrphanTaskCleaner
+from pixav.maxwell_core.gc import LocalFileJanitor, OrphanTaskCleaner
 from pixav.maxwell_core.scheduler import LruAccountScheduler
 from pixav.shared.enums import TaskState
-from pixav.shared.repository import TaskRepository, VideoRepository
+from pixav.shared.repository import SourceCandidateRepository, TaskRepository, VideoRepository
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ class MaxwellOrchestrator:
         upload_queue_name: str = "pixav:upload",
         no_account_policy: str = "wait",
         batch_size: int = 5,
+        janitor: LocalFileJanitor | None = None,
+        candidate_repo: SourceCandidateRepository | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._dispatcher = dispatcher
@@ -46,8 +48,10 @@ class MaxwellOrchestrator:
         self._upload_q = upload_queue_name
         self._no_account_policy = no_account_policy
         self._batch_size = batch_size
+        self._janitor = janitor
+        self._candidate_repo = candidate_repo
 
-    async def tick(self) -> dict[str, int]:  # noqa: C901
+    async def tick(self, *, download_paused: bool = False) -> dict[str, int]:  # noqa: C901
         """Run one scheduling cycle.
 
         Returns:
@@ -59,10 +63,15 @@ class MaxwellOrchestrator:
             "orphans_cleaned": 0,
             "waiting_no_account": 0,
             "failed_no_account": 0,
+            "skipped_download_pause": 0,
+            "local_files_cleaned": 0,
         }
 
         # 1. GC pass — clean orphaned tasks
         stats["orphans_cleaned"] = await self._cleaner.cleanup()
+        if self._janitor is not None:
+            cleanup_stats = await self._janitor.cleanup()
+            stats["local_files_cleaned"] = cleanup_stats["deleted"] + cleanup_stats["missing"]
 
         # 2. Find pending tasks from DB (up to batch_size)
         pending_count = await self._task_repo.count_by_state(TaskState.PENDING)
@@ -74,6 +83,9 @@ class MaxwellOrchestrator:
         pending_tasks = await self._task_repo.list_pending(self._batch_size)
         for task in pending_tasks:
             queue_name = task.queue_name or self._download_q
+            if download_paused and queue_name == self._download_q:
+                stats["skipped_download_pause"] += 1
+                continue
             # Claim as DISPATCHED (queued but not yet started by a worker).
             # Workers will advance to stage-specific transient states when they
             # actually begin execution, which avoids GC treating queue backlog
@@ -145,7 +157,19 @@ class MaxwellOrchestrator:
         """
         orphans = await self._cleaner.cleanup()
         expired = await self._cleaner.cleanup_expired_videos()
-        return {"orphans_cleaned": orphans, "videos_expired": expired}
+        cleaned = 0
+        if self._janitor is not None:
+            cleanup_stats = await self._janitor.cleanup()
+            cleaned = cleanup_stats["deleted"] + cleanup_stats["missing"]
+        released = 0
+        if self._candidate_repo is not None:
+            released = await self._candidate_repo.release_expired_cooldowns()
+        return {
+            "orphans_cleaned": orphans,
+            "videos_expired": expired,
+            "local_files_cleaned": cleaned,
+            "source_candidates_released": released,
+        }
 
     async def health(self) -> dict[str, object]:
         """Return orchestrator health status.

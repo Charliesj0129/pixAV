@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from pixav.shared import metrics
 from pixav.shared.enums import VideoStatus
 from pixav.shared.models import Video
 from pixav.sht_probe.service import ShtProbeService, _title_from_magnet
@@ -234,3 +235,53 @@ class TestTitleFromMagnet:
     def test_returns_untitled_without_dn(self) -> None:
         magnet = "magnet:?xt=urn:btih:abc123"
         assert _title_from_magnet(magnet) == "Untitled"
+
+
+def _adapter_errors() -> float:
+    return metrics.source_adapter_errors.labels(reason="INVALID_PROVIDER_PAYLOAD")._value.get()
+
+
+class TestAdapterErrors:
+    """BDD-008: a provider row nobody can read is discarded, and it is counted."""
+
+    @staticmethod
+    def _service(queue: AsyncMock, video_repo: AsyncMock) -> ShtProbeService:
+        return ShtProbeService(video_repo=video_repo, queue=queue, managed_media_workflow=True)
+
+    async def test_one_unreadable_row_is_counted_and_the_rest_survive_bdd_008(
+        self, mock_queue: AsyncMock, mock_video_repo: AsyncMock
+    ) -> None:
+        service = self._service(mock_queue, mock_video_repo)
+        before = _adapter_errors()
+
+        accepted = await service._publish_observations(
+            [],
+            results=[
+                # No magnet_uri at all: nothing here can become a candidate.
+                {"title": "not a torrent", "provider": "indexer"},
+                {
+                    "title": "synthetic 1080p .mp4",
+                    "magnet_uri": "magnet:?xt=urn:btih:" + "a" * 40,
+                    "provider": "indexer",
+                    "seeders": 3,
+                    "size": 2 * 1024**3,
+                },
+            ],
+        )
+
+        assert len(accepted) == 1, "the readable row is still admitted"
+        assert _adapter_errors() == before + 1
+        assert mock_queue.push.await_count == 1
+
+    async def test_a_discarded_row_is_not_invisible_bdd_008(
+        self, mock_queue: AsyncMock, mock_video_repo: AsyncMock
+    ) -> None:
+        """Without the counter, "nothing usable" and "nothing found" look alike."""
+        service = self._service(mock_queue, mock_video_repo)
+        before = _adapter_errors()
+
+        accepted = await service._publish_observations([], results=[{"magnet_uri": "not-a-magnet"}])
+
+        assert accepted == []
+        assert _adapter_errors() == before + 1
+        mock_queue.push.assert_not_awaited()

@@ -1,0 +1,9 @@
+ARG REDROID_GAPPS_IMAGE=redroid/redroid:13.0.0_mindthegapps
+FROM ${REDROID_GAPPS_IMAGE}
+
+# AOSP SystemConfig reads OEM features from this directory during boot. The
+# whitespace-free identity overrides remain in config/android_profiles.yml;
+# the product partition carries the model because Redroid cannot preserve the
+# space in a `ro.product.model=Pixel XL` container argument.
+COPY pixel-xl-features.xml /system/etc/sysconfig/pixel-xl-features.xml
+COPY pixel-xl-product-build.prop /product/etc/build.prop

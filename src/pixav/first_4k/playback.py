@@ -176,7 +176,9 @@ class PlaybackMixin(FlowState):
             await uploader.open_details()
             media = next(s for s in part.media_info["streams"] if s["codec_type"] == "video")
             items.append(collect_item(await uploader.attributes(), part.filename, {**media, "sha256": part.sha256}))
-        await uploader.flow("launch-photos")
+        # open_details() left the last part on the item pager, and the account
+        # disc lives on the home screen, so the pager has to be cleared first.
+        await uploader._open_photos_home()
         await uploader.flow("account")
         after = await uploader.quota_observation()
         after["observed_at"] = (await self.pool.fetchval("SELECT now()")).isoformat()

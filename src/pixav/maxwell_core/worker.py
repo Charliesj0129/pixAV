@@ -12,16 +12,28 @@ import redis.asyncio as aioredis
 from pixav.config import Settings, get_settings
 from pixav.maxwell_core.backpressure import QueueDepthMonitor
 from pixav.maxwell_core.dispatcher import RedisTaskDispatcher
-from pixav.maxwell_core.gc import OrphanTaskCleaner
+from pixav.maxwell_core.gc import LocalFileJanitor, OrphanTaskCleaner
 from pixav.maxwell_core.orchestrator import MaxwellOrchestrator
 from pixav.maxwell_core.scheduler import LruAccountScheduler
 from pixav.shared.db import create_pool
+from pixav.shared.disk import DownloadSpaceGuard
 from pixav.shared.enums import TaskState
-from pixav.shared.metrics import record_task_failed, record_task_processed, set_queue_depth
+from pixav.shared.metrics import (
+    record_source_adapter_error,
+    record_task_failed,
+    record_task_processed,
+    set_executions_source_unavailable,
+    set_executions_terminal,
+    set_executions_user_action_required,
+    set_executions_waiting_quota,
+    set_queue_depth,
+    set_remote_assets_due_reverification,
+)
 from pixav.shared.models import Task
+from pixav.shared.pause import is_paused_value
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
-from pixav.shared.repository import TaskRepository, VideoRepository
+from pixav.shared.repository import SourceCandidateRepository, TaskRepository, VideoRepository
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +49,12 @@ def _parse_uuid(value: Any) -> uuid.UUID | None:
         return None
 
 
-def _is_paused_value(raw: Any) -> bool:
-    if raw is None:
-        return False
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 async def _is_paused(redis: aioredis.Redis, pause_key: str) -> bool:
     value = await redis.get(pause_key)
-    return _is_paused_value(value)
+    return is_paused_value(value)
 
 
-async def ingest_crawl_queue(
+async def ingest_crawl_queue(  # noqa: C901
     *,
     crawl_queue: TaskQueue,
     task_repo: TaskRepository,
@@ -56,6 +62,7 @@ async def ingest_crawl_queue(
     download_queue_name: str,
     max_retries: int = 10,
     batch_size: int = 100,
+    managed_workflow: Any = None,
 ) -> int:
     """Drain crawl queue payloads and create pending download tasks."""
     created = 0
@@ -67,6 +74,26 @@ async def ingest_crawl_queue(
             if claimed is None:
                 break
             payload, receipt = claimed
+
+            if payload.get("schema") == "source-observation-v1":
+                if managed_workflow is None:
+                    raise RuntimeError("managed discovery requires the execution authority")
+                try:
+                    managed_workflow.source_policy.normalize(payload["observation"])
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    # Two different facts: the queue item is done with (below),
+                    # and a provider payload could not be understood (here).
+                    logger.warning("adapter error: INVALID_PROVIDER_PAYLOAD")
+                    record_source_adapter_error()
+                    record_task_failed(_METRICS_MODULE)
+                    await crawl_queue.ack(receipt)
+                    acked = True
+                    continue
+                await managed_workflow.ingest_observation(payload["observation"])
+                await crawl_queue.ack(receipt)
+                acked = True
+                created += 1
+                continue
 
             video_id = _parse_uuid(payload.get("video_id"))
             if video_id is None:
@@ -121,7 +148,48 @@ async def _publish_queue_depths(crawl_queue: TaskQueue, queues: dict[str, TaskQu
             logger.warning("failed to publish depth for queue %s: %s", queue.name, exc)
 
 
-async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = None) -> None:
+async def _publish_execution_metrics(managed: Any, *, reverify_interval_days: int = 0) -> None:
+    """Export the managed execution states an operator has to tell apart."""
+    if managed is None:
+        return
+    try:
+        counts = await managed.observe_states()
+        due = await managed.storage.due_reverification(interval_days=reverify_interval_days)
+    except Exception as exc:  # pragma: no cover - metrics must never break the tick
+        logger.warning("failed to publish execution state metrics: %s", exc)
+        return
+    set_executions_waiting_quota(counts["waiting_quota"])
+    set_executions_source_unavailable(counts["source_unavailable"])
+    set_executions_user_action_required(counts["user_action_required"])
+    set_executions_terminal(counts["terminal"])
+    set_remote_assets_due_reverification(due)
+
+
+async def _open_reverifications(managed: Any, *, interval_days: int) -> None:
+    """Ask again about durable copies nobody has read back lately.
+
+    A failure here must not stop the tick: re-verification is a background
+    assurance activity, and losing it for one cycle changes nothing that has
+    already been proven.
+    """
+    if managed is None or interval_days <= 0:
+        return
+    try:
+        opened = await managed.storage.reverify_due(interval_days=interval_days)
+    except Exception as exc:  # pragma: no cover - assurance must never break the tick
+        logger.warning("failed to open re-verification executions: %s", exc)
+        return
+    if opened:
+        logger.info("opened %d re-verification execution(s)", len(opened))
+
+
+async def run_loop(  # noqa: C901
+    settings: Settings,
+    *,
+    interval: int = 30,
+    health_app: Any = None,
+    health_state: Any = None,
+) -> None:
     """Run the Maxwell orchestrator tick loop.
 
     Args:
@@ -135,6 +203,25 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
     redis = await create_redis(settings)
 
     try:
+        managed = None
+        managed_queue = None
+        storage_queue = None
+        if settings.managed_media_workflow:
+            from pixav.maxwell_core.media_workflow import MediaWorkflow
+            from pixav.shared.retry import parse_retry_backoff
+            from pixav.shared.workflow import MANAGED_QUEUE, STORAGE_QUEUE, require_workflow_role
+            from pixav.sht_probe.policy import SourcePolicy
+
+            await require_workflow_role(pool, "pixav_execution_authority")
+            managed = MediaWorkflow(
+                pool,
+                backoff=parse_retry_backoff(settings.retry_backoff_seconds),
+                cooldown_seconds=settings.source_candidate_cooldown_hours * 3600,
+                max_retries=settings.download_max_retries,
+                source_policy=SourcePolicy(min_score=settings.source_min_quality_score),
+            )
+            managed_queue = TaskQueue(redis=redis, queue_name=MANAGED_QUEUE)
+            storage_queue = TaskQueue(redis=redis, queue_name=STORAGE_QUEUE)
         task_repo = TaskRepository(pool)
         video_repo = VideoRepository(pool)
 
@@ -154,6 +241,19 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
         dispatcher = RedisTaskDispatcher(task_repo=task_repo, queues=queues)
         monitor = QueueDepthMonitor(queues=queues)
         cleaner = OrphanTaskCleaner(pool)
+        janitor = LocalFileJanitor(
+            pool,
+            download_dir=settings.download_dir,
+            batch_size=settings.local_cleanup_batch_size,
+            apply_deletions=settings.local_cleanup_apply,
+        )
+        disk_guard = DownloadSpaceGuard(
+            redis,
+            path=settings.download_dir,
+            pause_key=settings.download_pause_key,
+            min_free_bytes=settings.download_min_free_bytes,
+            min_free_percent=settings.download_min_free_percent,
+        )
 
         orchestrator = MaxwellOrchestrator(
             scheduler=scheduler,
@@ -165,11 +265,15 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
             download_queue_name=settings.queue_download,
             upload_queue_name=settings.queue_upload,
             no_account_policy=settings.no_account_policy,
+            janitor=janitor,
+            candidate_repo=SourceCandidateRepository(pool),
         )
 
         # Expose orchestrator to health app if one was provided
         if health_app is not None:
             health_app.state.orchestrator = orchestrator
+        if health_state is not None:
+            health_state.mark_ready()
 
         logger.info("maxwell-core worker started (interval=%ds)", interval)
 
@@ -186,9 +290,15 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
                     video_repo=video_repo,
                     download_queue_name=settings.queue_download,
                     max_retries=settings.download_max_retries,
+                    managed_workflow=managed,
                 )
-                stats = await orchestrator.tick()
+                disk_status = await disk_guard.check_and_latch()
+                if managed is not None:
+                    await managed.tick(managed_queue, download_paused=disk_status.paused, storage_queue=storage_queue)
+                stats = await orchestrator.tick(download_paused=disk_status.paused)
+                await _open_reverifications(managed, interval_days=settings.remote_reverify_interval_days)
                 await _publish_queue_depths(crawl_queue, queues)
+                await _publish_execution_metrics(managed, reverify_interval_days=settings.remote_reverify_interval_days)
                 if created:
                     logger.info("ingested %d crawl payload(s) into tasks", created)
                 logger.info("tick result: %s", stats)
@@ -203,57 +313,24 @@ async def run_loop(settings: Settings, *, interval: int = 30, health_app: Any = 
 
 def main() -> None:
     """Entry point for ``python -m pixav.maxwell_core.worker``."""
-    import uvicorn
-    from fastapi import FastAPI
-    from fastapi.responses import PlainTextResponse
-
-    from pixav.shared.metrics import get_metrics_output
+    from pixav.shared.health import HealthState, create_health_app
+    from pixav.shared.health_server import run_with_health
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
 
-    health_app = FastAPI(title="pixAV maxwell_core health", docs_url=None, redoc_url=None)
-    health_app.state.orchestrator = None
-
-    @health_app.get("/health")
-    async def health() -> dict[str, Any]:
-        orchestrator: MaxwellOrchestrator | None = getattr(health_app.state, "orchestrator", None)
-        if orchestrator is not None:
-            try:
-                return {"status": "ok", "module": "maxwell_core", **(await orchestrator.health())}
-            except Exception:  # noqa: S110
-                pass
-        return {"status": "ok", "module": "maxwell_core"}
-
-    @health_app.get("/metrics", response_class=PlainTextResponse)
-    async def metrics() -> PlainTextResponse:
-        return PlainTextResponse(
-            content=get_metrics_output().decode("utf-8"),
-            media_type="text/plain; version=0.0.4; charset=utf-8",
-        )
+    health_state = HealthState("maxwell_core", stale_after_seconds=settings.heartbeat_stale_seconds)
+    health_app = create_health_app("maxwell_core", state=health_state)
 
     async def _run() -> None:
-        config = uvicorn.Config(
-            health_app,
+        await run_with_health(
+            worker_coro=run_loop(settings, health_app=health_app, health_state=health_state),
+            health_app=health_app,
             host=settings.health_host,
             port=settings.maxwell_core_health_port,
-            log_level="warning",
-            access_log=False,
+            health_state=health_state,
+            heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
         )
-        server = uvicorn.Server(config)
-        worker_task = asyncio.ensure_future(run_loop(settings, health_app=health_app))
-        server_task = asyncio.ensure_future(server.serve())
-        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):  # noqa: S110
-                pass
-        for t in done:
-            exc = t.exception()
-            if exc is not None:
-                raise exc
 
     asyncio.run(_run())
 

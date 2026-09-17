@@ -7,7 +7,12 @@ import httpx
 import pytest
 import respx
 
-from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
+from pixav.shared.metrics import crawl_watermark_rejected
+from pixav.sht_probe.sehuatang import (
+    SehuatangCrawler,
+    SehuatangExtractor,
+    _is_obfuscated_text,
+)
 
 
 @pytest.fixture
@@ -313,6 +318,14 @@ async def test_extractor_converts_infohash_to_magnet() -> None:
 
 
 @pytest.mark.unit
+async def test_extractor_attaches_thread_title_to_bare_hash() -> None:
+    html = f'<html><h1 id="thread_subject">Real Thread Title</h1><div>{_INFOHASH_UPPER}</div></html>'
+    candidates = await SehuatangExtractor().extract_candidates(html, "https://www.sehuatang.org/thread-1.html")
+    assert candidates[0].title == "Real Thread Title"
+    assert candidates[0].source_url.endswith("thread-1.html")
+
+
+@pytest.mark.unit
 async def test_concurrent_age_gates_each_resolve_with_their_own_token(
     mock_flaresolverr: AsyncMock,
 ) -> None:
@@ -356,3 +369,51 @@ async def test_concurrent_age_gates_each_resolve_with_their_own_token(
     for page_id, html in crawler._page_cache.items():
         assert not SehuatangCrawler._looks_like_age_gate(html), f"{page_id} still shows the age-gate"
     assert len(links) == pages
+
+
+@pytest.mark.unit
+class TestWatermarkRejection:
+    """Sehuatang stamps pages with a 40-hex watermark that is not an info hash.
+
+    It is a random key byte followed by ``sehuatang@gmail.com`` XOR-ed with that
+    key, so it matches the bare-info-hash pattern exactly. Left unfiltered it
+    accounted for over half of all discovered magnets.
+    """
+
+    @staticmethod
+    def _watermark(key: int) -> str:
+        payload = b"sehuatang@gmail.com"
+        return bytes([key] + [b ^ key for b in payload]).hex()
+
+    @pytest.mark.parametrize("key", [0x7B, 0x19, 0xA9, 0x2A, 0x00])
+    def test_rejects_watermark_for_any_key(self, key: int) -> None:
+        assert _is_obfuscated_text(self._watermark(key)) is True
+
+    @pytest.mark.parametrize(
+        "info_hash",
+        [
+            "c7c12339a5792fa68c6a4d77b83a5b123960f617",
+            "d7b741650272bde58f3a2803b616b07077984830",
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        ],
+    )
+    def test_keeps_real_info_hashes(self, info_hash: str) -> None:
+        assert _is_obfuscated_text(info_hash) is False
+
+    async def test_extractor_drops_watermark_but_keeps_real_hash(self) -> None:
+        real = "C7C12339A5792FA68C6A4D77B83A5B123960F617"
+        html = f"<html><body>{self._watermark(0x7B)} and {real}</body></html>"
+
+        magnets = await SehuatangExtractor().extract(html)
+
+        assert magnets == [f"magnet:?xt=urn:btih:{real}"]
+
+    async def test_discarded_watermarks_are_counted(self) -> None:
+        """A cycle that discards everything and one that finds nothing both
+        report new=0; only this counter tells them apart."""
+        before = crawl_watermark_rejected.labels(module="sht_probe")._value.get()
+        html = f"<html><body>{self._watermark(0x11)} {self._watermark(0x22)}</body></html>"
+
+        await SehuatangExtractor().extract(html)
+
+        assert crawl_watermark_rejected.labels(module="sht_probe")._value.get() == before + 2

@@ -7,9 +7,30 @@ from unittest.mock import Mock, patch
 import pytest
 
 from pixav.media_loader.video_parts import PartMedia
+from pixav.pixel_injector import parts_download
 from pixav.pixel_injector.canary_download import extract_original
 from pixav.pixel_injector.parts_download import prepare, quarantine
 from pixav.shared.models import VideoPart
+
+# What ffprobe would report for the retrieved bytes. Verification needs to know
+# what media came back, not only that the byte count and hash matched.
+OBSERVED = {
+    "container": "mov,mp4",
+    "size_bytes": 8,
+    "duration_seconds": 10.0,
+    "sha256": hashlib.sha256(b"original").hexdigest(),
+    "streams": [
+        {"kind": "video", "codec": "h264", "width": 1920, "height": 1080},
+        {"kind": "audio", "codec": "aac", "width": 0, "height": 0},
+    ],
+}
+
+
+@pytest.fixture
+def observed_stub(monkeypatch):
+    """ffprobe lives in the tools image; these tests exercise the cache boundary."""
+    monkeypatch.setattr(parts_download, "observed_media", lambda path: OBSERVED)
+    return OBSERVED
 
 
 def test_forced_zip64_original(tmp_path):
@@ -167,7 +188,7 @@ def test_incomplete_cloud_cache_is_preserved_before_browser_retry(tmp_path, arti
 
 
 @pytest.mark.parametrize("receipt_size", [8, 9])
-def test_cache_reuse_requires_matching_receipt_size(tmp_path, receipt_size, browser_stub):
+def test_cache_reuse_requires_matching_receipt_size(tmp_path, receipt_size, browser_stub, observed_stub):
     import json
 
     from pixav.pixel_injector.parts_download import download_original
@@ -178,11 +199,35 @@ def test_cache_reuse_requires_matching_receipt_size(tmp_path, receipt_size, brow
     (tmp_path / (part.filename + ".json")).write_text(json.dumps(receipt))
     with patch.object(browser_stub, "sync_playwright") as browser:
         if receipt_size == part.size_bytes:
-            assert download_original(part, tmp_path) == receipt
+            assert download_original(part, tmp_path) == {**receipt, "observed": observed_stub}
         else:
             with pytest.raises(ValueError, match="corrupt"):
                 download_original(part, tmp_path)
         browser.assert_not_called()
+
+
+def test_a_reused_cache_still_reports_what_the_media_is_bdd_053(tmp_path, browser_stub, observed_stub):
+    """An old receipt describes bytes; the media facts are recomputed from them.
+
+    A receipt written before the observation was part of the contract still
+    points at bytes that are present and still hash correctly, so the honest
+    answer is to look at them again rather than fetch the segment twice.
+    """
+    import json
+
+    from pixav.pixel_injector.parts_download import download_original
+
+    part = cached_part()
+    (tmp_path / part.filename).write_bytes(b"original")
+    stored = {"sha256": part.sha256, "size": part.size_bytes, "method": "photos-original-browser"}
+    (tmp_path / (part.filename + ".json")).write_text(json.dumps(stored))
+
+    with patch.object(browser_stub, "sync_playwright") as browser:
+        report = download_original(part, tmp_path)
+
+    browser.assert_not_called()
+    assert report["observed"] == observed_stub
+    assert "local_path" not in report and part.share_url not in json.dumps(report)
 
 
 @pytest.fixture

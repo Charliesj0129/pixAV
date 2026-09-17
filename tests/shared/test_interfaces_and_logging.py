@@ -5,8 +5,14 @@ from __future__ import annotations
 import logging
 
 from pixav.maxwell_core.interfaces import BackpressureMonitor, TaskDispatcher, TaskScheduler
-from pixav.shared.logging import setup_logging
-from pixav.sht_probe.interfaces import ContentCrawler, FlareSolverSession, JackettSearcher, MagnetExtractor
+from pixav.shared.logging import install_http_url_log_redaction, setup_logging
+from pixav.sht_probe.interfaces import (
+    ContentCrawler,
+    FlareSolverSession,
+    IndexerAdapter,
+    JackettSearcher,
+    MagnetExtractor,
+)
 
 
 class _SchedulerImpl:
@@ -61,9 +67,28 @@ def test_sht_protocol_runtime_checks() -> None:
     assert isinstance(_CrawlerImpl(), ContentCrawler)
     assert isinstance(_ExtractorImpl(), MagnetExtractor)
     assert isinstance(_JackettImpl(), JackettSearcher)
+    assert isinstance(_JackettImpl(), IndexerAdapter)
     assert isinstance(_FlareSolverImpl(), FlareSolverSession)
 
 
 def test_setup_logging_console_and_json() -> None:
     setup_logging(level=logging.DEBUG, json_output=False)
     setup_logging(level=logging.INFO, json_output=True)
+
+
+def test_http_dependency_logs_redact_urls_and_exception_tracebacks(caplog) -> None:
+    token = "synthetic-sensitive-token"
+    secret_url = f"https://photos.app.goo.gl/{token}?signed=yes"
+    install_http_url_log_redaction()
+    install_http_url_log_redaction()
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        logging.getLogger("httpx").info('HTTP Request: GET "%s" 200 OK', secret_url)
+        try:
+            raise RuntimeError(f"transport rejected {secret_url}")
+        except RuntimeError:
+            logging.getLogger("httpx").error("request failed", exc_info=True)
+
+    assert token not in caplog.text
+    assert secret_url not in caplog.text
+    assert "<redacted-http-url>" in caplog.text

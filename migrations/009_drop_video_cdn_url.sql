@@ -1,0 +1,25 @@
+-- 009_drop_video_cdn_url.sql
+-- The contract half of the source_candidates change (RFC v3 §0.C).
+--
+-- Why the column goes:
+--   `cdn_url` is a short-lived derived value — Google Photos signs its CDN URLs
+--   for roughly an hour — and the column has no expiry. Persisting it turned the
+--   Redis TTL into a no-op: once the cache expired, `_resolve_cdn()` fell back to
+--   the row, returned an already-dead URL, and rewrote it into the cache for
+--   another TTL. Nothing ever re-resolved. `share_url` is the durable fact; the
+--   CDN URL belongs only in the cache that can expire it.
+--
+-- ORDERING — this migration is not safe on its own:
+--   Stop old workers, run the migration gate, then start the new images in one
+--   maintenance window. Code older than the `_resolve_cdn()` fix still
+--   SELECTs this column and the repository's INSERT still names it, so applying
+--   009 against a running old deployment breaks discovery inserts and every
+--   resolve. 008 is additive and can be applied ahead of time; 009 belongs in
+--   the same maintenance window as the deploy that stops reading the column.
+--
+-- Data semantics: this deliberately discards a derived, expiring cache value,
+-- never the durable share URL.  The 2026-08-31 deploy-window check found one
+-- non-null `cdn_url` on an old synthetic available row; it also had the durable
+-- `share_url` and local artifact.  The resolver no longer reads this column.
+
+ALTER TABLE videos DROP COLUMN IF EXISTS cdn_url;

@@ -223,16 +223,22 @@ async def _run_media_loader_stage(
         base_url=settings.qbit_url,
         username=settings.qbit_user,
         password=settings.qbit_password,
-        download_dir=settings.download_dir,
+        download_dir=settings.qbit_download_dir,
+        local_download_dir=settings.download_dir,
     )
-    logger.info("running qBittorrent health check: %s", settings.qbit_url)
-    version = await qbit.health_check()
-    logger.info("qBittorrent health check passed (version=%s)", version)
+    try:
+        logger.info("running qBittorrent health check: %s", settings.qbit_url)
+        version = await qbit.health_check()
+        logger.info("qBittorrent health check passed (version=%s)", version)
 
-    info_hash = await qbit.add_magnet(video.magnet_uri)
-    logger.info("submitted magnet to qBittorrent (hash=%s)", info_hash)
-    await qbit.delete_torrent(info_hash)
-    logger.info("cleanup completed: deleted qBittorrent torrent %s", info_hash)
+        if not video.magnet_uri:
+            raise RuntimeError(f"video has no magnet_uri: {video_id}")
+        info_hash = await qbit.add_magnet(video.magnet_uri)
+        logger.info("submitted magnet to qBittorrent (hash=%s)", info_hash)
+        await qbit.delete_torrent(info_hash)
+        logger.info("cleanup completed: deleted qBittorrent torrent %s", info_hash)
+    finally:
+        await qbit.aclose()
 
 
 async def main() -> None:

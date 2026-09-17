@@ -1,0 +1,11 @@
+# Calibrated against the GMS post-sign-in consent page, 720x1280, 2026-09-15.
+# The page scrolls: ACCEPT is below the fold, so MORE brings it into view and
+# is optional for a short page. "Back up device data" anchors the assert
+# because it stays visible on both halves of the scroll, unlike the heading.
+appId: com.google.android.gms
+---
+- assertVisible: "Back up device data"
+- tapOn:
+    text: "MORE"
+    optional: true
+- tapOn: "ACCEPT"

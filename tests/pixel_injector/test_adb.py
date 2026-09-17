@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -18,7 +19,11 @@ def adb() -> AdbConnection:
 class TestAdbConnection:
     async def test_connect_success(self, adb: AdbConnection) -> None:
         mock_proc = AsyncMock()
-        mock_proc.communicate.return_value = (b"connected to 10.0.0.1:5555", b"")
+        mock_proc.communicate.side_effect = [
+            (b"connected to 10.0.0.1:5555", b""),
+            (b"", b""),
+            (b"1", b""),
+        ]
         mock_proc.returncode = 0
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
@@ -60,6 +65,38 @@ class TestAdbConnection:
             with pytest.raises(AdbError, match="push failed"):
                 await adb.push("/tmp/video.mp4", "/sdcard/video.mp4")
 
+    async def test_pull_success(self, adb: AdbConnection) -> None:
+        adb._target = "10.0.0.1:5555"
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"1 file pulled", b"")
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as create:
+            await adb.pull("/data/local/tmp/screen.png", "screen.png")
+
+        assert create.call_args.args == (
+            "adb",
+            "-s",
+            "10.0.0.1:5555",
+            "pull",
+            "/data/local/tmp/screen.png",
+            "screen.png",
+        )
+
+    async def test_pull_not_connected(self, adb: AdbConnection) -> None:
+        with pytest.raises(AdbError, match="not connected"):
+            await adb.pull("/data/local/tmp/screen.png", "screen.png")
+
+    async def test_pull_failure(self, adb: AdbConnection) -> None:
+        adb._target = "10.0.0.1:5555"
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"", b"remote object does not exist")
+        mock_proc.returncode = 1
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with pytest.raises(AdbError, match="pull failed"):
+                await adb.pull("/missing.png", "screen.png")
+
     async def test_shell_success(self, adb: AdbConnection) -> None:
         adb._target = "10.0.0.1:5555"
 
@@ -72,9 +109,55 @@ class TestAdbConnection:
 
         assert result == "output line"
 
+    async def test_shell_allows_long_operation_timeout_override(self, adb: AdbConnection) -> None:
+        adb._target = "10.0.0.1:5555"
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"Broadcast completed", b"")
+        mock_proc.returncode = 0
+        observed_timeouts: list[int | None] = []
+
+        async def capture_timeout(
+            awaitable: Awaitable[tuple[bytes, bytes]], *, timeout: int | None = None
+        ) -> tuple[bytes, bytes]:
+            observed_timeouts.append(timeout)
+            return await awaitable
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("asyncio.wait_for", side_effect=capture_timeout),
+        ):
+            await adb.shell("am broadcast test", timeout=900)
+
+        assert observed_timeouts == [900]
+
     async def test_shell_not_connected(self, adb: AdbConnection) -> None:
         with pytest.raises(AdbError, match="not connected"):
             await adb.shell("ls")
+
+    async def test_sensitive_shell_keeps_secret_out_of_process_argv(self, adb: AdbConnection) -> None:
+        adb._target = "10.0.0.1:5555"
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as create:
+            await adb.shell("input text 'SecretPassword123!'", sensitive=True)
+
+        assert "SecretPassword123!" not in " ".join(str(arg) for arg in create.call_args.args)
+        mock_proc.communicate.assert_awaited_once_with(b"input text 'SecretPassword123!'\n")
+
+    async def test_sensitive_shell_redacts_failure_detail(self, adb: AdbConnection) -> None:
+        adb._target = "10.0.0.1:5555"
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"", b"SecretPassword123!")
+        mock_proc.returncode = 1
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with pytest.raises(AdbError) as exc_info:
+                await adb.shell("input text 'SecretPassword123!'", sensitive=True)
+
+        assert "SecretPassword123!" not in str(exc_info.value)
+        assert "redacted" in str(exc_info.value)
 
     async def test_binary_not_found(self, adb: AdbConnection) -> None:
         with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("adb")):

@@ -1,0 +1,12 @@
+{
+  "gate_observed": true,
+  "raw_age_gates": [
+    {
+      "captured_at": "2026-09-07T15:08:22.086169+00:00",
+      "file": "raw-age-gate-0.html",
+      "raw_sha256": "0f90693b710ed82e14c9a2e319b47647c094f225ab43fb816a5f383f76191dd7",
+      "recognition_preserved": true,
+      "sha256": "d9f583175461c41347622db0b426d3c780e900fbe1d270c32603f4a2ebb5c738"
+    }
+  ]
+}

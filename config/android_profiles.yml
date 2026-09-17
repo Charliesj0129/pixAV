@@ -1,0 +1,68 @@
+# Android device profiles for Redroid containers.
+#
+# pixAV only knows a profile name; everything that makes a container look like a
+# particular device is data in this file. Overrides the built-in defaults in
+# src/pixav/pixel_injector/profiles.py by name.
+#
+# Google Photos checks two layers for the original-quality entitlement, and both
+# are image-level facts here, so no Magisk/Zygisk/LSPosed chain is involved:
+#   1. Build.MANUFACTURER/BRAND/FINGERPRINT         <- the ro.* args below
+#      Build.MODEL                                  <- /product/etc/build.prop in the image
+#   2. PackageManager.hasSystemFeature(PIXEL_*)    <- docker/android/pixel-xl-features.xml
+#      baked into /system/etc/sysconfig/ in the golden image
+#
+# Because both layers are image-level, `adb shell getprop` and
+# `adb shell pm list features` are ground truth: what they report is what the
+# Photos process sees. That is not true of a runtime hook, where a global
+# getprop proves nothing about one hooked process.
+
+gphotos_pixel_xl_v1:
+  # Pixel XL, codename `marlin`. The last Pixel generation carrying unlimited
+  # *original quality* Photos backup (Pixel 2-5 get storage-saver quality,
+  # Pixel 6 onward get nothing).
+  #
+  # Built locally on 2026-09-01 from:
+  #   - redroid/redroid:13.0.0-latest
+  #     manifest sha256:41e5f0c1ff27a4a474c474e5595168cedf6c40fc5dd102c5617f48c80f511e9e
+  #   - ayasa520/redroid-script commit
+  #     1004fc4062978c26cafe063d3fcc7357e3921c78, using `-a 13.0.0 -mtg`
+  #   - docker/android/Dockerfile.pixel-xl for the feature/product-property layer
+  #
+  # An image ID is used because this local build has no registry manifest
+  # digest. It is immutable on this host and cannot silently follow a tag.
+  image: sha256:c76d943942db819c95acc0bc4767f0e9fd2d01acb7cabb76e0dbdb1917a441b5
+
+  # redroid accepts arbitrary `ro.xxx=value` overrides as container arguments,
+  # but its second-stage init splits arguments on whitespace. `Pixel XL` is
+  # therefore baked into /product/etc/build.prop by the Dockerfile instead.
+  #
+  # Deliberately NOT overridden: ro.build.version.sdk / release. A real Pixel XL
+  # shipped Android 10 while this image is 13. Lying about the SDK level breaks
+  # the platform and every app on it, so this identity is consistent in vendor
+  # and model and inconsistent in OS version. That inconsistency is the one real
+  # weakness of the image-level approach; if it turns out to matter, the answer
+  # is a Photos-scoped runtime hook, not deeper property lies.
+  args:
+    - androidboot.redroid_gpu_mode=guest
+    - ro.product.brand=google
+    - ro.product.manufacturer=Google
+    - ro.product.name=marlin
+    - ro.product.device=marlin
+    # Final official Android 10 build for Pixel/Pixel XL. The fingerprint is a
+    # complete Build.FINGERPRINT identity; it deliberately does not override the
+    # running image's ro.build.version.sdk or ro.build.version.release.
+    - ro.build.fingerprint=google/marlin/marlin:10/QP1A.191005.007.A3/5972272:user/release-keys
+
+  # Evidence that the container is usable AND that the identity took effect.
+  # Stock Redroid images declare no HEALTHCHECK, so Docker's own health signal
+  # reads "none" from the instant the container starts and proves nothing.
+  #
+  readiness:
+    - command: getprop sys.boot_completed
+      contains: "1"
+    - command: getprop ro.product.model
+      contains: Pixel XL
+    - command: getprop ro.build.fingerprint
+      contains: google/marlin/marlin:10/QP1A.191005.007.A3/5972272:user/release-keys
+    - command: pm list features
+      contains: com.google.android.feature.PIXEL_2016_EXPERIENCE

@@ -1,0 +1,57 @@
+{
+  "captured_date": "2026-09-07",
+  "scope": "first three normal thread rows, board 103 page 1",
+  "sanitization": "scripts/cardigann_spike.py; retain title and first post only; remove scripts, controls, cookie values, external URLs and personal email",
+  "fixtures": [
+    {
+      "file": "thread-0.html",
+      "source_path": "forum.php?mod=viewthread&tid=3746639",
+      "sha256": "2a4206d34723339c229fa855e7e665afebae2a974e8324e12dfba10a56cbbe89",
+      "candidates": [
+        {
+          "title": "FC2PPV-4904351 [自译征用]低配桥本有菜？首次拍摄 护士小姐的夜班护理 白皙无毛的身体被全面开发",
+          "magnet_uri": "magnet:?xt=urn:btih:6049CAFFF43522130B11E5A75FE3C09EFBEA8C1A",
+          "source_url": "https://www.sehuatang.org/forum.php?mod=viewthread&tid=3746639",
+          "size": 0,
+          "seeders": 0
+        }
+      ]
+    },
+    {
+      "file": "thread-1.html",
+      "source_path": "forum.php?mod=viewthread&tid=3746638",
+      "sha256": "e94b09c882573a64b896332c5dba984510113acac0409ed6dc55e8b64315de80",
+      "candidates": [
+        {
+          "title": "[中文字幕]Blacked.16.06.29.Alexa.Grace  单身女孩的周末 [自译征用]",
+          "magnet_uri": "magnet:?xt=urn:btih:0E99BE66D5FA58191205FA5AB28DEA1DBB1631BE",
+          "source_url": "https://www.sehuatang.org/forum.php?mod=viewthread&tid=3746638",
+          "size": 0,
+          "seeders": 0
+        }
+      ]
+    },
+    {
+      "file": "thread-2.html",
+      "source_path": "forum.php?mod=viewthread&tid=3746636",
+      "sha256": "8e1cf4567566c53bc864239fe388ea8a8580f96ad97574487a662286b8c4cebf",
+      "candidates": [
+        {
+          "title": "[中文字幕]Blacked.16.06.19.Scarlet.Sage 瞒着哥哥偷吃巧克力棒？这就是疯狂撩拨黑人猛男的下场 [自译征用]",
+          "magnet_uri": "magnet:?xt=urn:btih:AB39C8F43D2FD6D41E536DBD50B47FB20D4F3899",
+          "source_url": "https://www.sehuatang.org/forum.php?mod=viewthread&tid=3746636",
+          "size": 0,
+          "seeders": 0
+        }
+      ]
+    }
+  ],
+  "age_gate": "not observed",
+  "bare_hash_only": "not observed",
+  "live_parity": "NOT_RUN",
+  "watermark_fixture": {
+    "file": "watermark.html",
+    "source_path": "forum.php?mod=viewthread&tid=3746639",
+    "sha256": "bd2b63cb3132cd879b76d2dfdd777dc9cdf2c86503091392d193702d62b32c5e"
+  }
+}

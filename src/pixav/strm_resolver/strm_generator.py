@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
-
-import aiofiles  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +36,10 @@ async def generate_strm(
 
     stream_url = f"{resolver_base_url.rstrip('/')}/stream/{video_id}"
 
-    # Ensure directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    async with aiofiles.open(file_path, "w") as f:
-        await f.write(stream_url)
+    # STRM files contain one short URL; a direct write avoids creating a worker
+    # thread for a tiny operation and keeps shutdown/coverage deterministic.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(stream_url, encoding="utf-8")
 
     logger.info("generated STRM file: %s -> %s", file_path, stream_url)
     return str(file_path.absolute())

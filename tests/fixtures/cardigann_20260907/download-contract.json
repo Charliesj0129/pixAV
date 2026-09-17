@@ -1,0 +1,39 @@
+{
+  "responses": [
+    {
+      "hashes": [
+        "6049CAFFF43522130B11E5A75FE3C09EFBEA8C1A"
+      ],
+      "link_path_shape": "/dl/sehuatang-pixav/?jackett_apikey=<redacted>&path=<redacted>&file=<redacted>",
+      "location_type": "magnet",
+      "search_magnet_present": false,
+      "source_path": "forum.php?mod=viewthread&tid=3746639",
+      "status": 302
+    },
+    {
+      "hashes": [
+        "0E99BE66D5FA58191205FA5AB28DEA1DBB1631BE"
+      ],
+      "link_path_shape": "/dl/sehuatang-pixav/?jackett_apikey=<redacted>&path=<redacted>&file=<redacted>",
+      "location_type": "magnet",
+      "search_magnet_present": false,
+      "source_path": "forum.php?mod=viewthread&tid=3746638",
+      "status": 302
+    },
+    {
+      "hashes": [
+        "AB39C8F43D2FD6D41E536DBD50B47FB20D4F3899"
+      ],
+      "link_path_shape": "/dl/sehuatang-pixav/?jackett_apikey=<redacted>&path=<redacted>&file=<redacted>",
+      "location_type": "magnet",
+      "search_magnet_present": false,
+      "source_path": "forum.php?mod=viewthread&tid=3746636",
+      "status": 302
+    }
+  ],
+  "result_count": 30,
+  "search_status": 200,
+  "observed_on": "2026-09-07",
+  "jackett_version": "0.24.2486",
+  "follow_redirects": false
+}

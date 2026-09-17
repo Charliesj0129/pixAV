@@ -66,6 +66,41 @@ def _pbkdf2_qbittorrent(password: str) -> str:
     return f"@ByteArray({salt_b64}:{derived_b64})"
 
 
+# Runs inside a throwaway container against the qBittorrent /config volume.
+#
+# Qt writes nested INI keys with a SINGLE backslash (WebUI\Username). An earlier
+# version of this script over-escaped them into WebUI\\Username, which Qt reads
+# as a different key entirely: qBittorrent then saw no stored password, fell back
+# to a per-session temporary one, and every worker login failed until the WebUI
+# IP-banned them. Keep these separators single.
+_CONFIG_PATCH_SCRIPT = """
+import os
+from pathlib import Path
+
+conf = Path('/config/qBittorrent/qBittorrent.conf')
+text = conf.read_text(encoding='utf-8') if conf.exists() else ''
+
+# Drop the correct keys plus any double-backslash leftovers from the old bug.
+stale = (
+    'WebUI\\\\Username=',
+    'WebUI\\\\Password_',
+    'WebUI\\\\\\\\Username=',
+    'WebUI\\\\\\\\Password_',
+)
+out = [line for line in text.splitlines() if not line.startswith(stale)]
+
+if '[Preferences]' not in text:
+    out.append('')
+    out.append('[Preferences]')
+
+out.append('WebUI\\\\Username=' + os.environ['QBIT_USER'])
+out.append('WebUI\\\\Password_PBKDF2="' + os.environ['QBIT_PBKDF2'] + '"')
+
+conf.parent.mkdir(parents=True, exist_ok=True)
+conf.write_text('\\n'.join(out).rstrip() + '\\n', encoding='utf-8')
+"""
+
+
 def main() -> int:
     username = os.getenv("PIXAV_QBIT_USER", "admin").strip() or "admin"
     password = os.getenv("PIXAV_QBIT_PASSWORD", "adminadmin")
@@ -91,27 +126,7 @@ def main() -> int:
             "python:3.12-slim",
             "python",
             "-c",
-            (
-                "from pathlib import Path\n"
-                "import os\n"
-                "conf = Path('/config/qBittorrent/qBittorrent.conf')\n"
-                "text = conf.read_text(encoding='utf-8') if conf.exists() else ''\n"
-                "lines = text.splitlines()\n"
-                "out = []\n"
-                "for line in lines:\n"
-                "    if line.startswith('WebUI\\\\\\\\Password_'):\n"
-                "        continue\n"
-                "    if line.startswith('WebUI\\\\\\\\Username='):\n"
-                "        continue\n"
-                "    out.append(line)\n"
-                "if '[Preferences]' not in text:\n"
-                "    out.append('')\n"
-                "    out.append('[Preferences]')\n"
-                "out.append(f\"WebUI\\\\\\\\Username={os.environ['QBIT_USER']}\")\n"
-                'out.append(f"WebUI\\\\\\\\Password_PBKDF2=\\"{os.environ[\'QBIT_PBKDF2\']}\\"")\n'
-                "conf.parent.mkdir(parents=True, exist_ok=True)\n"
-                "conf.write_text('\\n'.join(out).rstrip() + '\\n', encoding='utf-8')\n"
-            ),
+            _CONFIG_PATCH_SCRIPT,
         ]
     )
 

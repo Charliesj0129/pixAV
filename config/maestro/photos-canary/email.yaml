@@ -1,9 +1,12 @@
 # Calibrated against GMS English sign-in WebView, 720x1280, 2026-09-08.
+# The field is cleared first: a retry that finds text left by an interrupted
+# attempt would otherwise append to it and submit a malformed address.
 appId: com.google.android.gms
 ---
 - assertVisible: "Forgot email?"
 - tapOn:
     point: "50%,54%"
+- eraseText: 120
 - inputText:
     text: ${MAESTRO_EMAIL}
     label: "Enter dedicated canary account"

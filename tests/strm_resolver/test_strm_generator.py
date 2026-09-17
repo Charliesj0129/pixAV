@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import aiofiles
 import pytest
 
 from pixav.strm_resolver.strm_generator import _sanitize_filename, generate_strm
@@ -23,11 +21,8 @@ async def test_generate_strm(tmp_path: Path) -> None:
 
     expected_path = tmp_path / "strm" / "ABC-123 - Test Video Title.strm"
     assert path == str(expected_path)
-    assert os.path.exists(path)
-
-    async with aiofiles.open(path) as f:
-        content = await f.read()
-        assert content == f"http://localhost:8000/stream/{video_id}"
+    assert Path(path).exists()
+    assert Path(path).read_text(encoding="utf-8") == f"http://localhost:8000/stream/{video_id}"
 
 
 def test_sanitize_filename() -> None:

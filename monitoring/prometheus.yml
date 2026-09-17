@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  - job_name: pixav-workers
+    static_configs:
+      - targets:
+          - maxwell_core:8001
+          - media_loader:8002
+          - sht_probe:8004
+          - strm_resolver:8000
+
+  # The sentinel has no hostname of its own: it shares gluetun's network
+  # namespace, which is the whole point of where it runs.
+  - job_name: pixav-vpn-sentinel
+    static_configs:
+      - targets: ["gluetun:8006"]
+
+  - job_name: pixav-pixel-injector
+    static_configs:
+      - targets: ["host.docker.internal:8003"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]

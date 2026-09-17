@@ -1,0 +1,29 @@
+# Standalone spike: no production networks, DB, Redis, config or download mounts.
+name: pixav-cardigann
+services:
+  jackett:
+    image: lscr.io/linuxserver/jackett@sha256:184a2944a14d6e42e0cbe7068e1b5f8fe215c38dfb0901e7bace371c699caa1a
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Asia/Taipei
+      AUTO_UPDATE: "false"
+    ports:
+      - "127.0.0.1:19117:9117"
+    volumes:
+      - cardigann_config:/config
+      # Provision with scripts/provision_cardigann_cookie.py. Read-only to Jackett;
+      # a dedicated volume also works on hosts that cannot bind-mount secret files.
+      - cardigann_cookie:/run/pixav-secrets:ro
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47
+    environment:
+      LOG_LEVEL: warn
+      LOG_HTML: "false"
+    ports:
+      - "127.0.0.1:18191:8191"
+volumes:
+  cardigann_config:
+  cardigann_cookie:
+    external: true
+    name: pixav-cardigann_cardigann_cookie

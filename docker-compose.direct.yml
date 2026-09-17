@@ -1,0 +1,19 @@
+# Explicit opt-in direct networking; traffic does not use the VPN tunnel.
+# Use with docker-compose.yml. Omit this override to restore the VPN dependency.
+services:
+  gluetun:
+    profiles: [vpn]
+  vpn_sentinel:
+    profiles: [vpn]
+  qbittorrent:
+    network_mode: !reset null
+    depends_on: !reset {}
+    networks:
+      - pixav
+    ports:
+      - "${PIXAV_QBIT_PORT:-8085}:${PIXAV_QBIT_PORT:-8085}"
+      - "6881:6881"
+      - "6881:6881/udp"
+  media_loader:
+    environment:
+      PIXAV_QBIT_URL: http://qbittorrent:${PIXAV_QBIT_PORT:-8085}

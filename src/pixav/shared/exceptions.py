@@ -48,6 +48,17 @@ class DownloadError(PixavError):
     """Torrent download failed."""
 
 
+class SourceUnavailableError(DownloadError):
+    """This source candidate cannot deliver the media.
+
+    Distinct from a plain :class:`DownloadError`, which means the torrent client
+    itself misbehaved and is worth retrying. A source is unavailable when the
+    swarm is dead or the magnet was never a torrent at all, so the correct
+    response is to cool the candidate down and try another source, not to walk
+    the retry backoff against the same dead swarm.
+    """
+
+
 class RemuxError(PixavError):
     """FFmpeg remux failed."""
 
@@ -64,3 +75,11 @@ class CrawlError(PixavError):
 
 class ResolveError(PixavError):
     """CDN URL resolution failed."""
+
+
+class MediaDependencyError(RemuxError):
+    """Media inspection or preparation dependency is unavailable."""
+
+
+class TorrentOwnershipError(DownloadError):
+    """External torrent ownership or add result requires manual reconciliation."""

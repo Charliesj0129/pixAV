@@ -1,0 +1,53 @@
+# Standalone project. Never merge with production Compose.
+name: pixav-first-4k
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    environment:
+      POSTGRES_USER: pixav_test
+      POSTGRES_PASSWORD: first-4k-isolated
+      POSTGRES_DB: pixav_first_4k
+    ports: ["127.0.0.1:25432:5432"]
+    volumes: ["movie_postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pixav_test -d pixav_first_4k"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:26379:6379"]
+    volumes: ["movie_redis:/data"]
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent@sha256:304b19cf94bf4fda534e0b086cab9c5f1a9e139a8180c05c0ad7d2ba1526fa99
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      WEBUI_PORT: "8080"
+    ports: ["127.0.0.1:18085:8080"]
+    volumes:
+      - ./.verify/first-4k/qbit-config:/config
+      - ./.verify/first-4k/downloads:/downloads
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47
+    ports: ["127.0.0.1:28191:8191"]
+  resolver:
+    profiles: ["playback"]
+    image: pixav-strm_resolver:latest
+    working_dir: /app
+    command: ["/app/.venv/bin/uvicorn", "pixav.strm_resolver.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      PIXAV_DB_HOST: postgres
+      PIXAV_DB_USER: pixav_test
+      PIXAV_DB_PASSWORD: first-4k-isolated
+      PIXAV_DB_NAME: pixav_first_4k
+      PIXAV_REDIS_URL: redis://redis:6379/0
+      PYTHONPATH: /app/src
+    ports: ["127.0.0.1:28000:8000"]
+    volumes:
+      - ./src:/app/src:ro
+      - ./.verify/first-4k/playback:/playback:ro
+volumes:
+  movie_postgres:
+  movie_redis:

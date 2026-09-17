@@ -74,7 +74,7 @@ class PixelInjectorService:
             if not ready:
                 raise RedroidError(f"container {session.container_id} did not become ready")
 
-            logger.info("logging into Google account %s in %s", account.email, session.container_id)
+            logger.info("logging into Google account in %s", session.container_id)
             await self.uploader.login(session, account)
 
             logger.info("pushing %s into container %s", local_path, session.container_id)
@@ -87,7 +87,7 @@ class PixelInjectorService:
             share_url = await self.verifier.wait_for_share_url(session, timeout=self._verify_timeout_seconds)
             is_valid = await self.verifier.validate_share_url(share_url)
             if not is_valid:
-                raise VerificationError(f"share url validation failed: {share_url}")
+                raise VerificationError("share URL validation failed (token redacted)")
 
             logger.info("task %s completed", task_id)
             return task.model_copy(

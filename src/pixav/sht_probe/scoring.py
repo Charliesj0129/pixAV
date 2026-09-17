@@ -25,6 +25,10 @@ class QualityScorer:
     BLOCKED_KEYWORDS = {" vr ", "-vr", "3d", ".iso", ".wmv", ".avi"}
     MAX_SIZE_BYTES = 15 * 1024**3  # 15 GB
 
+    def __init__(self, *, segmented_storage: bool = False) -> None:
+        # Only the explicit segmented-film flow may exceed the legacy cap.
+        self._segmented_storage = segmented_storage
+
     def score(self, title: str, seeders: int = 0, size_bytes: int = 0) -> int:
         """Calculate a quality score for a given release.
 
@@ -50,6 +54,15 @@ class QualityScorer:
         )
         return int(score)
 
+    def eligibility_reasons(self, title: str, size_bytes: int) -> tuple[str, ...]:
+        """Hard eligibility is independent of numeric ranking and thresholds."""
+        reasons = []
+        if any(keyword in title.lower() for keyword in self.BLOCKED_KEYWORDS):
+            reasons.append("BLOCKED_FORMAT")
+        if not self._segmented_storage and size_bytes > self.MAX_SIZE_BYTES:
+            reasons.append("SIZE_LIMIT")
+        return tuple(reasons)
+
     def _is_blocked(self, norm_title: str, size_bytes: int) -> bool:
         # File type blocks
         for keyword in self.BLOCKED_KEYWORDS:
@@ -58,7 +71,7 @@ class QualityScorer:
                 return True
 
         # Hard size cap
-        if size_bytes > self.MAX_SIZE_BYTES:
+        if not self._segmented_storage and size_bytes > self.MAX_SIZE_BYTES:
             logger.debug(
                 "blocked release '%s': size %.2f GB > %.2f GB",
                 norm_title,

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pixav.media_loader.remuxer import FFmpegRemuxer
+from pixav.media_loader.remuxer import FFmpegRemuxer, select_media_input
 from pixav.shared.exceptions import RemuxError
 
 
@@ -86,3 +86,32 @@ class TestMakeOutputPath:
     def test_handles_nested_path(self) -> None:
         result = FFmpegRemuxer.make_output_path("/a/b/c/movie.avi", "/output/dir")
         assert result == "/output/dir/movie.mp4"
+
+    def test_unique_key_prevents_cross_video_overwrite(self) -> None:
+        result = FFmpegRemuxer.make_output_path("/downloads/movie.mkv", "/output", unique_key="video-id")
+        assert result == "/output/video-id/movie.mp4"
+
+    def test_same_input_and_output_gets_collision_safe_name(self, tmp_path: Path) -> None:
+        source = tmp_path / "movie.mp4"
+        result = FFmpegRemuxer.make_output_path(str(source), str(tmp_path))
+        assert result == str(tmp_path / "movie.remuxed.mp4")
+
+
+class TestSelectMediaInput:
+    def test_single_file_is_returned(self, tmp_path: Path) -> None:
+        media = tmp_path / "movie.mkv"
+        media.write_bytes(b"media")
+        assert select_media_input(str(media)) == str(media.resolve())
+
+    def test_largest_non_sample_media_wins(self, tmp_path: Path) -> None:
+        (tmp_path / "sample.mp4").write_bytes(b"x" * 100)
+        (tmp_path / "feature.mkv").write_bytes(b"x" * 50)
+        (tmp_path / "clip.mp4").write_bytes(b"x" * 10)
+        (tmp_path / "notes.txt").write_text("not media")
+
+        assert select_media_input(str(tmp_path)) == str((tmp_path / "feature.mkv").resolve())
+
+    def test_directory_without_media_is_rejected(self, tmp_path: Path) -> None:
+        (tmp_path / "notes.txt").write_text("not media")
+        with pytest.raises(RemuxError, match="no supported media"):
+            select_media_input(str(tmp_path))

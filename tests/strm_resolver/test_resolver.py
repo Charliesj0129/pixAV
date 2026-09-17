@@ -49,7 +49,11 @@ class TestGooglePhotosResolver:
 
     @respx.mock
     async def test_resolve_connection_error(self, resolver: GooglePhotosResolver) -> None:
-        respx.get("https://photos.app.goo.gl/fail").mock(side_effect=httpx.ConnectError("refused"))
+        secret_url = "https://photos.app.goo.gl/synthetic-secret"
+        respx.get(secret_url).mock(side_effect=httpx.ConnectError(f"refused {secret_url}"))
 
-        with pytest.raises(ResolveError, match="failed to fetch"):
-            await resolver.resolve("https://photos.app.goo.gl/fail")
+        with pytest.raises(ResolveError, match="failed to fetch") as error:
+            await resolver.resolve(secret_url)
+
+        assert "synthetic-secret" not in str(error.value)
+        assert error.value.__cause__ is None

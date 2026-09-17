@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Protocol
 
 from pixav.config import Settings, get_settings
 from pixav.shared.cookies import load_cookies
 from pixav.shared.db import create_pool
-from pixav.shared.metrics import record_task_failed, record_task_processed
+from pixav.shared.metrics import (
+    record_crawl_cookie_error,
+    record_crawl_cycle_timeout,
+    record_task_failed,
+    record_task_processed,
+    set_crawl_interval,
+    set_crawl_state,
+)
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
-from pixav.shared.repository import VideoRepository
+from pixav.shared.repository import SourceCandidateRepository, VideoRepository
 from pixav.sht_probe.crawler import HttpxCrawler
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
 from pixav.sht_probe.jackett_client import JackettClient
+from pixav.sht_probe.models import CrawlResult
 from pixav.sht_probe.parser import BeautifulSoupExtractor
 from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
 from pixav.sht_probe.service import ShtProbeService
@@ -38,10 +47,20 @@ def _seed_crawler_cookies(settings: Settings, *crawlers: _SeedableCrawler | None
     Sehuatang serves the logged-out guest view, which carries the age-gate and
     almost no thread links, so the crawl "succeeds" with nothing to show for it.
     """
-    cookies, source = load_cookies(
-        cookie_header=settings.crawl_cookie_header,
-        cookie_file=settings.crawl_cookie_file,
-    )
+    try:
+        cookies, source = load_cookies(
+            cookie_header=settings.crawl_cookie_header,
+            cookie_file=settings.crawl_cookie_file,
+        )
+    except FileNotFoundError:
+        record_crawl_cookie_error("missing")
+        raise
+    except (OSError, UnicodeError, ValueError):
+        record_crawl_cookie_error("invalid")
+        raise
+    if (settings.crawl_cookie_header.strip() or settings.crawl_cookie_file.strip()) and not cookies:
+        record_crawl_cookie_error("invalid")
+        raise ValueError("configured crawler cookies are empty or invalid")
     if not cookies:
         return
     for crawler in crawlers:
@@ -50,7 +69,7 @@ def _seed_crawler_cookies(settings: Settings, *crawlers: _SeedableCrawler | None
     logger.info("seeded %d crawl cookie(s) (%s)", len(cookies), source)
 
 
-async def run_once(settings: Settings) -> list[str]:
+async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
     """Run a single crawl cycle against all configured seed URLs.
 
     Returns:
@@ -62,6 +81,7 @@ async def run_once(settings: Settings) -> list[str]:
 
     try:
         video_repo = VideoRepository(pool)
+        candidate_repo = SourceCandidateRepository(pool)
         queue = TaskQueue(redis=redis, queue_name=settings.queue_crawl)
 
         # Build optional components
@@ -85,26 +105,35 @@ async def run_once(settings: Settings) -> list[str]:
         generic_service = ShtProbeService(
             video_repo=video_repo,
             queue=queue,
+            candidate_repo=candidate_repo,
             crawler=crawler,
             extractor=generic_extractor,
             jackett=jackett,
             embeddings_enabled=settings.embeddings_enabled,
+            managed_media_workflow=settings.managed_media_workflow,
+            min_quality_score=settings.source_min_quality_score,
         )
         sehuatang_service = (
             ShtProbeService(
                 video_repo=video_repo,
                 queue=queue,
+                candidate_repo=candidate_repo,
                 crawler=sehuatang_crawler,
                 extractor=sehuatang_extractor,
                 jackett=jackett,
                 embeddings_enabled=settings.embeddings_enabled,
+                managed_media_workflow=settings.managed_media_workflow,
                 page_fetch_concurrency=4,
+                min_quality_score=settings.source_min_quality_score,
             )
             if sehuatang_crawler
             else None
         )
 
         all_new: list[str] = []
+        extracted_magnets = 0
+        thread_links = 0
+        untitled_rejected = 0
 
         # Crawl seed URLs
         seed_entries = _parse_csv(settings.crawl_seed_urls)
@@ -121,14 +150,22 @@ async def run_once(settings: Settings) -> list[str]:
                 is_sehuatang = "sehuatang.org" in url
                 active_service = sehuatang_service if (is_sehuatang and sehuatang_service) else generic_service
 
-                new = await active_service.run_crawl(
+                crawl_result = await active_service.run_crawl(
                     url,
                     link_pattern=settings.crawl_link_filter_pattern,
                     tags=tags,
                     max_pages=settings.crawl_max_pages,
                 )
-                all_new.extend(new)
-                record_task_processed(_METRICS_MODULE, len(new))
+                all_new.extend(crawl_result)
+                if isinstance(crawl_result, CrawlResult):
+                    extracted_magnets += crawl_result.extracted_magnets
+                    thread_links += crawl_result.thread_links
+                    untitled_rejected += crawl_result.untitled_rejected
+                else:
+                    # Compatibility for alternate services: additions prove extraction,
+                    # but zero additions must not be treated as a confirmed empty crawl.
+                    extracted_magnets += len(crawl_result)
+                record_task_processed(_METRICS_MODULE, len(crawl_result))
             except Exception as exc:
                 record_task_failed(_METRICS_MODULE)
                 logger.error("crawl failed for %s: %s", url, exc)
@@ -140,15 +177,46 @@ async def run_once(settings: Settings) -> list[str]:
                 if not jackett:
                     logger.warning("skipping query %r (no jackett configured)", query)
                     continue
-                new = await generic_service.run_search(query)
-                all_new.extend(new)
-                record_task_processed(_METRICS_MODULE, len(new))
+                search_result = await generic_service.run_search(query)
+                all_new.extend(search_result)
+                extracted_magnets += len(search_result)
+                record_task_processed(_METRICS_MODULE, len(search_result))
             except Exception as exc:
                 record_task_failed(_METRICS_MODULE)
                 logger.error("search failed for %r: %s", query, exc)
 
-        logger.info("crawl cycle complete: %d new magnets total", len(all_new))
-        return all_new
+        if extracted_magnets == 0:
+            raw_empty = await redis.incr(settings.crawl_empty_cycles_key)
+            try:
+                empty_cycles = int(raw_empty)
+            except (TypeError, ValueError):
+                empty_cycles = 0
+        else:
+            await redis.set(settings.crawl_empty_cycles_key, 0)
+            empty_cycles = 0
+        age_gate_active = bool(sehuatang_crawler and sehuatang_crawler.age_gate_persisted)
+        completed = time.time()
+        set_crawl_state(
+            empty_cycles=empty_cycles,
+            completed_timestamp=completed,
+            age_gate_active=age_gate_active,
+        )
+        level = logging.ERROR if empty_cycles >= settings.crawl_empty_error_threshold else logging.INFO
+        logger.log(
+            level,
+            "crawl cycle complete: links=%d extracted=%d new=%d untitled_rejected=%d empty_cycles=%d",
+            thread_links,
+            extracted_magnets,
+            len(all_new),
+            untitled_rejected,
+            empty_cycles,
+        )
+        return CrawlResult(
+            all_new,
+            thread_links=thread_links,
+            extracted_magnets=extracted_magnets,
+            untitled_rejected=untitled_rejected,
+        )
     finally:
         if sehuatang_crawler is not None:
             try:
@@ -159,17 +227,27 @@ async def run_once(settings: Settings) -> list[str]:
         await pool.close()
 
 
-async def run_loop(settings: Settings) -> None:
+async def run_loop(settings: Settings, *, health_state: object | None = None) -> None:
     """Run crawl cycles in a loop with configurable interval."""
     logger.info(
         "sht-probe worker starting (interval=%ds, seeds=%s)",
         settings.crawl_interval_seconds,
         settings.crawl_seed_urls[:80] if settings.crawl_seed_urls else "<none>",
     )
+    set_crawl_interval(settings.crawl_interval_seconds)
+    if health_state is not None and hasattr(health_state, "mark_ready"):
+        health_state.mark_ready()
 
     while True:
         try:
-            await run_once(settings)
+            await asyncio.wait_for(
+                run_once(settings),
+                timeout=settings.crawl_interval_seconds + 15 * 60,
+            )
+        except asyncio.TimeoutError as exc:
+            record_crawl_cycle_timeout()
+            record_task_failed(_METRICS_MODULE)
+            logger.error("crawl cycle exceeded interval plus 15 minute grace: %s", exc)
         except Exception as exc:
             record_task_failed(_METRICS_MODULE)
             logger.exception("crawl cycle error: %s", exc)
@@ -189,9 +267,8 @@ def main() -> None:
     """Entry point for ``python -m pixav.sht_probe.worker``."""
     import sys
 
-    import uvicorn
-
-    from pixav.shared.health import create_health_app
+    from pixav.shared.health import HealthState, create_health_app
+    from pixav.shared.health_server import run_with_health
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
@@ -200,30 +277,18 @@ def main() -> None:
         asyncio.run(run_once(settings))
         return
 
-    health_app = create_health_app("sht_probe")
+    health_state = HealthState("sht_probe", stale_after_seconds=settings.heartbeat_stale_seconds)
+    health_app = create_health_app("sht_probe", state=health_state)
 
     async def _run() -> None:
-        config = uvicorn.Config(
-            health_app,
+        await run_with_health(
+            worker_coro=run_loop(settings, health_state=health_state),
+            health_app=health_app,
             host=settings.health_host,
             port=settings.sht_probe_health_port,
-            log_level="warning",
-            access_log=False,
+            health_state=health_state,
+            heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
         )
-        server = uvicorn.Server(config)
-        worker_task = asyncio.ensure_future(run_loop(settings))
-        server_task = asyncio.ensure_future(server.serve())
-        done, pending = await asyncio.wait([worker_task, server_task], return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):  # noqa: S110
-                pass
-        for t in done:
-            exc = t.exception()
-            if exc is not None:
-                raise exc
 
     asyncio.run(_run())
 

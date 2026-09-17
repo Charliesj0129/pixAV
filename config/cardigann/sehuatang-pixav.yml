@@ -1,0 +1,60 @@
+---
+# ISOLATED SPIKE ONLY. Cookie/age-gate, bare-hash and search-result parity gates OPEN.
+# Selectors come from tests/fixtures/sehuatang_20260907, not invented HTML.
+id: sehuatang-pixav
+name: Sehuatang pixAV spike
+description: "Board 103 latest discovery and detail-page magnet extraction (unpromoted)"
+language: zh-CN
+type: semi-private
+encoding: UTF-8
+links:
+  - https://www.sehuatang.org/
+requestDelay: 2.5
+testlinktorrent: false
+caps:
+  categorymappings:
+    - {id: 103, cat: XXX, desc: "Board 103"}
+  modes:
+    search: [q]
+settings:
+  - name: cookie
+    type: text
+    label: Cookie
+  - name: info_flaresolverr
+    type: info_flaresolverr
+login:
+  method: cookie
+  inputs:
+    cookie: "{{ .Config.cookie }}"
+  test:
+    path: forum-103-1.html
+    selector: 'tbody[id^="normalthread_"] a.xst'
+search:
+  paths:
+    - path: forum-103-1.html
+  rows:
+    selector: 'tbody[id^="normalthread_"]'
+  fields:
+    category:
+      text: 103
+    title:
+      selector: a.xst
+    details:
+      selector: a.xst
+      attribute: href
+    download:
+      selector: a.xst
+      attribute: href
+    size:
+      text: 0
+    seeders:
+      text: 0
+download:
+  infohash:
+    hash:
+      selector: '.blockcode li:contains("magnet:?xt=urn:btih:")'
+      filters:
+        - name: regexp
+          args: 'btih:([a-fA-F0-9]{40})'
+    title:
+      selector: '#thread_subject'

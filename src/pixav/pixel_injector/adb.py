@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from pixav.shared.exceptions import AdbError
 
@@ -51,7 +52,7 @@ class AdbConnection:
 
         logger.info("ADB connected to %s", self._target)
 
-    async def push(self, local: str, remote: str) -> None:
+    async def push(self, local: str, remote: str, *, timeout: int | None = None) -> None:
         """Push file to container via ADB.
 
         Args:
@@ -62,16 +63,39 @@ class AdbConnection:
             AdbError: If push fails or no active connection.
         """
         target = self._target_or_raise()
-        stdout, stderr, rc = await self._run("-s", target, "push", local, remote)
+        stdout, stderr, rc = await self._run("-s", target, "push", local, remote, timeout=timeout)
         if rc != 0:
             raise AdbError(f"ADB push failed: {stderr}")
         logger.info("pushed %s → %s on %s", local, remote, target)
 
-    async def shell(self, cmd: str) -> str:
+    async def pull(self, remote: str, local: str, *, timeout: int | None = None) -> None:
+        """Pull a file from the connected Android guest.
+
+        This is used by the manual Pixel experiment to preserve screenshots as
+        evidence. Keeping it beside :meth:`push` also makes the script fail with
+        a domain error when no ADB target exists, rather than an AttributeError.
+        """
+        target = self._target_or_raise()
+        _stdout, stderr, rc = await self._run("-s", target, "pull", remote, local, timeout=timeout)
+        if rc != 0:
+            raise AdbError(f"ADB pull failed: {stderr}")
+        logger.info("pulled %s → %s from %s", remote, local, target)
+
+    async def shell(
+        self,
+        cmd: str,
+        *,
+        sensitive: bool = False,
+        timeout: int | None = None,
+    ) -> str:
         """Execute shell command in container.
 
         Args:
             cmd: Shell command to execute.
+            sensitive: Send the command over stdin rather than process argv.
+                Use this for commands containing credentials so they cannot be
+                observed through the host process list or echoed in timeout
+                errors.
 
         Returns:
             Command output (stdout).
@@ -80,9 +104,13 @@ class AdbConnection:
             AdbError: If command fails or no active connection.
         """
         target = self._target_or_raise()
-        stdout, stderr, rc = await self._run("-s", target, "shell", cmd)
+        if sensitive:
+            stdout, stderr, rc = await self._run_sensitive_shell(target, cmd, timeout=timeout)
+        else:
+            stdout, stderr, rc = await self._run("-s", target, "shell", cmd, timeout=timeout)
         if rc != 0:
-            raise AdbError(f"ADB shell failed (rc={rc}): {stderr}")
+            detail = "redacted" if sensitive else stderr
+            raise AdbError(f"ADB shell failed (rc={rc}): {detail}")
         return stdout
 
     def _target_or_raise(self) -> str:
@@ -90,17 +118,19 @@ class AdbConnection:
             raise AdbError("not connected — call connect() first")
         return self._target
 
-    async def _run(self, *args: str) -> tuple[str, str, int]:
+    async def _run(self, *args: str, timeout: int | None = None) -> tuple[str, str, int]:
         """Run an ADB command and return (stdout, stderr, returncode)."""
         cmd = [self._adb_bin, *args]
+        effective_timeout = self._timeout if timeout is None else timeout
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=self._timeout)
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
         except asyncio.TimeoutError as exc:
+            await _kill_and_reap(proc)
             raise AdbError(f"ADB command timed out: {' '.join(cmd)}") from exc
         except FileNotFoundError as exc:
             raise AdbError(f"adb binary not found: {self._adb_bin}") from exc
@@ -110,3 +140,46 @@ class AdbConnection:
             stderr_b.decode(errors="replace").strip(),
             proc.returncode or 0,
         )
+
+    async def _run_sensitive_shell(
+        self,
+        target: str,
+        cmd: str,
+        *,
+        timeout: int | None = None,
+    ) -> tuple[str, str, int]:
+        """Execute a remote shell command without placing it in process argv."""
+        effective_timeout = self._timeout if timeout is None else timeout
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._adb_bin,
+                "-s",
+                target,
+                "shell",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(f"{cmd}\n".encode()),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            await _kill_and_reap(proc)
+            raise AdbError("ADB sensitive shell command timed out") from exc
+        except FileNotFoundError as exc:
+            raise AdbError(f"adb binary not found: {self._adb_bin}") from exc
+
+        return (
+            stdout_b.decode(errors="replace").strip(),
+            stderr_b.decode(errors="replace").strip(),
+            proc.returncode or 0,
+        )
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    """Do not leak an ADB subprocess after its command timeout."""
+    with suppress(ProcessLookupError):
+        proc.kill()
+    with suppress(Exception):
+        await proc.communicate()

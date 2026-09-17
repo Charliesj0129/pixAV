@@ -15,7 +15,7 @@ from typing import Any
 import asyncpg
 
 from pixav.shared.enums import AccountStatus, TaskState, VideoStatus
-from pixav.shared.models import Account, Task, Video
+from pixav.shared.models import Account, SourceCandidate, Task, Video
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +65,9 @@ class VideoRepository:
         row = await self._pool.fetchrow(
             """
             INSERT INTO videos (id, title, magnet_uri, local_path, share_url,
-                                cdn_url, status, metadata_json, info_hash, quality_score, tags, embedding, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14)
+                                status, metadata_json, info_hash, quality_score, tags, embedding,
+                                created_at, updated_at, local_cleanup_after)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14)
             RETURNING *
             """,
             video.id,
@@ -74,7 +75,6 @@ class VideoRepository:
             video.magnet_uri,
             video.local_path,
             video.share_url,
-            video.cdn_url,
             video.status.value,
             video.metadata_json,
             video.info_hash,
@@ -83,6 +83,7 @@ class VideoRepository:
             video.embedding,
             video.created_at,
             video.updated_at,
+            video.local_cleanup_after,
         )
         logger.info("inserted video %s (%s)", video.id, video.title)
         return _video_from_row(row)
@@ -106,19 +107,25 @@ class VideoRepository:
         *,
         local_path: str,
         metadata_json: str | None = None,
+        title: str | None = None,
+        quality_score: int | None = None,
     ) -> None:
         """Persist local output path and optional metadata after download."""
         await self._pool.execute(
             """
             UPDATE videos
                SET local_path = $1,
-                   metadata_json = COALESCE($2::jsonb, metadata_json),
-                   status = $3,
-                   updated_at = $4
-             WHERE id = $5
+                   metadata_json = COALESCE(metadata_json, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
+                   title = COALESCE(NULLIF(btrim($3), ''), title),
+                   quality_score = COALESCE($4, quality_score),
+                   status = $5,
+                   updated_at = $6
+             WHERE id = $7
             """,
             local_path,
             metadata_json,
+            title,
+            quality_score,
             VideoStatus.DOWNLOADED.value,
             _utc_now(),
             video_id,
@@ -136,12 +143,79 @@ class VideoRepository:
             UPDATE videos
                SET share_url = $1,
                    status = $2,
+                   local_cleanup_after = CASE
+                       WHEN $1 LIKE 'pixav-local://%' THEN NULL
+                       ELSE $3::timestamptz + interval '24 hours'
+                   END,
                    updated_at = $3
              WHERE id = $4
             """,
             share_url,
             VideoStatus.AVAILABLE.value,
             _utc_now(),
+            video_id,
+        )
+
+    async def schedule_terminal_cleanup(self, video_id: uuid.UUID, *, retention_days: int = 7) -> None:
+        """Retain failed local files for diagnostics, then make them janitor-eligible."""
+        await self._pool.execute(
+            """
+            UPDATE videos
+               SET local_cleanup_after = CASE
+                       WHEN local_path IS NULL OR share_url LIKE 'pixav-local://%' THEN NULL
+                       ELSE now() + ($1 * interval '1 day')
+                   END,
+                   updated_at = now()
+             WHERE id = $2
+            """,
+            max(1, retention_days),
+            video_id,
+        )
+
+    async def update_source(self, video_id: uuid.UUID, *, magnet_uri: str, info_hash: str | None) -> None:
+        """Repoint a video at a different source candidate."""
+        await self._pool.execute(
+            """
+            UPDATE videos
+               SET magnet_uri = $2,
+                   info_hash = $3,
+                   updated_at = now()
+             WHERE id = $1
+            """,
+            video_id,
+            magnet_uri,
+            info_hash,
+        )
+        logger.info("video %s repointed to source %s", video_id, magnet_uri[:60])
+
+    async def clear_local_path(self, video_id: uuid.UUID) -> None:
+        await self._pool.execute(
+            """
+            UPDATE videos
+               SET local_path = NULL,
+                   local_cleanup_after = NULL,
+                   updated_at = now()
+             WHERE id = $1
+            """,
+            video_id,
+        )
+
+    async def update_metadata_section(self, video_id: uuid.UUID, section: str, value: dict[str, Any]) -> None:
+        """Merge one provenance section without replacing sibling sections."""
+        await self._pool.execute(
+            """
+            UPDATE videos
+               SET metadata_json = jsonb_set(
+                       COALESCE(metadata_json, '{}'::jsonb),
+                       ARRAY[$1]::text[],
+                       $2::jsonb,
+                       true
+                   ),
+                   updated_at = now()
+             WHERE id = $3
+            """,
+            section,
+            json.dumps(value),
             video_id,
         )
 
@@ -210,6 +284,118 @@ class VideoRepository:
         )
         # rrf_score is ignored by model_validate (extra fields)
         return [_video_from_row(row) for row in rows]
+
+
+class SourceCandidateRepository:
+    """CRUD operations for the ``source_candidates`` table.
+
+    Cooldown, not deletion: a swarm that is dead today may be alive next week,
+    so an exhausted candidate is parked with an ``unavailable_until`` rather
+    than removed. This mirrors the account cooldown in AccountRepository.
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def register(
+        self,
+        video_id: uuid.UUID,
+        *,
+        magnet_uri: str,
+        info_hash: str | None = None,
+        origin: str = "sehuatang",
+        quality_score: int = 0,
+    ) -> None:
+        """Record a source for a video, ignoring one already known."""
+        await self._pool.execute(
+            """
+            INSERT INTO source_candidates (video_id, magnet_uri, info_hash, origin, quality_score)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (video_id, magnet_uri) DO NOTHING
+            """,
+            video_id,
+            magnet_uri,
+            info_hash,
+            origin,
+            quality_score,
+        )
+
+    async def mark_unavailable(
+        self,
+        video_id: uuid.UUID,
+        magnet_uri: str,
+        *,
+        reason: str,
+        cooldown_hours: int = 6,
+    ) -> None:
+        """Cool a candidate down after its swarm failed to deliver."""
+        await self._pool.execute(
+            """
+            UPDATE source_candidates
+               SET state = 'unavailable',
+                   unavailable_until = now() + make_interval(hours => $3),
+                   attempts = attempts + 1,
+                   last_error = $4,
+                   updated_at = now()
+             WHERE video_id = $1
+               AND magnet_uri = $2
+            """,
+            video_id,
+            magnet_uri,
+            cooldown_hours,
+            reason[:500],
+        )
+        logger.warning("source candidate cooled down for %sh: video=%s", cooldown_hours, video_id)
+
+    async def mark_succeeded(self, video_id: uuid.UUID, magnet_uri: str) -> None:
+        """Record the candidate that actually delivered the media."""
+        await self._pool.execute(
+            """
+            UPDATE source_candidates
+               SET state = 'succeeded',
+                   unavailable_until = NULL,
+                   updated_at = now()
+             WHERE video_id = $1
+               AND magnet_uri = $2
+            """,
+            video_id,
+            magnet_uri,
+        )
+
+    async def next_candidate(self, video_id: uuid.UUID, *, exclude_magnet: str | None = None) -> SourceCandidate | None:
+        """Return the best source still worth trying, or None when exhausted."""
+        row = await self._pool.fetchrow(
+            """
+            SELECT * FROM source_candidates
+             WHERE video_id = $1
+               AND (state IN ('pending', 'succeeded') OR
+                    (state = 'unavailable' AND unavailable_until <= now()))
+               AND ($2::text IS NULL OR magnet_uri <> $2)
+             ORDER BY quality_score DESC, lower(origin), info_hash, magnet_uri
+             LIMIT 1
+            """,
+            video_id,
+            exclude_magnet,
+        )
+        if row is None:
+            return None
+        return SourceCandidate.model_validate(dict(row))
+
+    async def release_expired_cooldowns(self) -> int:
+        """Return cooled-down candidates to the pool once their window closes."""
+        tag = await self._pool.execute("""
+            UPDATE source_candidates
+               SET state = 'pending',
+                   unavailable_until = NULL,
+                   updated_at = now()
+             WHERE state = 'unavailable'
+               AND unavailable_until IS NOT NULL
+               AND unavailable_until <= now()
+            """)
+        released = _rows_from_tag(str(tag))
+        if released:
+            logger.info("released %d source candidate cooldown(s)", released)
+        return released
 
 
 class AccountRepository:
@@ -313,8 +499,8 @@ class TaskRepository:
             """
             INSERT INTO tasks (id, video_id, account_id, state, queue_name,
                                local_path, share_url, retries, max_retries, error_message,
-                               trace_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                               trace_id, created_at, updated_at, retry_not_before)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING *
             """,
             task.id,
@@ -330,6 +516,7 @@ class TaskRepository:
             task.trace_id,
             task.created_at,
             task.updated_at,
+            task.retry_not_before,
         )
         logger.info("inserted task %s for video %s", task.id, task.video_id)
         return _task_from_row(row)
@@ -361,6 +548,7 @@ class TaskRepository:
         *,
         state: TaskState = TaskState.PENDING,
         error_message: str | None = None,
+        retry_not_before: datetime | None = None,
     ) -> None:
         """Persist retry count with state/error updates.
 
@@ -372,12 +560,14 @@ class TaskRepository:
                SET retries = $1,
                    state = $2,
                    error_message = $3,
-                   updated_at = $4
-             WHERE id = $5
+                   retry_not_before = $4,
+                   updated_at = $5
+             WHERE id = $6
             """,
             retries,
             state.value,
             error_message,
+            retry_not_before,
             _utc_now(),
             task_id,
         )
@@ -400,9 +590,11 @@ class TaskRepository:
                SET state = $1,
                    account_id = COALESCE($2::uuid, account_id),
                    error_message = NULL,
+                   retry_not_before = NULL,
                    updated_at = $3
              WHERE id = $4
                AND state = $5
+               AND (retry_not_before IS NULL OR retry_not_before <= now())
             """,
             next_state.value,
             account_id,
@@ -426,6 +618,7 @@ class TaskRepository:
                SET state = $1,
                    account_id = CASE WHEN $2 THEN NULL ELSE account_id END,
                    error_message = $3,
+                   retry_not_before = NULL,
                    updated_at = $4
              WHERE id = $5
             """,
@@ -453,6 +646,7 @@ class TaskRepository:
                SET queue_name = $1,
                    state = $2,
                    error_message = NULL,
+                   retry_not_before = NULL,
                    updated_at = $3
              WHERE id = $4
             """,
@@ -494,6 +688,8 @@ class TaskRepository:
             """
             SELECT * FROM tasks
              WHERE state = $1
+               AND queue_name <> 'pixav:media-managed'
+               AND (retry_not_before IS NULL OR retry_not_before <= now())
              ORDER BY created_at ASC
              LIMIT $2
             """,
@@ -501,6 +697,41 @@ class TaskRepository:
             limit,
         )
         return [_task_from_row(row) for row in rows]
+
+    async def replay(self, task_id: uuid.UUID, *, requested_by: str = "operator", reason: str | None = None) -> bool:
+        """Start a new retry cycle and persist an immutable operator audit row."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT state, retries FROM tasks WHERE id = $1 FOR UPDATE", task_id)
+                if row is None:
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO task_replay_audit (task_id, previous_state, previous_retries, requested_by, reason)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    task_id,
+                    row["state"],
+                    row["retries"],
+                    requested_by,
+                    reason,
+                )
+                await conn.execute(
+                    """
+                    UPDATE tasks
+                       SET state = 'pending', retries = 0, retry_not_before = now(),
+                           error_message = NULL, updated_at = now()
+                     WHERE id = $1
+                    """,
+                    task_id,
+                )
+        return True
+
+    async def is_managed_video(self, video_id: uuid.UUID) -> bool:
+        """Whether the managed execution authority has admitted this video."""
+        if await self._pool.fetchval("SELECT to_regclass('public.workflow_tasks')") is None:
+            return False
+        return bool(await self._pool.fetchval("SELECT EXISTS(SELECT FROM workflow_tasks WHERE video_id=$1)", video_id))
 
     async def has_open_task(self, video_id: uuid.UUID) -> bool:
         """Return True when a video already has an in-flight task.
@@ -522,7 +753,7 @@ class TaskRepository:
                 SELECT 1
                   FROM tasks
                  WHERE video_id = $1
-                   AND state = ANY($2::text[])
+                   AND (state = ANY($2::text[]) OR queue_name = 'pixav:media-managed')
             )
             """,
             video_id,

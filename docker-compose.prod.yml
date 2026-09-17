@@ -17,7 +17,7 @@ services:
 
   qbittorrent:
     <<: *service_defaults
-    image: ${PIXAV_IMAGE_QBITTORRENT:-lscr.io/linuxserver/qbittorrent:latest}
+    image: ${PIXAV_IMAGE_QBITTORRENT:-lscr.io/linuxserver/qbittorrent:5.2.3_v2.0.14-ls474@sha256:a7dc3bef7fe25c4d0bbf821f188edf78198d9db1920841b232aa89dff7f00cfe}
     stop_grace_period: 60s
 
   jackett:

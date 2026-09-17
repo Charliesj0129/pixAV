@@ -1,5 +1,17 @@
 appId: com.google.android.apps.photos
 ---
 - assertVisible: "Allow Photos to access your contacts?"
+# The dialog has two shapes and only one of its buttons exists at a time. The
+# first time the permission is asked the negative button is
+# `permission_deny_button`; once it has been asked before, Android replaces it
+# with `permission_deny_and_dont_ask_again_button`. Naming only the first id
+# left the dialog on screen, covering the share sheet, and failed the flow that
+# was supposed to clear it. Photos does not need contacts to create a link, so
+# whichever button is present is the right answer.
 - tapOn:
     id: "com.android.permissioncontroller:id/permission_deny_button"
+    optional: true
+- tapOn:
+    id: "com.android.permissioncontroller:id/permission_deny_and_dont_ask_again_button"
+    optional: true
+- assertNotVisible: "Allow Photos to access your contacts?"

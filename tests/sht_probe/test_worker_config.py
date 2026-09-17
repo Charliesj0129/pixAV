@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pixav.config import Settings
-from pixav.sht_probe.worker import run_once
+from pixav.sht_probe.models import CrawlResult
+from pixav.sht_probe.worker import _seed_crawler_cookies, run_loop, run_once
 
 
 @pytest.mark.asyncio
@@ -93,3 +95,107 @@ async def test_worker_seeds_cookies_into_both_crawlers(tmp_path) -> None:
     expected = {"_safe": "SAFEVAL", "cPNj_2132_auth": "AUTHVAL"}
     mock_httpx_crawler.return_value.seed_cookies.assert_called_once_with(expected)
     mock_sehuatang_crawler.return_value.seed_cookies.assert_called_once_with(expected)
+
+
+def test_missing_cookie_file_records_distinct_metric(tmp_path) -> None:
+    settings = Settings(crawl_cookie_file=str(tmp_path / "missing.txt"))
+
+    with patch("pixav.sht_probe.worker.record_crawl_cookie_error") as record:
+        with pytest.raises(FileNotFoundError):
+            _seed_crawler_cookies(settings)
+
+    record.assert_called_once_with("missing")
+
+
+def test_invalid_cookie_file_records_distinct_metric(tmp_path) -> None:
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text("not a cookie", encoding="utf-8")
+    settings = Settings(crawl_cookie_file=str(cookie_file))
+
+    with patch("pixav.sht_probe.worker.record_crawl_cookie_error") as record:
+        with pytest.raises(ValueError):
+            _seed_crawler_cookies(settings)
+
+    record.assert_called_once_with("invalid")
+
+
+@pytest.mark.asyncio
+async def test_crawl_cycle_timeout_records_distinct_metric() -> None:
+    settings = Settings(crawl_interval_seconds=1)
+
+    async def timeout_once(awaitable, *, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    async def stop_after_cycle(_seconds):
+        raise asyncio.CancelledError
+
+    with (
+        patch("pixav.sht_probe.worker.asyncio.wait_for", side_effect=timeout_once),
+        patch("pixav.sht_probe.worker.asyncio.sleep", side_effect=stop_after_cycle),
+        patch("pixav.sht_probe.worker.record_crawl_cycle_timeout") as record_timeout,
+        patch("pixav.sht_probe.worker.record_task_failed"),
+        patch("pixav.sht_probe.worker.set_crawl_interval") as set_interval,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await run_loop(settings)
+
+    set_interval.assert_called_once_with(1)
+    record_timeout.assert_called_once_with()
+
+
+def _empty_cycle_settings() -> Settings:
+    return Settings(
+        crawl_seed_urls="http://site1.com",
+        crawl_queries="",
+        flaresolverr_url="",
+        jackett_url="",
+        jackett_api_key="",
+        crawl_empty_cycles_key="pixav:crawl:empty_cycles",
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_crawl_increments_persisted_counter() -> None:
+    """The empty-cycle streak lives in Redis so a worker restart cannot reset it."""
+    redis = AsyncMock()
+    # Redis already holds two prior empty cycles from before this process started.
+    redis.incr.return_value = 3
+
+    with (
+        patch("pixav.sht_probe.worker.create_pool", new_callable=AsyncMock),
+        patch("pixav.sht_probe.worker.create_redis", AsyncMock(return_value=redis)),
+        patch("pixav.sht_probe.worker.ShtProbeService") as mock_service_class,
+        patch("pixav.sht_probe.worker.set_crawl_state") as set_state,
+    ):
+        mock_service = mock_service_class.return_value
+        mock_service.run_crawl = AsyncMock(return_value=CrawlResult([], extracted_magnets=0))
+
+        result = await run_once(_empty_cycle_settings())
+
+    assert result.extracted_magnets == 0
+    redis.incr.assert_awaited_once_with("pixav:crawl:empty_cycles")
+    redis.set.assert_not_awaited()
+    assert set_state.call_args.kwargs["empty_cycles"] == 3
+
+
+@pytest.mark.asyncio
+async def test_extracted_magnets_reset_the_counter_even_with_no_new_rows() -> None:
+    """Emptiness means 'extracted zero magnets', not 'inserted zero new videos'."""
+    redis = AsyncMock()
+
+    with (
+        patch("pixav.sht_probe.worker.create_pool", new_callable=AsyncMock),
+        patch("pixav.sht_probe.worker.create_redis", AsyncMock(return_value=redis)),
+        patch("pixav.sht_probe.worker.ShtProbeService") as mock_service_class,
+        patch("pixav.sht_probe.worker.set_crawl_state") as set_state,
+    ):
+        mock_service = mock_service_class.return_value
+        # Every magnet was a duplicate: nothing new persisted, but the crawl worked.
+        mock_service.run_crawl = AsyncMock(return_value=CrawlResult([], extracted_magnets=12))
+
+        await run_once(_empty_cycle_settings())
+
+    redis.set.assert_awaited_once_with("pixav:crawl:empty_cycles", 0)
+    redis.incr.assert_not_awaited()
+    assert set_state.call_args.kwargs["empty_cycles"] == 0

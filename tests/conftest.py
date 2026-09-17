@@ -12,6 +12,22 @@ from pixav.shared.enums import AccountStatus, TaskState, VideoStatus
 from pixav.shared.models import Account, Task, Video
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ignore_operator_env_file():
+    """Unit tests must not inherit the operator's ``.env``.
+
+    ``Settings`` reads ``.env`` by default, so a value an operator sets for a
+    live run — ``PIXAV_MANAGED_MEDIA_WORKFLOW`` is the one that bit — silently
+    changes what a test constructs and what the code under test then does.
+    """
+    original = Settings.model_config.get("env_file")
+    Settings.model_config["env_file"] = None
+    try:
+        yield
+    finally:
+        Settings.model_config["env_file"] = original
+
+
 @pytest.fixture()
 def settings() -> Settings:
     """Return a Settings instance with test defaults."""

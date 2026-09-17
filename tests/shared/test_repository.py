@@ -14,6 +14,7 @@ from pixav.shared.enums import TaskState, VideoStatus
 from pixav.shared.models import Task, Video
 from pixav.shared.repository import (
     AccountRepository,
+    SourceCandidateRepository,
     TaskRepository,
     VideoRepository,
     _task_from_row,
@@ -34,6 +35,23 @@ def _make_record(data: dict[str, Any]) -> MagicMock:
         pass
 
     return FakeRecord(data)
+
+
+def _transactional_pool(row: dict[str, Any] | None) -> tuple[AsyncMock, AsyncMock]:
+    """Build a pool whose ``acquire()``/``transaction()`` behave as async context managers."""
+    conn = AsyncMock()
+    conn.fetchrow.return_value = row
+    conn.transaction = MagicMock(return_value=_async_ctx(None))
+    pool = AsyncMock()
+    pool.acquire = MagicMock(return_value=_async_ctx(conn))
+    return conn, pool
+
+
+def _async_ctx(value: Any) -> MagicMock:
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=value)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx
 
 
 # ── Row helpers ─────────────────────────────────────────────────
@@ -165,6 +183,52 @@ class TestVideoRepository:
         )
         pool.execute.assert_awaited_once()
 
+    async def test_update_download_result_merges_metadata_instead_of_replacing(
+        self, repo: VideoRepository, pool: AsyncMock
+    ) -> None:
+        """Later enrichment must not erase the discovery provenance written at crawl time."""
+        pool.execute.return_value = "UPDATE 1"
+        await repo.update_download_result(
+            uuid.uuid4(),
+            local_path="/data/remuxed/video.mp4",
+            metadata_json='{"media": {"codec": "h264"}}',
+            title="SSIS-123",
+            quality_score=70,
+        )
+        sql = pool.execute.call_args[0][0]
+        assert "metadata_json = COALESCE(metadata_json, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb)" in sql
+        # A blank incoming title must never blank out an existing one.
+        assert "title = COALESCE(NULLIF(btrim($3), ''), title)" in sql
+        assert "quality_score = COALESCE($4, quality_score)" in sql
+
+    async def test_update_metadata_section_targets_one_key(self, repo: VideoRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        await repo.update_metadata_section(uuid.uuid4(), "stash", {"stash_id": "abc"})
+        sql, section, value, _video_id = pool.execute.call_args[0]
+        assert "jsonb_set(" in sql
+        assert section == "stash"
+        assert json.loads(value) == {"stash_id": "abc"}
+
+    async def test_upload_result_sets_cleanup_window_only_for_remote_uploads(
+        self, repo: VideoRepository, pool: AsyncMock
+    ) -> None:
+        """local mode keeps its file forever so /local/{video_id} keeps working."""
+        pool.execute.return_value = "UPDATE 1"
+        await repo.update_upload_result(uuid.uuid4(), share_url="https://photos.app.goo.gl/share")
+        sql = pool.execute.call_args[0][0]
+        assert "WHEN $1 LIKE 'pixav-local://%' THEN NULL" in sql
+        # The cast is required by real PostgreSQL: without it, the parameter is
+        # inferred as interval and the CASE result cannot be stored as timestamptz.
+        assert "$3::timestamptz + interval '24 hours'" in sql
+
+    async def test_schedule_terminal_cleanup_retains_failed_files(self, repo: VideoRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        await repo.schedule_terminal_cleanup(uuid.uuid4(), retention_days=7)
+        sql, days, _video_id = pool.execute.call_args[0]
+        assert days == 7
+        assert "now() + ($1 * interval '1 day')" in sql
+        assert "share_url LIKE 'pixav-local://%' THEN NULL" in sql
+
     async def test_update_upload_result(self, repo: VideoRepository, pool: AsyncMock) -> None:
         pool.execute.return_value = "UPDATE 1"
         await repo.update_upload_result(uuid.uuid4(), share_url="https://photos.app.goo.gl/share")
@@ -253,7 +317,8 @@ class TestTaskRepository:
         assert args[1] == 2
         assert args[2] == TaskState.PENDING.value
         assert args[3] == "transient failure"
-        assert args[5] == task_id
+        assert args[4] is None
+        assert args[6] == task_id
 
     async def test_claim_for_dispatch_true(self, repo: TaskRepository, pool: AsyncMock) -> None:
         pool.execute.return_value = "UPDATE 1"
@@ -303,6 +368,59 @@ class TestTaskRepository:
         assert result[0].state == TaskState.PENDING
         pool.fetch.assert_awaited_once()
 
+    async def test_list_pending_skips_tasks_still_in_backoff(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        """Maxwell only dispatches retries whose PostgreSQL due time has passed."""
+        pool.fetch.return_value = []
+
+        await repo.list_pending(limit=10)
+
+        sql = pool.fetch.call_args[0][0]
+        assert "retry_not_before IS NULL OR retry_not_before <= now()" in sql
+
+    async def test_claim_for_dispatch_refuses_tasks_still_in_backoff(
+        self, repo: TaskRepository, pool: AsyncMock
+    ) -> None:
+        pool.execute.return_value = "UPDATE 0"
+
+        await repo.claim_for_dispatch(uuid.uuid4(), next_state=TaskState.DISPATCHED)
+
+        sql = pool.execute.call_args[0][0]
+        assert "retry_not_before IS NULL OR retry_not_before <= now()" in sql
+
+    async def test_set_retry_persists_the_due_time(self, repo: TaskRepository, pool: AsyncMock) -> None:
+        pool.execute.return_value = "UPDATE 1"
+        due = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+
+        await repo.set_retry(uuid.uuid4(), 3, error_message="boom", retry_not_before=due)
+
+        sql = pool.execute.call_args[0][0]
+        assert "retry_not_before = $4" in sql
+        assert pool.execute.call_args[0][4] == due
+
+    async def test_replay_audits_and_restarts_the_retry_cycle(self) -> None:
+        conn, pool = _transactional_pool({"state": "failed", "retries": 6})
+        task_id = uuid.uuid4()
+
+        assert await TaskRepository(pool).replay(task_id, requested_by="operator", reason="ADB fixed") is True
+
+        audit_sql, audited_id, prev_state, prev_retries, by, reason = conn.execute.await_args_list[0][0]
+        assert "INSERT INTO task_replay_audit" in audit_sql
+        assert (audited_id, prev_state, prev_retries, by, reason) == (
+            task_id,
+            "failed",
+            6,
+            "operator",
+            "ADB fixed",
+        )
+        update_sql = conn.execute.await_args_list[1][0][0]
+        assert "state = 'pending', retries = 0, retry_not_before = now()" in update_sql
+
+    async def test_replay_returns_false_for_unknown_task(self) -> None:
+        conn, pool = _transactional_pool(None)
+
+        assert await TaskRepository(pool).replay(uuid.uuid4()) is False
+        conn.execute.assert_not_awaited()
+
     async def test_has_open_task_true(self, repo: TaskRepository, pool: AsyncMock) -> None:
         pool.fetchval.return_value = True
 
@@ -346,3 +464,79 @@ class TestAccountRepository:
         args = pool.execute.call_args[0]
         assert args[1] == account_id
         assert args[2] == 123456
+
+
+class TestSourceCandidateRepository:
+    """Cooldown, not deletion: a swarm dead today may be alive next week."""
+
+    @pytest.fixture
+    def pool(self) -> AsyncMock:
+        return AsyncMock()
+
+    @pytest.fixture
+    def repo(self, pool: AsyncMock) -> SourceCandidateRepository:
+        return SourceCandidateRepository(pool)
+
+    async def test_register_is_idempotent_per_video_and_magnet(
+        self, repo: SourceCandidateRepository, pool: AsyncMock
+    ) -> None:
+        await repo.register(uuid.uuid4(), magnet_uri="magnet:?xt=urn:btih:abc", quality_score=42)
+
+        query = pool.execute.await_args.args[0]
+        assert "ON CONFLICT (video_id, magnet_uri) DO NOTHING" in query
+
+    async def test_mark_unavailable_parks_the_row_instead_of_deleting_it(
+        self, repo: SourceCandidateRepository, pool: AsyncMock
+    ) -> None:
+        await repo.mark_unavailable(uuid.uuid4(), "magnet:?xt=urn:btih:abc", reason="no seeds", cooldown_hours=6)
+
+        query = pool.execute.await_args.args[0]
+        assert "DELETE" not in query.upper()
+        assert "unavailable_until" in query
+        assert "attempts = attempts + 1" in query
+
+    async def test_mark_unavailable_truncates_the_error_text(
+        self, repo: SourceCandidateRepository, pool: AsyncMock
+    ) -> None:
+        await repo.mark_unavailable(uuid.uuid4(), "magnet:x", reason="e" * 2000)
+
+        assert len(pool.execute.await_args.args[4]) == 500
+
+    async def test_next_candidate_excludes_the_failed_source(
+        self, repo: SourceCandidateRepository, pool: AsyncMock
+    ) -> None:
+        video_id = uuid.uuid4()
+        pool.fetchrow.return_value = {
+            "id": uuid.uuid4(),
+            "video_id": video_id,
+            "magnet_uri": "magnet:?xt=urn:btih:def",
+            "info_hash": "def",
+            "origin": "sehuatang",
+            "quality_score": 10,
+            "state": "pending",
+            "unavailable_until": None,
+            "attempts": 0,
+            "last_error": None,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": None,
+        }
+
+        result = await repo.next_candidate(video_id, exclude_magnet="magnet:?xt=urn:btih:abc")
+
+        assert result is not None
+        assert result.magnet_uri == "magnet:?xt=urn:btih:def"
+        assert pool.fetchrow.await_args.args[2] == "magnet:?xt=urn:btih:abc"
+
+    async def test_next_candidate_returns_none_when_exhausted(
+        self, repo: SourceCandidateRepository, pool: AsyncMock
+    ) -> None:
+        pool.fetchrow.return_value = None
+
+        assert await repo.next_candidate(uuid.uuid4()) is None
+
+    async def test_release_expired_cooldowns_reports_the_row_count(
+        self, repo: SourceCandidateRepository, pool: AsyncMock
+    ) -> None:
+        pool.execute.return_value = "UPDATE 3"
+
+        assert await repo.release_expired_cooldowns() == 3

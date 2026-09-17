@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -78,6 +81,11 @@ class StashMetadataScraper:
         except httpx.HTTPError as exc:
             raise CrawlError(f"Stash request failed: {exc}") from exc
 
+        errors = data.get("errors")
+        if errors:
+            messages = "; ".join(str(item.get("message", "GraphQL error")) for item in errors if isinstance(item, dict))
+            raise CrawlError(f"Stash GraphQL errors: {messages or 'unknown error'}")
+
         scenes = data.get("data", {}).get("findScenes", {}).get("scenes", [])
         if not scenes:
             logger.debug("no Stash scenes found for %r", title)
@@ -111,3 +119,79 @@ class StashMetadataScraper:
 
         logger.info("stash metadata found for %r: stash_id=%s", title, result.get("stash_id"))
         return result
+
+
+async def probe_media(path: str, *, ffprobe_bin: str = "ffprobe", timeout: int = 30) -> dict[str, Any]:  # noqa: C901
+    """Probe every stream; missing dependencies and malformed media fail closed."""
+    from pathlib import Path
+
+    from pixav.media_loader.preparation import MediaFacts, hash_file
+    from pixav.shared.exceptions import MediaDependencyError, RemuxError
+
+    target = Path(path)
+    if target.is_symlink() or any(parent.is_symlink() for parent in target.parents):
+        raise RemuxError("symlink in media input path")
+    if not target.is_file():
+        raise RemuxError("media file does not exist")
+    before = target.stat()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise MediaDependencyError("ffprobe unavailable") from exc
+    try:
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise MediaDependencyError("ffprobe timed out") from exc
+    if proc.returncode != 0:
+        raise RemuxError("ffprobe rejected media")
+    try:
+        raw = json.loads(stdout)
+        streams = tuple(
+            {
+                "kind": s["codec_type"],
+                "codec": s["codec_name"],
+                "width": s.get("width", 0),
+                "height": s.get("height", 0),
+            }
+            for s in raw["streams"]
+        )
+        facts = MediaFacts(
+            container=raw["format"]["format_name"],
+            size_bytes=raw["format"]["size"],
+            duration_seconds=raw["format"]["duration"],
+            streams=streams,
+            sha256=await hash_file(path),
+        )
+        video = next(s for s in facts.streams if s.kind == "video")
+    except (ValueError, TypeError, KeyError, StopIteration) as exc:
+        raise RemuxError("invalid ffprobe media facts") from exc
+    after = target.stat()
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        raise RemuxError("media changed during inspection")
+    if facts.size_bytes != after.st_size or not video.width or not video.height:
+        raise RemuxError("invalid media size or video dimensions")
+    return {
+        **facts.model_dump(mode="json"),
+        "path": path,
+        "filename": os.path.basename(path),
+        "codec": video.codec,
+        "width": video.width,
+        "height": video.height,
+        "resolution": f"{video.width}x{video.height}",
+    }

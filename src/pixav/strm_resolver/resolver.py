@@ -9,6 +9,7 @@ import re
 import httpx
 
 from pixav.shared.exceptions import ResolveError
+from pixav.shared.logging import install_http_url_log_redaction
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class GooglePhotosResolver:
     """
 
     def __init__(self, *, timeout: int = 15, concurrency: int = 3) -> None:
+        install_http_url_log_redaction()
         self._timeout = timeout
         self._sem = asyncio.Semaphore(concurrency)
         self._client: httpx.AsyncClient | None = None
@@ -70,17 +72,17 @@ class GooglePhotosResolver:
                 resp = await self._client.get(share_url)
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                raise ResolveError(f"share URL returned {exc.response.status_code}: {share_url}") from exc
+                raise ResolveError(f"share URL returned {exc.response.status_code} (token redacted)") from None
             except httpx.HTTPError as exc:
-                raise ResolveError(f"failed to fetch share URL: {exc}") from exc
+                raise ResolveError(f"failed to fetch share URL ({type(exc).__name__}; token redacted)") from None
 
             # Extract CDN URL from page content
             match = _CDN_PATTERN.search(resp.text)
             if not match:
-                raise ResolveError(f"no CDN URL found in share page: {share_url}")
+                raise ResolveError("no CDN URL found in share page (token redacted)")
 
             cdn_base = match.group(1)
             # Clean and append video streaming params
             cdn_url = cdn_base.split("=")[0] + "=dv"
-            logger.info("resolved %s → %s", share_url, cdn_url)
+            logger.info("resolved Google Photos share URL to CDN URL (both tokens redacted)")
             return cdn_url
