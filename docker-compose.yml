@@ -276,6 +276,10 @@ services:
       <<: *worker-net
       PIXAV_DB_USER: ${PIXAV_MAXWELL_DB_USER:-${PIXAV_DB_USER}}
       PIXAV_DB_PASSWORD: ${PIXAV_MAXWELL_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
+    volumes:
+      # Maxwell's disk guard must inspect the same host data filesystem used
+      # by media_loader/qBittorrent, not the container overlay filesystem.
+      - ./data:/app/data
     ports:
       - "${PIXAV_MAXWELL_CORE_HEALTH_PORT:-8001}:8001"
     depends_on:

@@ -460,10 +460,16 @@ class TestSourceViability:
                 json=[{"progress": 0.0, "state": "metaDL", "num_seeds": 0, "num_complete": 0, "availability": 0.0}],
             )
         )
+        delete = respx.post("http://qbit:8080/api/v2/torrents/delete").mock(return_value=httpx.Response(200))
 
         with pytest.raises(DownloadError, match="found no seeds") as error:
             await client.wait_complete("abc123")
+
         assert not isinstance(error.value, SourceUnavailableError)
+        assert delete.called
+        request = delete.calls.last.request
+        assert b"hashes=abc123" in request.content
+        assert b"deleteFiles=false" in request.content
 
     @respx.mock
     async def test_a_live_swarm_is_not_declared_dead(self) -> None:

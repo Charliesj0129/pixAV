@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -24,6 +25,9 @@ async def test_low_disk_latches_and_does_not_auto_resume(tmp_path) -> None:
     assert first.paused is True
     assert second.paused is True
     redis.set.assert_awaited_once()
+    payload = json.loads(redis.set.await_args.args[1])
+    assert payload["paused"] is True
+    assert payload["below_threshold"] is True
     redis.delete.assert_not_awaited()
 
 

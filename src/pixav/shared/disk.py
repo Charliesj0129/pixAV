@@ -65,7 +65,12 @@ class DownloadSpaceGuard:
         reason: str | None = None
         if status.below_threshold and not paused:
             reason = "disk space below download safety threshold"
-            payload = {**asdict(status), "reason": reason, "paused_at": datetime.now(timezone.utc).isoformat()}
+            payload = {
+                **asdict(status),
+                "paused": True,
+                "reason": reason,
+                "paused_at": datetime.now(timezone.utc).isoformat(),
+            }
             await self._redis.set(self._pause_key, json.dumps(payload, sort_keys=True))
             paused = True
         elif paused:

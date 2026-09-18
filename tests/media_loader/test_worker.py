@@ -21,16 +21,18 @@ class _StopWorker(BaseException):
 
 
 def _settings(**changes) -> Settings:
-    return Settings(
-        **changes,
-        queue_download="pixav:download",
-        queue_download_dlq="pixav:download:dlq",
-        queue_upload="pixav:upload",
-        download_max_retries=5,
-        download_min_free_bytes=0,
-        download_min_free_percent=0,
-        vpn_egress_echo_url="",
-    )
+    values = {
+        "queue_download": "pixav:download",
+        "queue_download_dlq": "pixav:download:dlq",
+        "queue_upload": "pixav:upload",
+        "download_max_retries": 5,
+        "download_min_free_bytes": 0,
+        "download_min_free_percent": 0,
+        "vpn_egress_echo_url": "",
+        "managed_media_workflow": False,
+    }
+    values.update(changes)
+    return Settings(**values)
 
 
 def _wire_common_patches(

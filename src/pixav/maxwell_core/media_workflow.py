@@ -189,7 +189,24 @@ class MediaWorkflow:
                 WHERE e.state IN ('READY','WAITING_RETRY','WAITING_QUOTA') AND e.due_at <= now()
                 AND (NOT $1::boolean OR e.stage <> 'download')
                 AND NOT EXISTS (SELECT FROM executions active WHERE active.state='RUNNING' AND active.stage=e.stage)
-                ORDER BY CASE WHEN e.stage='download' THEN 1 ELSE 0 END,e.due_at,e.created_at,e.id
+                ORDER BY CASE
+                    WHEN e.stage <> 'download' THEN 0
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM source_candidates c
+                        WHERE c.video_id=t.video_id
+                        AND (c.state IN ('pending','succeeded') OR c.unavailable_until <= now())
+                        AND c.info_hash ~ '^[a-f0-9]{40}$'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM source_observations o
+                            WHERE o.video_id=c.video_id
+                            AND o.info_hash=c.info_hash
+                            AND o.eligible
+                        )
+                    ) THEN 1
+                    ELSE 2
+                END,e.due_at,e.created_at,e.id
                 LIMIT 1 FOR UPDATE OF e SKIP LOCKED""",
                 download_paused,
             )

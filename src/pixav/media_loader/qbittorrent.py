@@ -488,6 +488,15 @@ class QBitClient:
                 if verdict == "stalled":
                     stalled_for += self._poll_interval
                     if stalled_for >= self._no_peer_grace_seconds:
+                        # No swarm signal within the grace period is still
+                        # retryable: zero seeds / zero availability alone do
+                        # not prove that the candidate itself is unavailable.
+                        # But the external qBittorrent operation must not leak
+                        # across retries and consume an active download slot.
+                        try:
+                            await self.delete_torrent(torrent_hash, delete_files=False)
+                        except DownloadError as exc:
+                            raise DownloadError(f"stalled torrent cleanup failed for {torrent_hash}: {exc}") from exc
                         raise DownloadError(
                             f"torrent {torrent_hash} found no seeds within "
                             f"{self._no_peer_grace_seconds}s (state={info.get('state')}, "
