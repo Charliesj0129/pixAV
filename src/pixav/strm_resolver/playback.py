@@ -22,6 +22,7 @@ from uuid import UUID
 from fastapi import HTTPException
 
 from pixav.media_loader.preparation import MediaFacts, PreparationPolicy, inspect_media
+from pixav.media_loader.video_parts import require_space
 from pixav.pixel_injector.photos_storage import PhotosColdReadback
 from pixav.shared.remote_assets import asset_from_row, segment_from_row
 from pixav.shared.storage_models import IntegrityError, policy_for
@@ -109,6 +110,9 @@ class PlaybackService:
         return True
 
     async def _retrieve(self, asset, segment, destination: Path) -> None:
+        # Reserve the original plus a transient provider archive; cache work
+        # must preserve the same 100 GiB / 10 percent latch as preparation.
+        require_space([(self.root, 2 * segment.size_bytes)])
         # Every attempt gets a fresh directory: the browser cannot reuse old
         # receipts or mistake a previously cached file for new remote evidence.
         work = Path(tempfile.mkdtemp(prefix="cold-", dir=self.root))

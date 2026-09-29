@@ -27,7 +27,9 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-async def ready_fixture(integration_db, tmp_path):
+async def ready_fixture(integration_db, tmp_path, monkeypatch):
+    # The fixture is a tiny synthetic clip; production keeps the 100 GiB latch.
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(total=1000 * 1024**3, free=500 * 1024**3))
     db = integration_db
     for path in sorted(Path("migrations").glob("*.sql")):
         await db.execute(path.read_text())
@@ -201,6 +203,18 @@ async def test_corrupt_readback_never_becomes_ready(ready_fixture):
     f.playback.readback_factory = bad_retriever
     with pytest.raises(ValueError):
         await f.playback.prepare(f.video)
+    assert await f.db.fetchval("SELECT count(*) FROM playable_assets") == 0
+    assert f.staging.exists()
+
+
+async def test_low_space_stops_before_remote_retrieval(ready_fixture, monkeypatch):
+    from pixav.media_loader.video_parts import MediaOperationError
+
+    f = ready_fixture
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(total=1000 * 1024**3, free=99 * 1024**3))
+    with pytest.raises(MediaOperationError, match="disk latch"):
+        await f.playback.prepare(f.video)
+    assert not f.calls
     assert await f.db.fetchval("SELECT count(*) FROM playable_assets") == 0
     assert f.staging.exists()
 

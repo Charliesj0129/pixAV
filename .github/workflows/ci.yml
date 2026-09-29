@@ -50,6 +50,7 @@ jobs:
 
       - name: Validate deployment configuration
         run: |
+          cp .env.example .env
           docker compose --env-file .env.example -f docker-compose.yml config --quiet
           docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.prod.yml config --quiet
 
