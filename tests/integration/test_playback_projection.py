@@ -238,3 +238,49 @@ async def test_playback_role_cannot_change_remote_durability(ready_fixture):
                 await conn.execute("UPDATE remote_assets SET state='INVALID',durable_at=NULL")
         finally:
             await conn.execute("RESET ROLE")
+
+
+async def test_http_playback_recovers_after_synthetic_staging_and_cache_removal(ready_fixture, tmp_path):
+    """Real DB, FFmpeg media and HTTP transport; only Photos is synthetic."""
+    import hashlib
+
+    from httpx import ASGITransport, AsyncClient
+
+    from pixav.strm_resolver.app import create_app
+
+    f = ready_fixture
+    original = f.staging.read_bytes()
+    f.staging.unlink()  # Disposable test media, not the production cleanup operation.
+    tokens = tmp_path / "devices.json"
+    tokens.write_text(json.dumps({"fixture": hashlib.sha256(b"synthetic-token").hexdigest()}))
+    tokens.chmod(0o600)
+    app = create_app(redis_url=None, db_dsn=None)
+    app.state.managed_playback = True
+    app.state.playback_settings = SimpleNamespace(playback_tokens_file=str(tokens))
+    app.state.db_pool = f.db
+    app.state.playback = f.playback
+    url = f"/stream/{f.video}"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://fixture") as client:
+        assert (await client.get(url)).status_code == 401
+        assert f.calls == []
+        client.headers["Authorization"] = "Bearer synthetic-token"
+        first = await client.get(url)
+        assert first.status_code == 200
+        assert hashlib.sha256(first.content).hexdigest() == f.facts.sha256
+        active = await f.projection.publish(f.video, f.poster)
+        assert active.is_dir()
+        assert await f.playback.evict(f.video)
+        head = await client.head(url)
+        assert head.status_code == 200
+        assert int(head.headers["content-length"]) == len(original)
+        assert len(f.calls) == 1  # HEAD does not restore bytes.
+        recovered = await client.get(url, headers={"Range": "bytes=500-799"})
+        assert recovered.status_code == 206 and recovered.content == original[500:800]
+        assert "location" not in recovered.headers
+        assert len(f.calls) == 2
+        assert f.calls[0] != f.calls[1]
+        tokens.write_text("{}")
+        assert (await client.get(url)).status_code == 403
+        assert len(f.calls) == 2
+    assert not f.staging.exists()
+    assert await f.db.fetchval("SELECT state FROM remote_assets WHERE id=$1", f.asset) == "DURABLE"
