@@ -26,7 +26,7 @@ class Account(BaseModel):
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     email: str
-    password: str | None = None
+    password: str | None = Field(default=None, repr=False)
     status: AccountStatus = AccountStatus.ACTIVE
     storage_instance_id: uuid.UUID | None = None
     last_used_at: datetime | None = None

@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await redis_client.ping()
             app.state.redis = redis_client
         except Exception as exc:
-            logger.warning("redis unavailable at startup (%s): %s", redis_url, exc)
+            logger.warning("redis unavailable at startup (%s)", type(exc).__name__)
             app.state.redis = None
 
     if db_dsn:
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             db_pool = await asyncpg.create_pool(dsn=db_dsn, min_size=1, max_size=5)
             app.state.db_pool = db_pool
         except Exception as exc:
-            logger.warning("postgres unavailable at startup (%s): %s", db_dsn, exc)
+            logger.warning("postgres unavailable at startup (%s)", type(exc).__name__)
             app.state.db_pool = None
 
     # Start resolver client
@@ -76,6 +76,9 @@ def create_app(
     app.state.redis = None
     app.state.db_pool = None
     app.state.local_share_scheme = settings.pixel_injector_local_share_scheme
+    app.state.managed_playback = settings.managed_playback
+    app.state.playback_settings = settings
+    app.state.playback = None
 
     # Initialize resolver with settings
     app.state.resolver = GooglePhotosResolver(concurrency=settings.resolver_concurrency)

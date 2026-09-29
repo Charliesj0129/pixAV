@@ -77,7 +77,8 @@ async def publish(db, video):
     await db.execute("""CREATE TABLE IF NOT EXISTS library_publications (
             video_id uuid PRIMARY KEY REFERENCES videos(id), state text NOT NULL)""")
     await db.execute(
-        """INSERT INTO library_publications(video_id,state) VALUES($1,'PUBLISHED')
+        """INSERT INTO library_publications(video_id,state,manifest_sha256,revision,poster_path,poster_sha256)
+        VALUES($1,'PUBLISHED',repeat('a',64),'synthetic','synthetic',repeat('a',64))
         ON CONFLICT (video_id) DO UPDATE SET state='PUBLISHED'""",
         video,
     )
@@ -301,7 +302,9 @@ async def playback_verified(db, video):
     await db.execute("""CREATE TABLE IF NOT EXISTS playable_assets (
             video_id uuid PRIMARY KEY REFERENCES videos(id), state text NOT NULL)""")
     await db.execute(
-        """INSERT INTO playable_assets(video_id,state) VALUES($1,'READY')
+        """INSERT INTO playable_assets(video_id,remote_asset_id,state,manifest_sha256,cache_path,size_bytes,sha256)
+        SELECT $1,id,'READY',repeat('a',64),'synthetic',1,repeat('a',64)
+        FROM remote_assets WHERE video_id=$1
         ON CONFLICT (video_id) DO UPDATE SET state='READY'""",
         video,
     )

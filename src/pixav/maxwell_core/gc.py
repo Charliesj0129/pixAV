@@ -216,17 +216,19 @@ class LocalFileJanitor:
     async def _verified_playback(self, conn: asyncpg.Connection, video_id) -> bool:
         """Whether playback was actually verified from the remote copy.
 
-        PlaybackResolver owns ``playable_assets``; it has not landed, so this
-        table does not exist and the condition is False for every artifact in
-        production. That is the blocking dependency, named -- the point of
-        naming it is that a refusal can say which producer is missing instead
-        of reporting a constant nobody can act on.
+        Migration 019 supplies the table, but cache preparation is not client
+        acceptance. Only separately recorded live playback and seek evidence
+        can satisfy this gate; READY alone must never permit staging deletion.
         """
         if not await self._table_available(conn, "playable_assets"):
             return False
         return bool(
             await conn.fetchval(
-                "SELECT EXISTS(SELECT FROM playable_assets WHERE video_id=$1 AND state='READY')", video_id
+                """SELECT EXISTS(SELECT FROM playable_assets p JOIN remote_assets r ON r.id=p.remote_asset_id
+                WHERE p.video_id=$1 AND p.state='READY' AND r.state='DURABLE'
+                AND p.playback_verified_at IS NOT NULL
+                AND p.evidence->>'client_playback'='PASS' AND p.evidence->>'client_seek'='PASS')""",
+                video_id,
             )
         )
 

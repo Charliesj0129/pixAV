@@ -47,5 +47,36 @@ jobs:
       - name: Mypy
         run: uv run mypy src
 
+      - name: Start isolated contract databases
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          docker compose -f docker-compose.integration.yml up -d --wait
+
+      - name: Verify and bind disposable instance identities
+        run: |
+          uv run python - <<'PY'
+          import asyncio, os
+          import asyncpg
+          import redis.asyncio as redis
+          async def main():
+              db = await asyncpg.connect('postgresql://pixav_test:integration-only@127.0.0.1:15432/pixav_integration')
+              cache = redis.from_url('redis://127.0.0.1:16379/0')
+              try:
+                  assert await db.fetchval('SELECT current_database()') == 'pixav_integration'
+                  identity = await db.fetchval('SELECT system_identifier FROM pg_control_system()')
+                  run_id = (await cache.info('server'))['run_id']
+                  with open(os.environ['GITHUB_ENV'], 'a') as target:
+                      target.write(f'PIXAV_RUN_INTEGRATION=1\nPIXAV_TEST_DB_IDENTITY={identity}\nPIXAV_TEST_REDIS_IDENTITY={run_id}\n')
+              finally:
+                  await db.close()
+                  await cache.aclose()
+          asyncio.run(main())
+          PY
+
       - name: Pytest
         run: uv run pytest -q --cov=src/pixav --cov-report=term-missing --cov-fail-under=80
+
+      - name: Remove disposable contract instances
+        if: always()
+        run: docker compose -f docker-compose.integration.yml down -v
