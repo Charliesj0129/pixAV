@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import uuid
 from pathlib import Path
 
@@ -21,6 +22,36 @@ from pixav.pixel_injector.canary import CanaryBlockedError
 from scripts.first_4k_movie import SELECTION_VERSION, SUCCESS_STATUSES, MovieFlow
 
 TORRENT = b"d8:announce20:http://t/announce.x4:infod4:name3:abcee" + b"e" * 60
+
+
+class PackageBoundary:
+    """Patch the same external boundary in each module of the split package."""
+
+    def __init__(self, modules):
+        object.__setattr__(self, "modules", modules)
+
+    def __getattr__(self, name):
+        for module in self.modules:
+            if hasattr(module, name):
+                return getattr(module, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        for module in self.modules:
+            if hasattr(module, name):
+                setattr(module, name, value)
+
+
+@pytest.fixture(autouse=True, params=["legacy", "package"])
+def implementation(request, monkeypatch):
+    """Behavioral contracts must execute both copies, not only compare source."""
+    if request.param == "package":
+        from pixav.first_4k import cli, flow, playback, prepare, upload
+
+        monkeypatch.setattr(sys.modules[__name__], "MovieFlow", flow.MovieFlow)
+        monkeypatch.setattr(
+            sys.modules[__name__], "flow_module", PackageBoundary((flow, prepare, upload, playback, cli))
+        )
 
 
 class FakePool:

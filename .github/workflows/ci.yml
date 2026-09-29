@@ -18,6 +18,7 @@ jobs:
     env:
       # Ensure optional heavyweight groups are never pulled in by default.
       UV_NO_GROUP: embeddings
+      PIXAV_E2E_ADMIN_DSN: postgresql://pixav_test:integration-only@127.0.0.1:15432/pixav_integration
 
     steps:
       - name: Checkout
@@ -46,6 +47,11 @@ jobs:
 
       - name: Mypy
         run: uv run mypy src
+
+      - name: Validate deployment configuration
+        run: |
+          docker compose --env-file .env.example -f docker-compose.yml config --quiet
+          docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.prod.yml config --quiet
 
       - name: Start isolated contract databases
         run: |

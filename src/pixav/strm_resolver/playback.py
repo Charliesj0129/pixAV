@@ -96,14 +96,14 @@ class PlaybackService:
             raise HTTPException(409, "segmented playback requires verified merged-object and junction evidence")
         return asset, segments, manifest_digest(asset, segments)
 
-    async def _cached(self, path: Path, segment) -> bool:
-        if not safe_file(self.root, path) or path.stat().st_size != segment.size_bytes:
+    async def _cached(self, path: Path, size_bytes: int, sha256: str) -> bool:
+        if not safe_file(self.root, path) or path.stat().st_size != size_bytes:
             return False
         stat = path.stat()
-        stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, segment.sha256)
+        stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, sha256)
         if self._verified.get(str(path)) == stamp:
             return True
-        if await asyncio.to_thread(file_hash, path) != segment.sha256:
+        if await asyncio.to_thread(file_hash, path) != sha256:
             return False
         self._verified[str(path)] = stamp
         return True
@@ -135,6 +135,15 @@ class PlaybackService:
             shutil.rmtree(work)
 
     async def prepare(self, video_id: UUID) -> None:
+        # A second seek must not wait for the first stream to finish. Cached
+        # READY reads take only shared locks, compatible with active readers.
+        try:
+            async with self.reader(video_id) as known:
+                if await self._cached(Path(known["cache_path"]), known["size_bytes"], known["sha256"]):
+                    return
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
         if any(item.is_symlink() for item in (self.root, *self.root.parents)):
             raise HTTPException(503, "unsafe playback cache root")
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -148,7 +157,7 @@ class PlaybackService:
             destination = self.root / str(asset.id) / version / "original.mp4"
             if any(item.is_symlink() for item in (destination, *destination.parents)):
                 raise HTTPException(503, "unsafe playback cache path")
-            if not await self._cached(destination, segment):
+            if not await self._cached(destination, segment.size_bytes, segment.sha256):
                 await self._retrieve(asset, segment, destination)
             await conn.execute(
                 """INSERT INTO playable_assets(video_id,remote_asset_id,state,manifest_sha256,cache_path,size_bytes,sha256,evidence)

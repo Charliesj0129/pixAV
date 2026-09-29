@@ -9,9 +9,11 @@ import asyncio
 import json
 import shutil
 import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import asyncpg
 import pytest
 from fastapi import HTTPException
 from PIL import Image
@@ -138,6 +140,8 @@ async def test_reader_prevents_eviction_until_response_finishes(ready_fixture):
     f = ready_fixture
     await f.playback.prepare(f.video)
     async with f.playback.reader(f.video) as item:
+        # Repeated seek preparation must remain concurrent with an active stream.
+        await asyncio.wait_for(f.playback.prepare(f.video), timeout=3)
         eviction = asyncio.create_task(f.playback.evict(f.video))
         done, _ = await asyncio.wait([eviction], timeout=0.1)
         assert not done
@@ -199,3 +203,24 @@ async def test_corrupt_readback_never_becomes_ready(ready_fixture):
         await f.playback.prepare(f.video)
     assert await f.db.fetchval("SELECT count(*) FROM playable_assets") == 0
     assert f.staging.exists()
+
+
+async def test_playback_role_cannot_change_remote_durability(ready_fixture):
+    f = ready_fixture
+    async with f.db.acquire() as conn:
+
+        class SingleConnection:
+            @asynccontextmanager
+            async def acquire(self):
+                yield conn
+
+        await conn.execute("SET ROLE pixav_playback")
+        try:
+            f.playback.pool = SingleConnection()
+            await f.playback.prepare(f.video)
+            async with f.playback.reader(f.video) as ready:
+                assert ready["state"] == "READY"
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await conn.execute("UPDATE remote_assets SET state='INVALID',durable_at=NULL")
+        finally:
+            await conn.execute("RESET ROLE")

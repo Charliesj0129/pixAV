@@ -225,8 +225,11 @@ class LocalFileJanitor:
         return bool(
             await conn.fetchval(
                 """SELECT EXISTS(SELECT FROM playable_assets p JOIN remote_assets r ON r.id=p.remote_asset_id
+                JOIN library_publications l ON l.video_id=p.video_id AND l.manifest_sha256=p.manifest_sha256
                 WHERE p.video_id=$1 AND p.state='READY' AND r.state='DURABLE'
+                AND r.video_id=p.video_id AND l.state='PUBLISHED'
                 AND p.playback_verified_at IS NOT NULL
+                AND p.evidence->>'client_manifest_sha256'=p.manifest_sha256
                 AND p.evidence->>'client_playback'='PASS' AND p.evidence->>'client_seek'='PASS')""",
                 video_id,
             )
