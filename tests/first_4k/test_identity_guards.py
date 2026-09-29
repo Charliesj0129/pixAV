@@ -54,8 +54,7 @@ def host(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("case", ["owned", "db-volume", "redis-volume", "qbit", "db-id", "db-name", "redis-id", "disk"])
-async def test_preflight_rejects_wrong_ownership_identity_and_low_space(host, case):
+def change_host(host, case):
     if case == "db-volume":
         host.db.attrs["Mounts"][0]["Name"] = "production"
     elif case == "redis-volume":
@@ -70,6 +69,11 @@ async def test_preflight_rejects_wrong_ownership_identity_and_low_space(host, ca
         host.cache.exec_run.return_value.output = b"run_id:other-redis"
     elif case == "disk":
         host.budget.return_value = [{"ready": False}]
+
+
+@pytest.mark.parametrize("case", ["owned", "db-volume", "redis-volume", "qbit", "db-id", "db-name", "redis-id", "disk"])
+async def test_preflight_rejects_wrong_ownership_identity_and_low_space(host, case):
+    change_host(host, case)
     if case == "owned":
         result = await guards.preflight(host.client, SimpleNamespace())
         assert result["db_identity"] == "db-id"
