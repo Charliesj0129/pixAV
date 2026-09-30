@@ -139,6 +139,12 @@ managed 模式不回傳 provider CDN URL，`/resolve` 只回穩定路徑，`/loc
 
 對應驗證入口：`tests/strm_resolver/test_managed_playback.py`（GET／HEAD／Range／認證與撤銷）、`test_projection.py`（metadata／XML／原子 pointer）、`tests/integration/test_playback_projection.py`（真 PostgreSQL、冷 cache 重建、reader 排他、失效撤架與 commit 失敗恢復）。整合測試僅以合成 bytes 替代 Photos boundary，不是 live evidence。CI 使用獨立 Compose PostgreSQL／Redis、核對實際 instance identity 後執行 integration，coverage 門檻仍為 80%。真 Photos、Jellyfin、24 小時 quota、分段交界、完整 rollback、production Golden Path 仍未驗收。
 
+### 無常駐主機的短版核心驗證
+
+GitHub Actions `CI` 可在 `workflow_dispatch` 選擇 `mode=short-core`；PR 也會先執行此步驟，再跑原完整測試與 80% coverage gate。使用臨時 runner、隔離 PostgreSQL／Redis、2 秒合成影音；不需 Google secret。`tests/integration/test_short_journey.py` 把同一筆 Video 從 SourcePolicy 經 Redis／MediaActivityWorker、真 FFmpeg、storage 狀態與一次 quota 記帳、DURABLE／READY、STRM／NFO／poster，一路串到真 TCP GET／HEAD／Range、刪除該測試產生的原檔與 cache 後重建、裝置撤銷及失效撤架。短測試步驟上限 3 分鐘，整個 CI job 上限 20 分鐘；安裝與容器啟動另需時間。JUnit 結果保留 7 天，結束後銷毀隔離容器與 volumes。
+
+來源取得與 Photos upload／cold bytes 是明確的 fixture，微型測試替代可用磁碟數值；production 的 100 GiB／10% 門檻不變。此短版不含真 Pixel／Photos、Jellyfin 掃描與 client 實播、production cleanup、分段交界、24 小時 quota 或完整 backup／restore，不能稱為完整 Golden Path 驗收。移除合成檔是測試操作，不製造 client evidence 放行正式 staging cleanup。
+
 ## 開發順序與交付門檻
 
 | 順序 | 可審查的交付 | 通過條件 |

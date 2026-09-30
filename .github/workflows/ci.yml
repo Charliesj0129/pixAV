@@ -6,6 +6,14 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Validation scope (synthetic external boundaries, no live Photos/Jellyfin)
+        type: choice
+        options:
+          - full
+          - short-core
+        default: full
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -81,7 +89,36 @@ jobs:
           asyncio.run(main())
           PY
 
+      - name: Short synthetic core journey
+        timeout-minutes: 3
+        run: uv run pytest -q tests/integration/test_short_journey.py --junitxml=short-core.xml
+
+      - name: Short journey scope and result
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Short synthetic core journey
+          See the `Short synthetic core journey` step and JUnit artifact for its result.
+
+          One video: source policy -> Redis/media worker -> FFmpeg remux -> upload/verification domain transitions -> DURABLE -> READY -> STRM/NFO/poster -> TCP GET/HEAD/Range -> remove synthetic staging/cache -> recover -> revoke device -> withdraw invalid publication.
+
+          Real: PostgreSQL, Redis, FFmpeg, domain services, HTTP server and file transport.
+          Fixtures: torrent acquisition, Photos upload and independent read-back bytes, sufficient disk for the tiny clip.
+          Not covered: real Pixel/Photos, Jellyfin scan/client playback, production cleanup eligibility, multi-part boundaries, 24-hour quota, production backup/restore.
+          No Google credentials or persistent test host are used. Only disposable integration instances are removed.
+          EOF
+
+      - name: Save synthetic journey result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-core-result
+          path: short-core.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Pytest
+        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'short-core'
         run: uv run pytest -q --cov=src/pixav --cov-report=term-missing --cov-fail-under=80
 
       - name: Remove disposable contract instances
