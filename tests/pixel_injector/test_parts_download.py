@@ -1,7 +1,7 @@
 import hashlib
 import uuid
 import zipfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -24,6 +24,15 @@ OBSERVED = {
         {"kind": "audio", "codec": "aac", "width": 0, "height": 0},
     ],
 }
+
+
+@pytest.fixture
+def sufficient_disk(monkeypatch):
+    """Cache tests use synthetic disk capacity; disk latch tests cover refusal."""
+    monkeypatch.setattr(
+        "pixav.media_loader.video_parts.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=500 * 1024**3, total=1000 * 1024**3),
+    )
 
 
 @pytest.fixture
@@ -55,7 +64,7 @@ def test_symlink_zip_member_rejected(tmp_path):
         extract_original(archive, tmp_path / "out.mp4", "part.mp4", 6, hashlib.sha256(b"target").hexdigest())
 
 
-def test_cold_merge_uses_only_verified_cloud_paths_and_atomic_publication(tmp_path):
+def test_cold_merge_uses_only_verified_cloud_paths_and_atomic_publication(tmp_path, sufficient_disk):
     video = uuid.uuid4()
     digest = hashlib.sha256(b"original").hexdigest()
     parts = [
@@ -169,7 +178,7 @@ def cached_part():
 
 
 @pytest.mark.parametrize("artifact", ["receipt", "file", "partial"])
-def test_incomplete_cloud_cache_is_preserved_before_browser_retry(tmp_path, artifact, browser_stub):
+def test_incomplete_cloud_cache_is_preserved_before_browser_retry(tmp_path, artifact, browser_stub, sufficient_disk):
     from pixav.pixel_injector.parts_download import download_original
 
     part = cached_part()

@@ -12,6 +12,12 @@ from pixav.shared.models import Account, StorageInstance, Task, Video
 
 
 class TestAccount:
+    def test_password_is_not_in_text_representation(self) -> None:
+        acct = Account(email="account@example.test", password="synthetic-account-secret")
+        assert "synthetic-account-secret" not in repr(acct)
+        assert "synthetic-account-secret" not in str(acct)
+        assert acct.password == "synthetic-account-secret"
+
     def test_create_with_defaults(self) -> None:
         acct = Account(email="a@b.com")
         assert acct.email == "a@b.com"

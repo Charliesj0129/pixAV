@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     # Strm-Resolver
     resolver_host: str = "0.0.0.0"
     resolver_port: int = 8000
+    # Opt-in until the single-original playback and live client contracts pass.
+    managed_playback: bool = False
+    playback_cache_dir: str = "./data/playback-cache"
+    playback_tokens_file: str = ""
+    library_projection_dir: str = "./data/library"
+    library_artwork_dir: str = "./data/artwork"
+    playback_public_url: str = ""
 
     # Health endpoints (each worker exposes /health and /metrics on its port)
     maxwell_core_health_port: int = 8001

@@ -14,6 +14,15 @@ from pixav.pixel_injector.canary import CanaryBlockedError
 from scripts.first_4k_contracts import RunHeartbeat, resolve_configuration
 
 
+@pytest.fixture(autouse=True, params=["legacy", "package"])
+def implementation(request, monkeypatch):
+    if request.param == "package":
+        from pixav.first_4k import contracts
+
+        monkeypatch.setattr(sys.modules[__name__], "RunHeartbeat", contracts.RunHeartbeat)
+        monkeypatch.setattr(sys.modules[__name__], "resolve_configuration", contracts.resolve_configuration)
+
+
 def test_saved_values_replace_omitted_defaults_and_allow_invocation_limit():
     state = {}
     original = resolve_configuration(

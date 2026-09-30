@@ -16,6 +16,7 @@ from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResp
 from pixav.shared.exceptions import ResolveError
 from pixav.shared.metrics import get_metrics_output
 from pixav.strm_resolver.cache import CdnCache
+from pixav.strm_resolver.managed_routes import managed_stream, service
 
 router = APIRouter()
 
@@ -189,13 +190,19 @@ async def _resolve_cdn(request: Request, video_id: str) -> tuple[str, str]:
 @router.get("/resolve/{video_id}")
 async def resolve_video(video_id: str, request: Request) -> dict[str, str]:
     """Resolve video share URL to CDN URL."""
+    if _state(request, "managed_playback"):
+        service(request)
+        _parse_uuid(video_id)
+        return {"video_id": video_id, "stream_url": f"/stream/{video_id}"}
     cdn_url, source = await _resolve_cdn(request, video_id)
     return {"video_id": video_id, "cdn_url": cdn_url, "source": source}
 
 
-@router.get("/stream/{video_id}")
-async def stream_video(video_id: str, request: Request) -> RedirectResponse:
+@router.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
+async def stream_video(video_id: str, request: Request):
     """Resolve then redirect to CDN URL."""
+    if _state(request, "managed_playback"):
+        return await managed_stream(request, _parse_uuid(video_id))
     cdn_url, _source = await _resolve_cdn(request, video_id)
     return RedirectResponse(url=cdn_url, status_code=302)
 
@@ -227,6 +234,8 @@ async def local_video(video_id: str, request: Request) -> StreamingResponse:
     This is primarily intended for dev/test pipelines where the upload stage
     produces a synthetic share_url and strm_resolver points back to this host.
     """
+    if _state(request, "managed_playback"):
+        raise HTTPException(404, "legacy local playback is disabled")
     parsed_video_id = _parse_uuid(video_id)
     db_pool = _get_db_pool(request)
     row = await db_pool.fetchrow(

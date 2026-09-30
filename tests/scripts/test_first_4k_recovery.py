@@ -1,6 +1,7 @@
 """Simulated safe-boundary contracts; these are not live guest restart proof."""
 
 import copy
+import sys
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -11,6 +12,14 @@ import pytest
 from pixav.pixel_injector.canary import OWNER_LABEL, CanaryBlockedError
 from pixav.shared.models import VideoPart
 from scripts import first_4k_recovery as recovery
+
+
+@pytest.fixture(autouse=True, params=["legacy", "package"])
+def implementation(request, monkeypatch):
+    if request.param == "package":
+        from pixav.first_4k import recovery as package
+
+        monkeypatch.setattr(sys.modules[__name__], "recovery", package)
 
 
 @pytest.fixture
