@@ -100,7 +100,10 @@ def download_original(part: TransferableFile, root: Path) -> dict:
                 page = browser.new_page(accept_downloads=True)
                 page.goto(part.share_url, wait_until="domcontentloaded", timeout=60000)
                 page.get_by_role("button", name="More options", exact=True).click(timeout=30000)
-                with page.expect_download(timeout=120000) as pending:
+                # Photos may take several minutes to prepare an original ZIP,
+                # even after an item's backup is confirmed. Keep the start wait
+                # bounded separately from the six-hour process deadline.
+                with page.expect_download(timeout=600000) as pending:
                     page.get_by_role("menuitem", name="Download all", exact=True).click(timeout=30000)
                 pending.value.save_as(archive)
                 version = browser.version

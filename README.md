@@ -305,6 +305,8 @@ cache 與 `PIXAV_STORAGE_READBACK_DIR` 必須在同一檔案系統，因為重�
 
 managed prepare 使用 `PIXAV_MEDIA_SEGMENT_TARGET_BYTES`（預設 9,500,000,000，必須大於 0 且小於 10,000,000,000）。小檔整片上傳，大檔以既有 `PartMedia` stream copy 分段，先驗完整合併的影音 fingerprint 與逐段獨立解碼，再產生 `PreparedArtifact.segments` 交給同一 storage authority。source 與 transport target 綁定私有 intent；完成 receipt 以全段 size／hash 檢查恢復，不重跑 FFmpeg。writer lock 持有到工具停止，lease 取消會先停止自己的工具，再釋放鎖。此路徑遵循 `PreparationPolicy`，不改來源候選的 4K eligibility，也不改 first-4k CLI 的 4K 要求。
 
+Photos 原件回載的 browser navigation timeout 為 60 秒、選單操作 30 秒，ZIP 下載啟動等待最多 10 分鐘，整個隔離程序仍受 6 小時 deadline 約束。本輪實際分段分享頁可讀，但原 120 秒啟動等待連續逾時；較長的有界等待已在新 session 取得完整原件並核對 size／SHA-256。逾時仍交既有 infrastructure retry，不能當成遠端損壞、不能放行 DURABLE，也不回到 upload stage。
+
 managed authority 在 DURABLE 提交交易中，以 `durable_at + PIXAV_LOCAL_CLEANUP_SUCCESS_HOURS` 設定本地保留期限（預設 24 小時，至少 1 小時），保留既有較長期限；重新驗證不重設 durability 時間，也不縮短期限。`pixav-local://` 或沒有本地檔案的項目不排程。到期只是 cleanup 候選，仍須完整實播登錄、publication、exact-target 備份授權及所有 reader／execution 守衛通過。此排程不補寫已完成 execution 的歷史事實，既有缺期限資產須由後續 authority re-verification 收斂。
 
 ### 私有 Jellyfin 部署
