@@ -404,7 +404,7 @@ Maxwell 仍是唯一 authority，managed 排程以每秒短 tick 接續結果；
 
 此結果契約須成對部署 Maxwell／media-loader：核實實例、暫停派送、保存同實例 full／selected／queue 備份並驗證 restore，停止舊兩服務，使用相同 project/context 與 direct Compose 組合 `up -d --no-deps --no-build maxwell_core media_loader`，再以自己的 pause token 恢復。上傳有未知副作用時保留 storage operation。回退前停止派送並核對未消費 `pending` 結果；舊版不支援新結果契約，不可直接回退後消費，應使用相容版本。不刪 volumes、不重加未知 torrent／upload。本次沒有 schema migration。
 
-本輪完整套件 1,550 passed、2 skipped，coverage 82.17%；Ruff、Black、Isort、Mypy 與 base／prod／playback Compose 檢查通過。skipped 是未啟用的 live crawl 與 Redis restart；後者另在已核對身分的隔離實例實跑通過，前者保持 OPEN。實際 FFmpeg remux、分段往返與 qBittorrent ownership contract 已執行；這些結果不代表 production Golden Path 通過。既有 non-VPN Maxwell／media-loader 的部署與 retained upload operation 保留；本輪隔離驗收期間暫停正式 Maxwell／storage-worker／pixel-injector，避免指定帳號與 guest 同時被另一套 authority 使用。正式部署尚未切換至本輪工作區版本。備份在專案根目錄私有加密保存並已完成隔離 restore，**不是離機備份**；實播錄影登錄、安全刪原檔後再播、多段 client 版本補證與 24 小時 quota 仍 OPEN。
+本輪完整套件 1,550 passed、2 skipped，coverage 82.17%；Ruff、Black、Isort、Mypy 與 base／prod／playback Compose 檢查通過。skipped 是未啟用的 live crawl 與 Redis restart；後者另在已核對身分的隔離實例實跑通過，前者保持 OPEN。實際 FFmpeg remux、分段往返與 qBittorrent ownership contract 已執行；這些結果不代表 production Golden Path 通過。既有 non-VPN Maxwell／media-loader 的部署與 retained upload operation 保留；本輪隔離驗收期間暫停正式 Maxwell／storage-worker／pixel-injector，避免指定帳號與 guest 同時被另一套 authority 使用。正式部署尚未切換至本輪工作區版本。備份在專案根目錄私有加密保存並已完成隔離 restore，**不是離機備份**；實播錄影登錄、安全刪原檔後再播、24 小時 quota 仍 OPEN。
 
 ## 完整 BDD 情境索引
 
