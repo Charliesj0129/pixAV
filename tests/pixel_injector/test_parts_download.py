@@ -2,13 +2,13 @@ import hashlib
 import uuid
 import zipfile
 from types import ModuleType
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
 from pixav.media_loader.video_parts import PartMedia
 from pixav.pixel_injector import parts_download
-from pixav.pixel_injector.canary_download import extract_original
+from pixav.pixel_injector.canary_download import OriginalMismatchError, extract_original
 from pixav.pixel_injector.parts_download import prepare, quarantine
 from pixav.shared.models import VideoPart
 
@@ -237,3 +237,91 @@ def browser_stub(monkeypatch):
     module.sync_playwright = Mock()
     monkeypatch.setitem(__import__("sys").modules, "playwright.sync_api", module)
     return module
+
+
+@pytest.fixture
+def original_browser(browser_stub):
+    """The single-video action and accessible labels were verified live in Photos.
+
+    Exercise identity and byte publication using actual files; no preview or ZIP
+    result can satisfy this original-download boundary.
+    """
+    part = cached_part()
+    browser = MagicMock(version="verified-browser-version")
+    page = browser.new_page.return_value
+    videos = MagicMock()
+    videos.count.return_value = 1
+    download_action = MagicMock()
+    more_options = MagicMock()
+    more_options.click.side_effect = AssertionError("album and viewer menus are both visible during navigation")
+
+    def locate(role, *, name, **kwargs):
+        if role == "link":
+            assert name.match("Video - synthetic item")
+            return videos
+        if role == "button":
+            assert name in ("More options", "Open info")
+            return more_options
+        assert role == "menuitem"
+        assert name.fullmatch("Download - Shift+D") and name.fullmatch("Download")
+        assert not name.fullmatch("Download all")
+        return download_action
+
+    page.get_by_role.side_effect = locate
+    download = MagicMock(suggested_filename=part.filename)
+    download.save_as.side_effect = lambda path: path.write_bytes(b"original")
+    page.expect_download.return_value.__enter__.return_value.value = download
+    context = MagicMock()
+    context.__enter__.return_value.chromium.launch.return_value = browser
+    browser_stub.sync_playwright.return_value = context
+    return part, browser, videos, download
+
+
+def test_individual_original_publishes_only_complete_verified_bytes(tmp_path, original_browser, observed_stub):
+    import json
+
+    part, browser, _, download = original_browser
+    with patch("signal.alarm"):
+        report = parts_download.download_original(part, tmp_path)
+    assert (tmp_path / part.filename).read_bytes() == b"original"
+    assert report["observed"] == observed_stub
+    assert report["download_action"] == "single-video-original"
+    assert report["method"] == "photos-original-browser"
+    assert json.loads((tmp_path / (part.filename + ".json")).read_text()) == report
+    assert part.share_url not in json.dumps(report)
+    browser.close.assert_called_once()
+    download.save_as.assert_called_once()
+
+
+@pytest.mark.parametrize("data", [b"preview!", b"short", b"oversized"])
+def test_individual_download_rejects_rendition_and_wrong_size(tmp_path, original_browser, observed_stub, data):
+    part, browser, _, download = original_browser
+    download.save_as.side_effect = lambda path: path.write_bytes(data)
+    with patch("signal.alarm"), pytest.raises(OriginalMismatchError):
+        parts_download.download_original(part, tmp_path)
+    assert not (tmp_path / part.filename).exists()
+    assert not (tmp_path / (part.filename + ".json")).exists()
+    assert list(tmp_path.glob("browser-*/original.mp4"))[0].read_bytes() == data
+    browser.close.assert_called_once()
+
+
+def test_individual_download_rejects_unrelated_provider_name(tmp_path, original_browser, observed_stub):
+    part, browser, _, download = original_browser
+    download.suggested_filename = "unrelated.mp4"
+    with patch("signal.alarm"), pytest.raises(OriginalMismatchError, match="provider identity"):
+        parts_download.download_original(part, tmp_path)
+    assert not (tmp_path / part.filename).exists()
+    assert not (tmp_path / (part.filename + ".json")).exists()
+    assert list(tmp_path.glob("browser-*/original.mp4"))
+    browser.close.assert_called_once()
+
+
+def test_ambiguous_album_cannot_select_an_arbitrary_video(tmp_path, original_browser, observed_stub):
+    part, browser, videos, download = original_browser
+    videos.count.return_value = 2
+    with patch("signal.alarm"), pytest.raises(OriginalMismatchError, match="exactly one video"):
+        parts_download.download_original(part, tmp_path)
+    videos.click.assert_not_called()
+    download.save_as.assert_not_called()
+    assert not (tmp_path / part.filename).exists()
+    browser.close.assert_called_once()

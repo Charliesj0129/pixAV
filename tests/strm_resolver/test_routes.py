@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from pixav.strm_resolver.app import create_app
+from pixav.strm_resolver.app import create_app, lifespan
 
 
 @pytest.fixture
@@ -25,6 +25,43 @@ async def test_health_returns_ok(app):
         response = await client.get("/health")
         assert response.status_code == 200
         assert response.json() == {"status": "ok", "module": "strm_resolver"}
+
+
+@pytest.mark.parametrize("failure", [None, ConnectionError("dependency unavailable"), TimeoutError()])
+async def test_configured_health_rejects_unreadable_database(app, failure):
+    app.state.db_dsn = "configured-private-dsn"
+    if failure is not None:
+        app.state.db_pool = AsyncMock()
+        app.state.db_pool.fetchval.side_effect = failure
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "database unavailable"}
+
+
+async def test_configured_health_checks_database_before_reporting_ready(app):
+    app.state.db_dsn = "configured-private-dsn"
+    app.state.db_pool = AsyncMock()
+    app.state.db_pool.fetchval.return_value = 1
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/health")).status_code == 200
+    app.state.db_pool.fetchval.assert_awaited_once_with("SELECT 1")
+
+
+async def test_failed_database_startup_exits_and_closes_optional_redis(app, caplog):
+    app.state.db_dsn = "configured-private-dsn"
+    app.state.redis_url = "configured-private-redis"
+    redis = AsyncMock()
+    with (
+        patch("pixav.strm_resolver.app.aioredis.from_url", return_value=redis),
+        patch("pixav.strm_resolver.app.asyncpg.create_pool", side_effect=ConnectionError("private connection detail")),
+    ):
+        with pytest.raises(RuntimeError, match="PostgreSQL is required"):
+            async with lifespan(app):
+                pytest.fail("uninitialized playback must not become ready")
+    redis.aclose.assert_awaited_once()
+    assert app.state.db_pool is None
+    assert "private connection detail" not in caplog.text
 
 
 @pytest.mark.asyncio

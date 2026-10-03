@@ -23,6 +23,18 @@ from pixav.strm_resolver.routes import router
 logger = logging.getLogger(__name__)
 
 
+async def _open_database(dsn: str, redis_client: aioredis.Redis | None) -> asyncpg.Pool:
+    try:
+        return await asyncio.wait_for(asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5), timeout=10)
+    except Exception as exc:
+        logger.warning("postgres unavailable at startup (%s)", type(exc).__name__)
+        if redis_client is not None:
+            await redis_client.aclose()
+        # Let the container restart policy retry initialization. Serving with no
+        # pool would leave playback broken after PostgreSQL recovered.
+        raise RuntimeError("PostgreSQL is required for configured playback") from None
+
+
 def _start_janitor(app: FastAPI, db_pool: asyncpg.Pool | None) -> asyncio.Task[None] | None:
     """Eviction runs beside the readers it must wait for, so their locks are visible to it."""
     if db_pool is None or app.state.playback_cache_sweep_seconds <= 0:
@@ -42,7 +54,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     redis_url: str | None = app.state.redis_url
     db_dsn: str | None = app.state.db_dsn
     redis_client: aioredis.Redis | None = None
-    db_pool: asyncpg.Pool = None
+    db_pool: asyncpg.Pool | None = None
 
     # Initialize resources
     if redis_url:
@@ -55,12 +67,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.redis = None
 
     if db_dsn:
-        try:
-            db_pool = await asyncpg.create_pool(dsn=db_dsn, min_size=1, max_size=5)
-            app.state.db_pool = db_pool
-        except Exception as exc:
-            logger.warning("postgres unavailable at startup (%s)", type(exc).__name__)
-            app.state.db_pool = None
+        db_pool = await _open_database(db_dsn, redis_client)
+        app.state.db_pool = db_pool
 
     # Start resolver client
     if hasattr(app.state, "resolver"):

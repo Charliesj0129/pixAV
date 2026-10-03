@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from pixav.media_loader.preparation import inspect_media
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary, sha256
-from pixav.pixel_injector.canary_download import extract_original
+from pixav.pixel_injector.canary_download import OriginalMismatchError, copy_original
 from pixav.shared.models import VideoPart
 from pixav.shared.storage_models import TransferableFile
 
@@ -86,32 +87,44 @@ def download_original(part: TransferableFile, root: Path) -> dict:
     elif any(p.exists() or p.is_symlink() for p in (stray, receipt)):
         # A half-written extraction would make the retry fail its exclusive open.
         quarantine(root, stray, receipt)
-    # Browser download, save_as archive and extraction can coexist. Retained
+    # Browser download, save_as and verified publication can coexist. Retained
     # quarantine bytes are already charged to actual filesystem free space.
     require_space([(root, part.size_bytes * 3 + 16 * 1024**2)])
     with retained_temporary(prefix="browser-", directory=root) as temporary:
-        # Linux container deadline includes ZIP construction and save_as, which
+        # Linux container deadline includes provider preparation and save_as, which
         # Playwright's click/download-event timeout does not bound.
         signal.alarm(21600)
-        archive = Path(temporary) / "original.zip"
+        original = Path(temporary) / "original.mp4"
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(downloads_path=str(temporary))
             try:
                 page = browser.new_page(accept_downloads=True)
                 page.goto(part.share_url, wait_until="domcontentloaded", timeout=60000)
-                page.get_by_role("button", name="More options", exact=True).click(timeout=30000)
-                # Photos may take several minutes to prepare an original ZIP,
-                # even after an item's backup is confirmed. Keep the start wait
+                videos = page.get_by_role("link", name=re.compile(r"^Video -"))
+                videos.first.wait_for(state="visible", timeout=30000)
+                if videos.count() != 1:
+                    raise OriginalMismatchError("Photos album must contain exactly one video")
+                videos.click(timeout=30000)
+                # Wait for the viewer before opening its menu. During navigation
+                # the album's identically named menu still offers Download all.
+                page.get_by_role("button", name="Open info", exact=True).wait_for(state="visible", timeout=30000)
+                page.get_by_role("button", name="More options", exact=True).last.click(timeout=30000)
+                # The individual original action has been verified against full
+                # hashes. Download-all ZIP preparation can stall on a backed-up
+                # video; do not substitute the browser's playback rendition.
+                # Keep the start wait
                 # bounded separately from the six-hour process deadline.
                 with page.expect_download(timeout=600000) as pending:
-                    page.get_by_role("menuitem", name="Download all", exact=True).click(timeout=30000)
-                pending.value.save_as(archive)
+                    page.get_by_role("menuitem", name=re.compile(r"^Download(?: - Shift\+D)?$")).click(timeout=30000)
+                download = pending.value
+                download.save_as(original)
+                if download.suggested_filename != getattr(part, "provider_filename", part.filename):
+                    raise OriginalMismatchError("Photos original filename does not match provider identity")
                 version = browser.version
             finally:
                 browser.close()
-        extract_original(
-            archive, destination, getattr(part, "provider_filename", part.filename), part.size_bytes, part.sha256
-        )
+        with contained_file(Path(temporary), original).open("rb") as stream:
+            copy_original(stream, destination, part.size_bytes, part.sha256)
         signal.alarm(0)
     report = {
         "method": "photos-original-browser",
@@ -119,6 +132,7 @@ def download_original(part: TransferableFile, root: Path) -> dict:
         "sha256": part.sha256,
         "at": datetime.now(timezone.utc).isoformat(),
         "browser": version,
+        "download_action": "single-video-original",
         "observed": observed_media(destination),
     }
     # Crash after byte publication leaves an untrusted cached file, never inferred success.

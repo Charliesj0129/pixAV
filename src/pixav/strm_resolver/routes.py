@@ -271,12 +271,14 @@ async def local_video(video_id: str, request: Request) -> StreamingResponse:
 
 
 @router.get("/health")
-async def health_check() -> dict[str, str]:
-    """Health check endpoint.
-
-    Returns:
-        Status dictionary
-    """
+async def health_check(request: Request) -> dict[str, str]:
+    """Configured playback is healthy only while its facts are readable."""
+    if _state(request, "db_dsn"):
+        try:
+            pool = _get_db_pool(request)
+            await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout=2)
+        except Exception:
+            raise HTTPException(status_code=503, detail="database unavailable") from None
     return {"status": "ok", "module": "strm_resolver"}
 
 
