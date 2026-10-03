@@ -81,7 +81,7 @@ async def add_account(workflow, *, email=None, **columns):
     return account_id
 
 
-async def reach_upload(workflow):
+async def reach_upload(workflow, info_hash="a" * 40):
     """Drive one video from discovery to the point where storage takes over."""
     video = await workflow.pool.fetchval("INSERT INTO videos(title) VALUES('synthetic fixture') RETURNING id")
     candidates, _ = SourcePolicy().normalize_batch(
@@ -90,7 +90,7 @@ async def reach_upload(workflow):
                 "provider": "synthetic",
                 "provider_id": "one",
                 "title": "synthetic 1080p .mp4",
-                "magnet_uri": "magnet:?xt=urn:btih:" + "a" * 40,
+                "magnet_uri": "magnet:?xt=urn:btih:" + info_hash,
             }
         ]
     )
@@ -350,6 +350,80 @@ async def test_verified_cold_readback_commits_durability_bdd_052_054_056(workflo
     asset = await workflow.pool.fetchrow("SELECT * FROM remote_assets")
     assert asset["state"] == "DURABLE" and asset["durable_at"] is not None
     assert await workflow.pool.fetchval("SELECT state FROM executions") == "SUCCEEDED"
+    retention = await workflow.pool.fetchval("SELECT local_cleanup_after FROM videos")
+    from datetime import timedelta
+
+    assert retention == asset["durable_at"] + timedelta(hours=24)
+
+
+@pytest.mark.parametrize("case", ["configured", "longer", "local"])
+async def test_durable_retention_uses_db_clock_preserves_longer_deadlines_and_local_files_bdd_006(workflow, case):
+    from datetime import timedelta
+
+    video, _ = await reach_upload(workflow)
+    workflow.storage = StorageWorkflow(workflow.pool, local_retention_hours=37)
+    prior = None
+    if case == "longer":
+        prior = await workflow.pool.fetchval(
+            "UPDATE videos SET local_cleanup_after=now()+interval '7 days' WHERE id=$1 RETURNING local_cleanup_after",
+            video,
+        )
+    elif case == "local":
+        await workflow.pool.execute("UPDATE videos SET share_url='pixav-local://synthetic' WHERE id=$1", video)
+    await add_account(workflow)
+    upload = await workflow.next_activity()
+    await submit(workflow, report(upload, share_url=SHARE, evidence=BACKUP))
+    await workflow.consume_results()
+    assert await workflow.pool.fetchval("SELECT local_cleanup_after FROM videos") == prior
+    verify = await workflow.next_activity()
+    await submit(workflow, report(verify, evidence=cold_receipt()))
+    await workflow.consume_results()
+    assert await workflow.next_activity() is None
+
+    asset = await workflow.pool.fetchrow("SELECT durable_at FROM remote_assets")
+    expected = asset["durable_at"] + timedelta(hours=37) if case == "configured" else prior
+    assert await workflow.pool.fetchval("SELECT local_cleanup_after FROM videos") == expected
+
+    # A scheduled recheck must not restart the original local-retention clock.
+    await workflow.pool.execute("UPDATE remote_assets SET reverified_at=now()-interval '31 days'")
+    opened = await workflow.storage.reverify_due(interval_days=30)
+    assert len(opened) == 1
+    reverify = await workflow.next_activity()
+    assert reverify.stage == "verify"
+    await submit(workflow, report(reverify, evidence=cold_receipt()))
+    await workflow.consume_results()
+    assert await workflow.next_activity() is None
+    assert await workflow.pool.fetchval("SELECT local_cleanup_after FROM videos") == expected
+
+
+async def test_readback_retry_clears_current_failure_and_retains_attempt_history_bdd_032_054(workflow):
+    await reach_upload(workflow)
+    await add_account(workflow)
+    upload = await workflow.next_activity()
+    await submit(workflow, report(upload, share_url=SHARE, evidence=BACKUP))
+    await workflow.consume_results()
+    first = await workflow.next_activity()
+    await submit(workflow, report(first, "infrastructure", error_code="DEPENDENCY_FAILURE"))
+    await workflow.consume_results()
+    await workflow.retry_now(first.execution_id, operator="fixture-operator", reason="provider is available")
+
+    retry = await workflow.next_activity()
+    assert retry.execution_id == first.execution_id and retry.operation_id == first.operation_id
+    await submit(workflow, report(retry, evidence=cold_receipt()))
+    await workflow.consume_results()
+    assert await workflow.next_activity() is None
+
+    row = await workflow.pool.fetchrow("SELECT state,error_code,failure_class,blocked_reason FROM executions")
+    assert dict(row) == {"state": "SUCCEEDED", "error_code": None, "failure_class": None, "blocked_reason": None}
+    assert await workflow.pool.fetchval("SELECT state FROM remote_assets") == "DURABLE"
+    assert await workflow.pool.fetchval("SELECT count(*) FROM activity_attempts WHERE stage='upload'") == 1
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts") == SIZE
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT payload->>'error_code' FROM activity_results WHERE attempt_id=$1", first.attempt_id
+        )
+        == "DEPENDENCY_FAILURE"
+    )
 
 
 async def test_readback_without_independent_provenance_blocks_durability_bdd_052(workflow):
@@ -837,3 +911,145 @@ async def test_the_reverification_backlog_is_observable_bdd_055(workflow):
     assert await workflow.storage.due_reverification(interval_days=1) == 1
     assert await workflow.storage.due_reverification(interval_days=0) == 0, "0 disables re-verification"
     assert await workflow.storage.reverify_due(interval_days=0) == []
+
+
+@pytest.fixture
+async def reuse_pair(workflow):
+    import hashlib
+
+    await reach_upload(workflow)
+    account = await add_account(workflow)
+    source = await workflow.next_activity()
+    await submit(workflow, report(source, share_url=SHARE, evidence=BACKUP))
+    await workflow.consume_results()
+    verify = await workflow.next_activity()
+    await submit(workflow, report(verify, evidence=cold_receipt()))
+    await workflow.consume_results()
+    assert await workflow.next_activity() is None
+    await reach_upload(workflow, info_hash="b" * 40)
+    target = await workflow.next_activity()
+    await submit(workflow, report(target, outcome="user_action", error_code="USER_ACTION_REQUIRED"))
+    await workflow.consume_results()
+    at = await workflow.pool.fetchval("SELECT clock_timestamp()")
+    evidence = cold_receipt(
+        at=at.isoformat(),
+        cold_mounts=["/app/src:ro", "/work:rw"],
+        provider_asset_id=str(source.asset_id),
+        provider_segment_index=0,
+        provider_share_sha256=hashlib.sha256(SHARE.encode()).hexdigest(),
+    )
+    return source, target, account, evidence
+
+
+async def test_reconcile_existing_dry_run_idempotent_no_debit_then_fresh_verify(workflow, reuse_pair):
+    from pixav.shared.remote_assets import segment_from_row
+
+    source, target, account, evidence = reuse_pair
+    storage = StorageWorkflow(workflow.pool)
+    args = (target.execution_id, 0, source.asset_id, 0, evidence)
+    audit = {"operator": "fixture", "reason": "same original independently recovered"}
+    before = await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account)
+    assert await storage.reconcile_existing_segment(*args, **audit)
+    assert (
+        await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", target.execution_id)
+        == "USER_ACTION_REQUIRED"
+    )
+    assert await storage.reconcile_existing_segment(*args, **audit, apply=True)
+    assert not await storage.reconcile_existing_segment(*args, **audit, apply=True)
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == before
+    row = await workflow.pool.fetchrow("SELECT * FROM remote_asset_segments WHERE asset_id=$1", target.asset_id)
+    segment = segment_from_row(row)
+    assert segment.provider_filename != segment.filename
+    assert str(source.asset_id) in segment.provider_filename
+    request = await workflow.next_activity()
+    assert request.stage == "verify" and request.execution_id == target.execution_id
+    assert await workflow.pool.fetchval("SELECT state FROM remote_assets WHERE id=$1", target.asset_id) == "CREATED"
+    await submit(workflow, report(request, evidence=cold_receipt()))
+    await workflow.consume_results()
+    assert await workflow.next_activity() is None
+    assert await workflow.pool.fetchval("SELECT state FROM remote_assets WHERE id=$1", target.asset_id) == "DURABLE"
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == before
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT count(*) FROM activity_attempts WHERE execution_id=$1 AND stage='upload'", target.execution_id
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("defect", ["hash", "account", "source", "staging", "stale", "duration", "active"])
+async def test_reconcile_existing_refuses_unproven_or_active_target(workflow, reuse_pair, defect):
+    from datetime import timedelta
+
+    source, target, account, evidence = reuse_pair
+    if defect == "hash":
+        evidence["sha256"] = "d" * 64
+    elif defect == "account":
+        other = await add_account(workflow)
+        await workflow.pool.execute(
+            "UPDATE remote_asset_segments SET account_id=$2 WHERE asset_id=$1", target.asset_id, other
+        )
+    elif defect == "source":
+        evidence["provider_asset_id"] = str(uuid.uuid4())
+    elif defect == "staging":
+        evidence["cold_mounts"].append("/parts:ro")
+    elif defect == "stale":
+        now = await workflow.pool.fetchval("SELECT clock_timestamp()")
+        evidence["at"] = (now - timedelta(hours=2)).isoformat()
+    elif defect == "duration":
+        evidence["observed"]["duration_seconds"] = 2
+    elif defect == "active":
+        await workflow.pool.execute("UPDATE executions SET state='READY' WHERE id=$1", target.execution_id)
+    before = await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account)
+    with pytest.raises(ValueError):
+        await StorageWorkflow(workflow.pool).reconcile_existing_segment(
+            target.execution_id,
+            0,
+            source.asset_id,
+            0,
+            evidence,
+            operator="fixture",
+            reason="reviewed",
+            apply=True,
+        )
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == before
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT usage_counted_at FROM remote_asset_segments WHERE asset_id=$1", target.asset_id
+        )
+        is None
+    )
+
+
+async def test_failed_retrieval_can_only_resume_verification_with_new_proof(workflow, reuse_pair):
+    source, target, account, evidence = reuse_pair
+    storage = StorageWorkflow(workflow.pool)
+    await storage.reconcile_existing_segment(
+        target.execution_id, 0, source.asset_id, 0, evidence, operator="fixture", reason="reviewed", apply=True
+    )
+    verify = await workflow.next_activity()
+    await submit(workflow, report(verify, outcome="verification_failed", error_code="READBACK_FAILED"))
+    await workflow.consume_results()
+    proof = {**evidence, "provider_asset_id": str(target.asset_id)}
+    with pytest.raises(ValueError):
+        await storage.retry_verification(
+            target.execution_id, 0, {**proof, "sha256": "f" * 64}, operator="fixture", reason="fresh proof", apply=True
+        )
+    assert await storage.retry_verification(target.execution_id, 0, proof, operator="fixture", reason="fresh proof")
+    assert await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", target.execution_id) == "FAILED"
+    assert await storage.retry_verification(
+        target.execution_id, 0, proof, operator="fixture", reason="fresh proof", apply=True
+    )
+    retried = await workflow.next_activity()
+    assert retried.stage == "verify" and retried.operation_id == verify.operation_id
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == SIZE
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT count(*) FROM activity_attempts WHERE execution_id=$1 AND stage='upload'", target.execution_id
+        )
+        == 1
+    )
+    checkpoint = json.loads(
+        await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", target.execution_id)
+    )
+    assert checkpoint["verification_recoveries"][0]["previous_error_code"] == "READBACK_FAILED"

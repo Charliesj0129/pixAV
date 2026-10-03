@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +35,8 @@ class Settings(BaseSettings):
     qbit_extra_trackers: str = ""
     # Overall wall-clock budget for one torrent download.
     qbit_download_timeout_seconds: int = 3600
+    managed_download_poll_seconds: int = Field(default=15, ge=1, le=60)
+    managed_download_stall_seconds: int = Field(default=900, gt=0)
     # No-peer observation timeout; this is an infrastructure retry, not proof
     # that the source is unavailable.
     qbit_no_peer_grace_seconds: int = 300
@@ -84,6 +87,7 @@ class Settings(BaseSettings):
     sht_probe_health_port: int = 8004
     storage_worker_health_port: int = 8005
     vpn_sentinel_health_port: int = 8006
+    playback_worker_health_port: int = 8007
     health_host: str = "0.0.0.0"
     heartbeat_interval_seconds: int = 5
     heartbeat_stale_seconds: int = 120
@@ -97,6 +101,8 @@ class Settings(BaseSettings):
     # Durable remuxes must live outside qBittorrent's content paths so torrent
     # cleanup cannot also delete the artifact referenced by PostgreSQL.
     remux_dir: str = "./data/remuxed"
+    # Stream-copy segments must remain below the Photos 10 GB item ceiling.
+    media_segment_target_bytes: int = Field(default=9_500_000_000, gt=0, lt=10_000_000_000)
     download_min_free_bytes: int = 100 * 1024**3
     download_min_free_percent: float = 10.0
     local_cleanup_success_hours: int = 24
@@ -113,6 +119,10 @@ class Settings(BaseSettings):
     # its own path; only the link lives here.
     storage_staging_dir: str = "./data/storage-staging"
     storage_guest_data_dir: str = "./data/storage-guest"
+    storage_guest_cpus: float = Field(default=2.0, ge=0.1, le=8, allow_inf_nan=False)
+    storage_guest_memory_mb: int = Field(default=4096, ge=512, le=16384)
+    storage_tools_cpus: float = Field(default=1.0, ge=0.1, le=8, allow_inf_nan=False)
+    storage_tools_memory_mb: int = Field(default=2048, ge=512, le=16384)
     # The cold read-back container writes here. It stays under the project data
     # root so ``host_project_root`` can translate it for the Docker daemon.
     storage_readback_image: str = "pixav-storage-tools:1"
@@ -186,15 +196,36 @@ class Settings(BaseSettings):
     # re-verification entirely.
     remote_reverify_interval_days: int = 30
 
+    # Playback cache: verified objects the resolver serves to players. It is
+    # disposable -- PostgreSQL holds the facts and Photos holds the bytes -- so
+    # an object may be evicted once unread for the TTL, or sooner when the
+    # optional byte budget (0 = none) is exceeded. A reader holding an object
+    # always delays its eviction.
+    playback_cache_dir: str = "./data/playback-cache"
+    playback_cache_ttl_hours: int = 72
+    playback_cache_max_bytes: int = 0
+    playback_cache_sweep_seconds: int = 300
+    # How long one stream request waits for a cold object to be rebuilt before
+    # answering 503 with Retry-After. The rebuild continues either way.
+    playback_cold_wait_seconds: int = 60
+
     # Scheduling policy
     no_account_policy: str = "wait"
 
     # Rate limiting
     resolver_rate_limit_rpm: int = 60
     resolver_concurrency: int = 3
+    resolver_auth_required: bool = False
+    resolver_token_file: str = ""
 
-    # STRM
-    strm_output_dir: str = "./data/strm"
+    # Library projection. The media server scans <library_root>/library; every
+    # file there is derived and can be rebuilt from PostgreSQL and the retained
+    # artwork originals under artwork_root, which belong in backups. The .strm
+    # files point at resolver_base_url, so it must be the address players use.
+    # The authority reconciles every library_reconcile_seconds (0 disables).
+    library_root: str = "./data/library"
+    artwork_root: str = "./data/artwork"
+    library_reconcile_seconds: int = 300
     resolver_base_url: str = "http://localhost:8000"
 
     @property

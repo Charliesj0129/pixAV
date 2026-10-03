@@ -6,9 +6,11 @@ import uuid
 from unittest.mock import AsyncMock, call, patch
 
 from pixav.maxwell_core.worker import (
+    _open_playback_preparations,
     _open_reverifications,
     _publish_execution_metrics,
     _publish_queue_depths,
+    _reconcile_library,
     ingest_crawl_queue,
 )
 from pixav.shared import metrics
@@ -287,3 +289,45 @@ class TestReverificationBacklog:
         managed.storage.reverify_due.side_effect = RuntimeError("database is away")
 
         await _open_reverifications(managed, interval_days=30)
+
+
+class TestOpenPlaybackPreparations:
+    async def test_opens_preparations_and_exports_states_bdd_066(self) -> None:
+        managed = AsyncMock()
+        managed.playback.open_due.return_value = [uuid.uuid4()]
+        managed.playback.observe.return_value = {"READY": 2, "PREPARING": 1}
+
+        await _open_playback_preparations(managed)
+
+        managed.playback.open_due.assert_awaited_once()
+        series = _series("pixav_playable_assets")
+        assert series['pixav_playable_assets{state="READY"}'] == 2
+        assert series['pixav_playable_assets{state="STALE"}'] == 0
+
+    async def test_a_failure_never_breaks_the_tick(self) -> None:
+        managed = AsyncMock()
+        managed.playback.open_due.side_effect = RuntimeError("database is away")
+
+        await _open_playback_preparations(managed)
+
+    async def test_legacy_deployment_has_nothing_to_open(self) -> None:
+        await _open_playback_preparations(None)
+
+
+class TestReconcileLibrary:
+    async def test_runs_one_reconciliation_pass_bdd_103(self) -> None:
+        library = AsyncMock()
+        library.reconcile.return_value = {"published": 1, "unchanged": 4}
+
+        await _reconcile_library(library)
+
+        library.reconcile.assert_awaited_once()
+
+    async def test_a_failed_pass_never_breaks_the_tick(self) -> None:
+        library = AsyncMock()
+        library.reconcile.side_effect = OSError("library root is away")
+
+        await _reconcile_library(library)
+
+    async def test_disabled_reconciliation_does_nothing(self) -> None:
+        await _reconcile_library(None)

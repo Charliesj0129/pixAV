@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -132,9 +133,12 @@ async def test_the_container_mounts_only_the_work_dir_and_the_source_tree_bdd_05
     spec = client.created[0].spec
     assert spec["image"] == IMAGE
     assert spec["command"] == ["python", "-m", "pixav.pixel_injector.segment_readback"]
+    work = next(source for source, mount in spec["volumes"].items() if mount["bind"] == COLD_WORK_MOUNT)
+    assert Path(work).parent == tmp_path / "readback" / str(ASSET) / "3"
+    assert Path(work).name.startswith("session-")
     assert spec["volumes"] == {
         str(tmp_path / "src"): {"bind": COLD_SOURCE_MOUNT, "mode": "ro"},
-        str(tmp_path / "readback" / str(ASSET) / "3"): {"bind": COLD_WORK_MOUNT, "mode": "rw"},
+        work: {"bind": COLD_WORK_MOUNT, "mode": "rw"},
     }
     assert receipt["cold_inputs"] == "provider-only"
     assert receipt["sha256"] == DIGEST
@@ -217,7 +221,8 @@ async def test_the_work_dir_is_this_segment_s_own_and_starts_empty(tmp_path):
     await readback(tmp_path, client).read_back(segment())
 
     work = tmp_path / "readback" / str(ASSET) / "3"
-    assert work.is_dir() and list(work.iterdir()) == []
+    sessions = list(work.iterdir())
+    assert len(sessions) == 1 and sessions[0].is_dir() and list(sessions[0].iterdir()) == []
 
 
 async def test_bind_sources_are_translated_for_a_containerised_worker(tmp_path):
@@ -234,7 +239,38 @@ async def test_bind_sources_are_translated_for_a_containerised_worker(tmp_path):
 
     await subject.read_back(segment())
 
-    assert sorted(client.created[0].spec["volumes"]) == [
-        f"/home/operator/pixAV/readback/{ASSET}/3",
-        "/home/operator/pixAV/src",
-    ]
+    mounts = sorted(client.created[0].spec["volumes"])
+    assert mounts[0].startswith(f"/home/operator/pixAV/readback/{ASSET}/3/session-")
+    assert mounts[1] == "/home/operator/pixAV/src"
+
+
+def test_reconciled_provider_identity_survives_cold_manifest_without_recovery():
+    from pixav.shared.storage_models import ProviderSegmentIdentity
+
+    origin = uuid.uuid4()
+    item = segment().model_copy(update={"provider_identity": ProviderSegmentIdentity(asset_id=origin, segment_index=2)})
+    manifest = PhotosColdReadback.manifest(item)
+    restored = RemoteAssetSegment.model_validate(manifest["segment"])
+    assert restored.provider_filename == f"pixav-{origin}-part-2-{DIGEST[:16]}.mp4"
+    assert restored.filename == item.filename
+    assert restored.recovery == {} and restored.verification == {}
+
+
+async def test_repeated_readback_uses_distinct_empty_workspaces(tmp_path):
+    client = FakeClient()
+    adapter = readback(tmp_path, client)
+    await adapter.read_back(segment())
+    await adapter.read_back(segment())
+    work = [next(k for k, v in c.spec["volumes"].items() if v["bind"] == COLD_WORK_MOUNT) for c in client.created]
+    assert len(set(work)) == 2
+    assert all(not list(Path(path).iterdir()) for path in work)
+
+
+@pytest.mark.parametrize("error", ["TimeoutError", "ModuleNotFoundError", "PermissionError", "Error"])
+async def test_incomplete_browser_is_not_a_remote_integrity_verdict(tmp_path, error):
+    from pixav.shared.exceptions import ReadbackUnavailableError
+
+    client = FakeClient(output=json.dumps({"status": "BLOCKED", "error_type": error}).encode(), exit_code=2)
+    with pytest.raises(ReadbackUnavailableError) as caught:
+        await readback(tmp_path, client).read_back(segment())
+    assert caught.value.error_type == error

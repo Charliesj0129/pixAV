@@ -486,7 +486,7 @@ class TestSourceViability:
         respx.get("http://qbit:8080/api/v2/torrents/info").mock(
             return_value=httpx.Response(
                 200,
-                json=[{"progress": 0.0, "state": "metaDL", "num_seeds": 0, "num_complete": 2}],
+                json=[{"progress": 0.0, "state": "metaDL", "num_seeds": 0, "num_complete": 2, "availability": 1.4}],
             )
         )
 
@@ -644,3 +644,105 @@ class TestMagnetTrackers:
         sent = parse_qs(add.calls[0].request.content.decode())["urls"][0]
         # Announcing starts on add, rather than one announce cycle later.
         assert "tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce" in sent
+
+
+@respx.mock
+async def test_metadata_wait_with_reported_seed_is_bounded() -> None:
+    qbit = QBitClient(
+        "http://qbit:8080",
+        "admin",
+        "adminadmin",
+        download_dir="/downloads",
+        poll_interval=1,
+        no_peer_grace_seconds=2,
+    )
+    try:
+        respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=_modern_login_response())
+        respx.get("http://qbit:8080/api/v2/torrents/info").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "hash": "abc123",
+                        "state": "metaDL",
+                        "progress": 0.0,
+                        "total_size": -1,
+                        "availability": 0.0,
+                        "num_seeds": 0,
+                        "num_complete": 1,
+                    }
+                ],
+            )
+        )
+        delete_route = respx.post("http://qbit:8080/api/v2/torrents/delete").mock(
+            return_value=httpx.Response(200, text="Ok.")
+        )
+
+        with pytest.raises(DownloadError, match="did not acquire metadata") as exc:
+            await qbit.wait_complete("abc123", timeout=10)
+
+        assert not isinstance(exc.value, SourceUnavailableError)
+        assert delete_route.call_count == 1
+        form = parse_qs(delete_route.calls.last.request.content.decode())
+        assert form["hashes"] == ["abc123"]
+        assert form["deleteFiles"] == ["false"]
+    finally:
+        await qbit.aclose()
+
+
+@respx.mock
+async def test_transfer_snapshot_rates_do_not_export_provider_names_or_urls(client):
+    respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=_modern_login_response())
+    respx.get("http://qbit:8080/api/v2/torrents/info").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "hash": "a" * 40,
+                    "name": "private-name",
+                    "magnet_uri": "private-link",
+                    "dlspeed": 120,
+                    "upspeed": 40,
+                    "progress": 0.5,
+                    "total_size": 1000,
+                    "downloaded": 500,
+                }
+            ],
+        )
+    )
+    result = await client.transfer_snapshot()
+    assert result["download_Bps"] == 120 and result["torrent_upload_Bps"] == 40
+    assert "private-name" not in str(result) and "private-link" not in str(result)
+
+
+@respx.mock
+async def test_managed_check_is_bounded_pending_then_complete_without_readding(client):
+    from uuid import uuid4
+
+    operation = str(uuid4())
+    row = dict(hash="a" * 40, tags=f"pixav-operation-{operation}", progress=0.5, downloaded=50, state="downloading")
+    respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=_modern_login_response())
+    info = respx.get("http://qbit:8080/api/v2/torrents/info").mock(return_value=httpx.Response(200, json=[row]))
+    pending = await client.check_download("a" * 40, operation)
+    assert pending.progress == 0.5 and pending.artifact_path is None
+    assert info.call_count == 1
+    row.update(progress=1, downloaded=100, content_path="/downloads/synthetic.mp4", completion_on=1000)
+    info.mock(return_value=httpx.Response(200, json=[row]))
+    complete = await client.check_download("a" * 40, operation)
+    assert complete.artifact_path == "/downloads/synthetic.mp4"
+    assert complete.completed_at == 1000
+    assert info.call_count == 2
+
+
+@respx.mock
+@pytest.mark.parametrize("rows", [[], [{"hash": "a" * 40, "tags": "foreign"}]])
+async def test_managed_unknown_operation_never_adds_or_deletes(client, rows):
+    from uuid import uuid4
+
+    from pixav.shared.exceptions import TorrentOwnershipError
+
+    respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=_modern_login_response())
+    respx.get("http://qbit:8080/api/v2/torrents/info").mock(return_value=httpx.Response(200, json=rows))
+    with pytest.raises(TorrentOwnershipError):
+        await client.check_download("a" * 40, str(uuid4()))
+    assert all("/torrents/add" not in str(call.request.url) for call in respx.calls)

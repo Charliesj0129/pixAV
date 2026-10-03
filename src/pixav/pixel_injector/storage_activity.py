@@ -19,8 +19,8 @@ from uuid import UUID, uuid4
 import asyncpg
 from pydantic import ValidationError
 
-from pixav.pixel_injector.maestro_parts import UserActionRequiredError
-from pixav.shared.exceptions import RedroidError, UploadError, VerificationError
+from pixav.pixel_injector.canary import CanaryBlockedError
+from pixav.shared.exceptions import ReadbackUnavailableError, RedroidError, UploadError, VerificationError
 from pixav.shared.models import Account
 from pixav.shared.queue import TaskQueue
 from pixav.shared.remote_assets import expectation, segment_from_row
@@ -151,24 +151,34 @@ class StorageActivityWorker:
             if request.stage == "upload":
                 return await self._upload(request, segment, token, fields)
             return await self._verify(request.asset_id, segment, fields)
-        except UserActionRequiredError:
-            # Never resubmit credentials. An operator decides what happens next.
+        except CanaryBlockedError:
+            # Includes login challenges. The adapter requires UI/runtime review;
+            # infrastructure retries cannot resolve an unknown remote effect.
             return ActivityResult(**fields, outcome="user_action", error_code="USER_ACTION_REQUIRED")
         except QuotaExhaustedError:
             return ActivityResult(**fields, outcome="quota_exhausted", error_code="QUOTA_EXHAUSTED")
         except IntegrityError:
             return ActivityResult(**fields, outcome="verification_failed", error_code="INTEGRITY_MISMATCH")
+        except (ReadbackUnavailableError, asyncio.TimeoutError) as exc:
+            return self._unavailable(request, fields, exc)
         except VerificationError:
             return ActivityResult(**fields, outcome="verification_failed", error_code="READBACK_FAILED")
         except (RedroidError, UploadError):
             # The remote effect may or may not have landed. Saying "failed" here
             # would authorize a blind resend, so the authority reconciles first.
             return ActivityResult(**fields, outcome="unknown_effect", error_code="REMOTE_EFFECT_UNKNOWN")
-        except asyncio.TimeoutError:
-            return ActivityResult(**fields, outcome="unknown_effect", error_code="REMOTE_EFFECT_TIMEOUT")
         except Exception:
             logger.exception("storage activity failed")
             return ActivityResult(**fields, outcome="infrastructure", error_code="DEPENDENCY_FAILURE")
+
+    @staticmethod
+    def _unavailable(request, fields: dict, error: Exception) -> ActivityResult:
+        if request.stage != "verify":
+            return ActivityResult(**fields, outcome="unknown_effect", error_code="REMOTE_EFFECT_TIMEOUT")
+        kind = error.error_type if isinstance(error, ReadbackUnavailableError) else "TimeoutError"
+        return ActivityResult(
+            **fields, outcome="infrastructure", error_code="DEPENDENCY_FAILURE", evidence={"readback_dependency": kind}
+        )
 
     async def _upload(self, request, segment, token, fields) -> ActivityResult:
         if request.account_id is None:

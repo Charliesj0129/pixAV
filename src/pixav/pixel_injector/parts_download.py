@@ -106,7 +106,9 @@ def download_original(part: TransferableFile, root: Path) -> dict:
                 version = browser.version
             finally:
                 browser.close()
-        extract_original(archive, destination, part.filename, part.size_bytes, part.sha256)
+        extract_original(
+            archive, destination, getattr(part, "provider_filename", part.filename), part.size_bytes, part.sha256
+        )
         signal.alarm(0)
     report = {
         "method": "photos-original-browser",

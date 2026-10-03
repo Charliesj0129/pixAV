@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from pixav.media_loader.interfaces import DownloadObservation
 from pixav.shared.exceptions import DownloadError, SourceUnavailableError, TorrentOwnershipError
 from pixav.shared.watermark import is_watermark_info_hash
 
@@ -304,6 +305,11 @@ class QBitClient:
             raise DownloadError(f"qBittorrent health check request failed: {exc}") from exc
 
     async def reconcile_download(self, info_hash: str, operation_id: str) -> str:
+        """Legacy blocking adapter; managed workers use check_download."""
+        await self._owned_download(info_hash, operation_id, allow_add=True)
+        return await self.wait_complete(info_hash)
+
+    async def _owned_download(self, info_hash: str, operation_id: str, *, allow_add: bool) -> dict:
         """Reuse only a torrent bearing this operation's tag, without deleting files."""
         from uuid import UUID
 
@@ -324,6 +330,8 @@ class QBitClient:
             ):
                 raise TorrentOwnershipError("torrent ownership is unknown")
         else:
+            if not allow_add:
+                raise TorrentOwnershipError("previous download operation is absent; reconcile before adding")
             reject_watermark_hash(info_hash)
             response = await self._request(
                 "POST",
@@ -347,7 +355,39 @@ class QBitClient:
                 or tag not in str(rows[0].get("tags", "")).split(", ")
             ):
                 raise TorrentOwnershipError("torrent add result requires reconciliation")
-        return await self.wait_complete(info_hash)
+        return rows[0]
+
+    async def check_download(
+        self, info_hash: str, operation_id: str, *, allow_add: bool = False
+    ) -> DownloadObservation:
+        """Bound the whole operation, including login/add/reconciliation requests."""
+        return await asyncio.wait_for(self._check_download(info_hash, operation_id, allow_add=allow_add), timeout=30)
+
+    async def _check_download(self, info_hash: str, operation_id: str, *, allow_add: bool) -> DownloadObservation:
+        info = await self._owned_download(info_hash, operation_id, allow_add=allow_add)
+        await self._enforce_size_limit(info, info_hash)
+        observation = DownloadObservation(
+            progress=info.get("progress", 0),
+            downloaded_bytes=info.get("downloaded", 0),
+            metadata_pending=info.get("state") in {"metaDL", "forcedMetaDL"},
+        )
+        if info.get("state") in _TERMINAL_ERROR_STATES:
+            raise DownloadError("owned torrent is in an error state")
+        if observation.progress == 1:
+            path = info.get("content_path")
+            if not isinstance(path, str) or not path:
+                raise DownloadError("completed torrent lacks a content path")
+            path = map_download_path(
+                path, remote_root=self._download_dir, local_root=self._local_download_dir or self._download_dir
+            )
+            return DownloadObservation.model_validate(
+                {
+                    **observation.model_dump(),
+                    "artifact_path": path,
+                    "completed_at": info.get("completion_on") if info.get("completion_on", 0) > 0 else None,
+                }
+            )
+        return observation
 
     async def add_magnet(self, uri: str) -> str:
         """Add a magnet URI to qBittorrent and return the torrent hash.
@@ -437,6 +477,38 @@ class QBitClient:
             stopped.raise_for_status()
             raise DownloadError("torrent exceeds reserved disk budget; stopped without deleting files")
 
+    async def _advance_metadata_timeout(
+        self,
+        info: Mapping[str, Any],
+        torrent_hash: str,
+        stalled_for: int,
+    ) -> int:
+        """Bound metadata acquisition without declaring the source unavailable."""
+        metadata_pending = (
+            str(info.get("state") or "") == "metaDL"
+            and float(info.get("progress") or 0.0) == 0.0
+            and int(info.get("total_size") or -1) <= 0
+            and int(info.get("num_complete") or 0) > 0
+            and float(info.get("availability") or 0.0) <= 0.0
+        )
+        if not metadata_pending:
+            return 0
+
+        stalled_for += self._poll_interval
+        if stalled_for < self._no_peer_grace_seconds:
+            return stalled_for
+
+        try:
+            await self.delete_torrent(torrent_hash, delete_files=False)
+        except DownloadError as exc:
+            raise DownloadError(f"metadata timeout cleanup failed for {torrent_hash}: {exc}") from exc
+        raise DownloadError(
+            f"torrent {torrent_hash} did not acquire metadata within "
+            f"{self._no_peer_grace_seconds}s (state={info.get('state')}, "
+            f"num_complete={info.get('num_complete')}, "
+            f"availability={info.get('availability')})"
+        )
+
     async def wait_complete(self, torrent_hash: str, timeout: int | None = None) -> str:
         """Poll qBittorrent until the torrent finishes downloading.
 
@@ -451,6 +523,7 @@ class QBitClient:
         deadline = self._download_timeout if timeout is None else timeout
         elapsed = 0
         stalled_for = 0
+        metadata_stalled_for = 0
 
         try:
             while elapsed < deadline:
@@ -468,6 +541,11 @@ class QBitClient:
                 info = torrents[0]
                 await self._enforce_size_limit(info, torrent_hash)
                 verdict = classify_torrent_progress(info)
+
+                # A tracker can report a complete peer while qBittorrent still
+                # fails to acquire metadata. That is not proof the source is
+                # dead, but it must not hold one managed execution forever.
+                metadata_stalled_for = await self._advance_metadata_timeout(info, torrent_hash, metadata_stalled_for)
 
                 if verdict == "complete":
                     content_path = info.get("content_path", "")
@@ -550,6 +628,36 @@ class QBitClient:
         ):
             raise DownloadError("qBittorrent inventory contract failure")
         return {str(row["hash"]).lower() for row in rows}
+
+    async def transfer_snapshot(self) -> dict:
+        """Read measured transfer rates without names, URLs or credentials."""
+        response = await self._request("GET", "/api/v2/torrents/info")
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise DownloadError("qBittorrent transfer contract failure")
+        selected = []
+        for row in rows:
+            if not isinstance(row, dict) or not re.fullmatch(r"[a-fA-F0-9]{40}", str(row.get("hash", ""))):
+                raise DownloadError("qBittorrent transfer identity failure")
+            selected.append(
+                {
+                    "info_hash": row["hash"].lower(),
+                    "state": str(row.get("state", "unknown")),
+                    "progress": float(row.get("progress", 0)),
+                    "size_bytes": int(row.get("total_size", 0)),
+                    "downloaded_bytes": int(row.get("downloaded", 0)),
+                    "download_Bps": int(row.get("dlspeed", 0)),
+                    "torrent_upload_Bps": int(row.get("upspeed", 0)),
+                    "connected_seeds": int(row.get("num_seeds", 0)),
+                    "connected_peers": int(row.get("num_leechs", 0)),
+                }
+            )
+        return {
+            "torrents": selected,
+            "download_Bps": sum(r["download_Bps"] for r in selected),
+            "torrent_upload_Bps": sum(r["torrent_upload_Bps"] for r in selected),
+        }
 
     async def has_torrent(self, torrent_hash: str) -> bool:
         """Return whether qBittorrent still owns ``torrent_hash``.

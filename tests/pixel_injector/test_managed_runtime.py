@@ -289,3 +289,51 @@ async def test_a_retained_runtime_is_verified_against_the_same_host_paths(tmp_pa
 
     assert [item.id for item in first] == [item.id for item in second]
     assert len(client.created) == 2
+
+
+@pytest.mark.parametrize("missing_role", ["guest", "tools", "both"])
+@pytest.mark.parametrize("account", [ACCOUNT, OTHER_ACCOUNT])
+async def test_missing_recorded_runtime_stops_before_replacement(tmp_path, monkeypatch, missing_role, account):
+    pool, client = Pool(), Client()
+    subject = runtime(pool, client, tmp_path, monkeypatch)
+    guest, tools = await subject.acquire(ACCOUNT)
+    for item, role in ((guest, "guest"), (tools, "tools")):
+        if missing_role in (role, "both"):
+            del client.items[item.id]
+    with pytest.raises(CanaryBlockedError, match="recorded runtime missing"):
+        await subject.acquire(account)
+    assert pool.row["state"] == "REVIEW_REQUIRED"
+    assert pool.row["guest_id"] == guest.id
+    assert pool.row["tools_id"] == tools.id
+    assert len(client.created) == 2
+    assert not guest.removed and not tools.removed
+
+
+async def test_container_disappears_after_inventory_requires_review(tmp_path, monkeypatch):
+    from docker.errors import NotFound
+
+    pool, client = Pool(), Client()
+    subject = runtime(pool, client, tmp_path, monkeypatch)
+    await subject.acquire(ACCOUNT)
+
+    def missing(identifier):
+        raise NotFound("synthetic missing container")
+
+    monkeypatch.setattr(client.containers, "get", missing)
+    with pytest.raises(CanaryBlockedError, match="disappeared"):
+        await subject.acquire(ACCOUNT)
+    assert pool.row["state"] == "REVIEW_REQUIRED"
+    assert len(client.created) == 2
+
+
+async def test_guest_and_tools_receive_separate_resource_limits(tmp_path, monkeypatch):
+    pool, client = Pool(), Client()
+    subject = runtime(
+        pool, client, tmp_path, monkeypatch, guest_cpus=1.5, guest_memory_mb=3072, tools_cpus=0.5, tools_memory_mb=1536
+    )
+    await subject.acquire(ACCOUNT)
+    guest, tools = client.created
+    assert guest["nano_cpus"] == 1_500_000_000
+    assert guest["mem_limit"] == guest["memswap_limit"] == 3072 * 1024**2
+    assert tools["nano_cpus"] == 500_000_000
+    assert tools["mem_limit"] == tools["memswap_limit"] == 1536 * 1024**2

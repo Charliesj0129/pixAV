@@ -1,4 +1,4 @@
-"""Opt-in HTTP and VLC acceptance of the complete locally rebuilt movie."""
+"""Opt-in HTTP and VLC acceptance of complete movies and of the stable playback URL."""
 
 from __future__ import annotations
 
@@ -68,6 +68,91 @@ async def range_acceptance(base: str, video_id: str, local: Path) -> dict:
         "head": "PASS",
         "get": "PASS",
         "sha256": expected,
+        "size": size,
+    }
+
+
+def _windows(size: int) -> list[tuple[str, int, int]]:
+    middle, window = size // 2, 65536
+    return [
+        ("bytes=0-65535", 0, min(window - 1, size - 1)),
+        (f"bytes={middle}-{min(middle + window - 1, size - 1)}", middle, min(middle + window - 1, size - 1)),
+        ("bytes=-65536", max(0, size - window), size - 1),
+    ]
+
+
+async def _hash_complete_get(client: httpx.AsyncClient, url: str, size: int, captured: dict) -> str:
+    """Stream the whole object once, hashing it and keeping the bytes at each window."""
+    digest = hashlib.sha256()
+    received = 0
+    async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as response:
+        if response.status_code != 200 or int(response.headers.get("content-length", -1)) != size:
+            raise ValueError(f"HTTP complete GET contract failed ({response.status_code})")
+        async for chunk in response.aiter_bytes():
+            offset = received
+            received += len(chunk)
+            if received > size:
+                raise ValueError("HTTP complete GET size mismatch")
+            digest.update(chunk)
+            for (start, end), buffer in captured.items():
+                low, high = max(start, offset), min(end + 1, received)
+                if low < high:
+                    buffer += chunk[low - offset : high - offset]
+    if received != size:
+        raise ValueError("HTTP complete GET hash/size mismatch")
+    return digest.hexdigest()
+
+
+async def stable_acceptance(
+    base: str,
+    video_id: str,
+    expected_size: int,
+    expected_sha256: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    bearer_token: str | None = None,
+) -> dict:
+    """Accept the stable URL against the READY record alone, with no local original.
+
+    The complete GET is hashed while it streams, and the bytes at each range's
+    offsets are kept from that same body, so every range is compared with bytes
+    whose SHA-256 was just proven. A cold object answers 503; try again later.
+    """
+    url = f"{base}/stream/{video_id}"
+    size = expected_size
+    windows = _windows(size)
+    captured = {(start, end): bytearray() for _, start, end in windows}
+    headers = {"Authorization": "Bearer " + bearer_token} if bearer_token else {}
+    async with httpx.AsyncClient(timeout=60, follow_redirects=False, transport=transport, headers=headers) as client:
+        head = await client.head(url)
+        if (
+            head.status_code != 200
+            or head.content
+            or int(head.headers.get("content-length", -1)) != size
+            or head.headers.get("accept-ranges") != "bytes"
+        ):
+            raise ValueError("HTTP HEAD contract failed")
+        if await _hash_complete_get(client, url, size, captured) != expected_sha256:
+            raise ValueError("HTTP complete GET hash/size mismatch")
+
+        for header, start, end in windows:
+            response = await client.get(url, headers={"Range": header})
+            if (
+                response.status_code != 206
+                or response.headers.get("content-range") != f"bytes {start}-{end}/{size}"
+                or response.content != bytes(captured[(start, end)])
+            ):
+                raise ValueError("stable URL HTTP range mismatch")
+        invalid = await client.get(url, headers={"Range": f"bytes={size}-"})
+        if invalid.status_code != 416 or invalid.headers.get("content-range") != f"bytes */{size}":
+            raise ValueError("HTTP 416 contract failed")
+    return {
+        "head": "PASS",
+        "get": "PASS",
+        "range": "PASS",
+        "suffix": "PASS",
+        "416": "PASS",
+        "sha256": expected_sha256,
         "size": size,
     }
 

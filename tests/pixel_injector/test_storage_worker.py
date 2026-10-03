@@ -47,6 +47,10 @@ def test_omitting_a_runtime_uses_the_journalled_managed_guest(monkeypatch):
     assert worker.uploader is not None
     assert built["staging_root"] == Path(settings().storage_staging_dir)
     assert built["profile_name"] == settings().redroid_profile
+    assert built["guest_cpus"] == settings().storage_guest_cpus
+    assert built["guest_memory_mb"] == settings().storage_guest_memory_mb
+    assert built["tools_cpus"] == settings().storage_tools_cpus
+    assert built["tools_memory_mb"] == settings().storage_tools_memory_mb
 
 
 def test_the_readback_is_configured_with_its_own_isolated_image(monkeypatch):
@@ -66,3 +70,19 @@ def test_the_worker_owner_must_be_a_stable_uuid():
     with pytest.raises(RuntimeError, match="PIXAV_STORAGE_WORKER_OWNER"):
         _owner(settings(storage_worker_owner="not-a-uuid"))
     assert _owner(settings(storage_worker_owner=OWNER)) == OWNER
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"storage_guest_cpus": 0},
+        {"storage_tools_cpus": -1},
+        {"storage_guest_cpus": float("inf")},
+        {"storage_tools_memory_mb": 0},
+    ],
+)
+def test_runtime_resource_limits_cannot_be_unbounded(changes):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        settings(**changes)

@@ -59,16 +59,9 @@ services:
       retries: 5
 
   # ── Network isolation ──────────────────────────────────────────────────────
-  # Measured on this host 2026-08-30, directly from qBittorrent's own API:
-  #   connection_status = firewalled, dht_nodes = 0, total_peer_connections = 0
-  # while an HTTPS/443 tracker was simultaneously reporting `peers=9 seeds=2`.
-  # The network reaches trackers but blocks BitTorrent peer traffic itself, so
-  # this is not a privacy measure — without it no download can occur at all.
-  #
-  # Prevention over detection: gluetun's firewall drops every packet that is not
-  # inside the tunnel, so a VPN outage makes downloading structurally impossible
-  # rather than merely alarming. qBittorrent has no network namespace of its own
-  # and therefore no path around it.
+  # VPN mode requires a healthy tunnel before qBittorrent starts. Its shared
+  # namespace has no direct fallback. Validate firewall blocking on the actual
+  # host; historical peer observations are not evidence for a new deployment.
   gluetun:
     <<: [*restart, *logging]
     # Immutable image used by the Phase 0 kernel probe. The v3 tag alone moved
@@ -401,11 +394,20 @@ services:
       context: .
       dockerfile: docker/pixel-injector.Dockerfile
     container_name: pixav-storage-worker
+    cpus: ${PIXAV_STORAGE_WORKER_CPUS:-1.0}
+    mem_limit: ${PIXAV_STORAGE_WORKER_MEMORY:-1g}
+    memswap_limit: ${PIXAV_STORAGE_WORKER_MEMORY:-1g}
     command: ["uv", "run", "--no-sync", "python", "-m", "pixav.pixel_injector.storage_worker"]
     env_file:
       - .env
     environment:
       <<: *worker-net
+      # Sibling Android/Maestro containers are created by the runtime journal.
+      # Limiting this worker alone does not limit those sibling containers.
+      PIXAV_STORAGE_GUEST_CPUS: ${PIXAV_STORAGE_GUEST_CPUS:-2.0}
+      PIXAV_STORAGE_GUEST_MEMORY_MB: ${PIXAV_STORAGE_GUEST_MEMORY_MB:-4096}
+      PIXAV_STORAGE_TOOLS_CPUS: ${PIXAV_STORAGE_TOOLS_CPUS:-1.0}
+      PIXAV_STORAGE_TOOLS_MEMORY_MB: ${PIXAV_STORAGE_TOOLS_MEMORY_MB:-2048}
       PIXAV_DB_USER: ${PIXAV_ACTIVITY_DB_USER:-${PIXAV_DB_USER}}
       PIXAV_DB_PASSWORD: ${PIXAV_ACTIVITY_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
       # Bind-mount sources for the guest and tools containers are resolved by
@@ -436,6 +438,46 @@ services:
       retries: 3
       start_period: 60s
 
+  # Builds the verified playback cache from Google Photos. A materialization can
+  # take hours for a large film, so it has its own queue and process instead of
+  # blocking uploads; it holds the same restricted login as the storage worker.
+  playback_worker:
+    <<: [*restart, *logging]
+    build:
+      context: .
+      dockerfile: docker/pixel-injector.Dockerfile
+    container_name: pixav-playback-worker
+    command: ["uv", "run", "--no-sync", "python", "-m", "pixav.pixel_injector.playback_worker"]
+    env_file:
+      - .env
+    environment:
+      <<: *worker-net
+      PIXAV_DB_USER: ${PIXAV_ACTIVITY_DB_USER:-${PIXAV_DB_USER}}
+      PIXAV_DB_PASSWORD: ${PIXAV_ACTIVITY_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
+      PIXAV_HOST_PROJECT_ROOT: ${PIXAV_HOST_PROJECT_ROOT:-${PWD}}
+    ports:
+      - "${PIXAV_PLAYBACK_WORKER_HEALTH_PORT:-8007}:8007"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-back files, the work directories and the published cache objects
+      # must share one filesystem: reuse and publication are hard links.
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - pixav
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8007/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   strm_resolver:
     <<: [*restart, *logging]
     build:
@@ -446,6 +488,9 @@ services:
       - .env
     environment:
       <<: *worker-net
+      # Optional login that is a member of pixav_playback_reader only.
+      PIXAV_DB_USER: ${PIXAV_RESOLVER_DB_USER:-${PIXAV_DB_USER}}
+      PIXAV_DB_PASSWORD: ${PIXAV_RESOLVER_DB_PASSWORD:-${PIXAV_DB_PASSWORD}}
     ports:
       - "${PIXAV_RESOLVER_PORT:-8000}:8000"
     volumes:

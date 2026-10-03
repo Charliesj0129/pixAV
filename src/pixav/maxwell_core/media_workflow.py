@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
+from pixav.maxwell_core.playback_workflow import PlaybackWorkflow
 from pixav.maxwell_core.storage_workflow import StorageWorkflow
 from pixav.shared.retry import DEFAULT_RETRY_BACKOFF_SECONDS
 from pixav.shared.workflow import ActivityRequest, ActivityResult, Execution, ExecutionAttempt
@@ -46,9 +47,23 @@ class MediaWorkflow:
         cooldown_seconds: int = 21600,
         source_policy: SourcePolicy | None = None,
         max_retries: int = 6,
+        download_poll_seconds: int = 15,
+        download_timeout_seconds: int = 3600,
+        download_stall_seconds: int = 900,
+        download_metadata_seconds: int = 300,
+        local_retention_hours: int = 24,
     ) -> None:
         if not backoff or any(delay <= 0 for delay in backoff) or lease_seconds <= 0 or cooldown_seconds <= 0:
             raise ValueError("positive backoff, lease and cooldown required")
+        if (
+            not 1 <= download_poll_seconds <= 60
+            or min(download_timeout_seconds, download_stall_seconds, download_metadata_seconds) <= 0
+        ):
+            raise ValueError("bounded positive download polling and deadlines required")
+        self.download_poll_seconds = download_poll_seconds
+        self.download_timeout_seconds = download_timeout_seconds
+        self.download_stall_seconds = download_stall_seconds
+        self.download_metadata_seconds = download_metadata_seconds
         self.pool = pool
         self.backoff = backoff
         self.lease_seconds = lease_seconds
@@ -59,7 +74,9 @@ class MediaWorkflow:
         self.source_policy = source_policy or SourcePolicy()
         # Storage is a second set of stages on the same authority, never a
         # second authority: one writer of execution state, as the contract says.
-        self.storage = StorageWorkflow(pool, lease_seconds=lease_seconds)
+        self.storage = StorageWorkflow(pool, lease_seconds=lease_seconds, local_retention_hours=local_retention_hours)
+        # Playback preparation is a third set of stages on the same authority.
+        self.playback = PlaybackWorkflow(pool)
 
     async def admit(self, video_id: UUID, *, max_retries: int | None = None) -> UUID:
         """Create a stable domain task once; never adopt a live legacy task."""
@@ -218,8 +235,9 @@ class MediaWorkflow:
             generation = execution["generation"] + 1
             extra: dict = {}
             stage = execution["stage"]
-            if execution["stage"] in ("upload", "verify"):
-                resolved = await self.storage.next_activity(conn, execution, owner=owner, generation=generation)
+            if execution["stage"] in ("upload", "verify", "playback"):
+                owning = self.playback if execution["stage"] == "playback" else self.storage
+                resolved = await owning.next_activity(conn, execution, owner=owner, generation=generation)
                 if resolved is None:
                     return None
                 identity, extra = resolved
@@ -352,12 +370,16 @@ class MediaWorkflow:
     async def _transition(self, conn, execution, stage: str, result: ActivityResult) -> None:
         if stage in {"download", "prepare"} and result.outcome not in {
             "success",
+            *(("pending",) if stage == "download" else ()),
             "infrastructure",
             "unknown_effect",
             "invalid_media",
             *(("source_unavailable",) if stage == "download" else ()),
         }:
             raise ValueError("outcome is not valid for this media activity")
+        if result.outcome == "pending" and stage == "download":
+            await self._download_pending(conn, execution, result)
+            return
         if result.outcome != "success":
             await conn.execute(
                 """UPDATE executions SET failure_class=$2,error_code=$3,updated_at=now()
@@ -372,6 +394,8 @@ class MediaWorkflow:
             # Infrastructure and unknown-effect outcomes share the generic retry
             # policy below, but must not keep holding somebody else's account.
             await self.storage.release_lease(conn, execution["id"])
+        if stage == "playback" and await self.playback.apply_result(conn, execution, result):
+            return
         if result.outcome == "success":
             await self._success(conn, execution, stage, result)
         elif result.outcome == "source_unavailable":
@@ -408,11 +432,72 @@ class MediaWorkflow:
                 result.error_code,
             )
 
+    async def _download_pending(self, conn, execution, result: ActivityResult) -> None:
+        observation = result.download
+        if observation is None or observation.artifact_path is not None or observation.progress == 1:
+            raise ValueError("pending download requires incomplete observation")
+        clock = await conn.fetchrow(
+            "SELECT now() AS observed_at,created_at FROM operation_intents WHERE id=$1", result.operation_id
+        )
+        now = clock["observed_at"]
+        checkpoint = json.loads(execution["checkpoint"])
+        previous = checkpoint.get("download_poll", {})
+        if previous.get("operation_id") != str(result.operation_id):
+            previous = {}
+        started = clock["created_at"]
+        last_progress = datetime.fromisoformat(previous["last_progress_at"]) if previous else started
+        if observation.downloaded_bytes > previous.get("downloaded_bytes", 0):
+            last_progress = now
+        metadata_since = previous.get("metadata_since") if observation.metadata_pending else None
+        if observation.metadata_pending and metadata_since is None:
+            metadata_since = now.isoformat()
+        code = None
+        if (now - started).total_seconds() >= self.download_timeout_seconds:
+            code = "DOWNLOAD_DEADLINE_EXCEEDED"
+        elif (
+            metadata_since
+            and (now - datetime.fromisoformat(metadata_since)).total_seconds() >= self.download_metadata_seconds
+        ):
+            code = "DOWNLOAD_METADATA_TIMEOUT"
+        elif (now - last_progress).total_seconds() >= self.download_stall_seconds:
+            code = "DOWNLOAD_PROGRESS_TIMEOUT"
+        checkpoint["download_poll"] = {
+            "operation_id": str(result.operation_id),
+            "started_at": started.isoformat(),
+            "last_checked_at": now.isoformat(),
+            "last_progress_at": last_progress.isoformat(),
+            "metadata_since": metadata_since,
+            "progress": observation.progress,
+            "downloaded_bytes": max(observation.downloaded_bytes, previous.get("downloaded_bytes", 0)),
+        }
+        # Expired operations retain their torrent/files and require reconciliation;
+        # normal pending neither resets nor consumes the failure retry budget.
+        await conn.execute(
+            """UPDATE executions SET state=$2,checkpoint=$3::jsonb,
+            due_at=now()+make_interval(secs=>$4),owner=NULL,lease_until=NULL,
+            blocked_reason=$5,error_code=$5,failure_class=$6,updated_at=now() WHERE id=$1""",
+            execution["id"],
+            "USER_ACTION_REQUIRED" if code else "READY",
+            json.dumps(checkpoint),
+            self.download_poll_seconds,
+            code,
+            "download_timeout" if code else None,
+        )
+
     async def _success(self, conn, execution, stage: str, result: ActivityResult) -> None:
         if stage == "download":
             if not result.artifact_path:
                 raise ValueError("download success requires artifact path")
-            facts = json.dumps({"download_path": result.artifact_path, "download_operation": str(result.operation_id)})
+            checkpoint = json.loads(execution["checkpoint"])
+            now = await conn.fetchval("SELECT now()")
+            checkpoint.update(
+                download_path=result.artifact_path,
+                download_operation=str(result.operation_id),
+                download_confirmed_at=now.isoformat(),
+            )
+            if result.download and result.download.completed_at:
+                checkpoint["torrent_completed_at"] = result.download.completed_at
+            facts = json.dumps(checkpoint)
             await conn.execute(
                 """INSERT INTO workflow_artifacts(id,execution_id,operation_id,path,facts)
                 VALUES($1,$2,$3,$4,'{}') ON CONFLICT(operation_id) DO NOTHING""",
@@ -423,7 +508,7 @@ class MediaWorkflow:
             )
             await conn.execute(
                 """UPDATE executions SET stage='prepare',state='READY',checkpoint=$2::jsonb,
-                due_at=now(),owner=NULL,lease_until=NULL WHERE id=$1""",
+                due_at=now(),owner=NULL,lease_until=NULL,error_code=NULL,failure_class=NULL,updated_at=now() WHERE id=$1""",
                 result.execution_id,
                 facts,
             )
@@ -486,7 +571,7 @@ class MediaWorkflow:
         before creating any side effect; unknown ownership is a manual stop.
         """
         tag = await self.pool.execute("""UPDATE executions e SET
-            state=CASE WHEN stage IN ('download','prepare') AND recovery_count >= max_retries
+            state=CASE WHEN stage IN ('download','prepare','playback') AND recovery_count >= max_retries
                 THEN 'USER_ACTION_REQUIRED' ELSE 'READY' END,
             failure_class='lease_expired',error_code='ACTIVITY_LEASE_EXPIRED',
             recovery_count=recovery_count+1,owner=NULL,lease_until=NULL,due_at=now(),updated_at=now()
@@ -685,13 +770,15 @@ class MediaWorkflow:
                 video_id,
             )
 
-    async def tick(self, queue, *, download_paused: bool = False, storage_queue=None) -> int:
+    async def tick(self, queue, *, download_paused: bool = False, storage_queue=None, playback_queue=None) -> int:
         await self.consume_results()
         await self.recover_expired()
         request = await self.next_activity(download_paused=download_paused)
         if request is None:
             return 0
-        target = storage_queue if request.stage in ("upload", "verify") else queue
+        target = {"upload": storage_queue, "verify": storage_queue, "playback": playback_queue}.get(
+            request.stage, queue
+        )
         if target is None:
             raise RuntimeError("no transport configured for the resolved activity stage")
         await target.push(request.model_dump(mode="json"))

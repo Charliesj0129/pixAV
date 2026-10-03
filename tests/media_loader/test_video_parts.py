@@ -254,7 +254,7 @@ def test_real_four_k_stream_copy_round_trip(tmp_path):
             f"{Path('src').resolve()}:/app/src:ro",
             "-v",
             f"{cold}:/work",
-            "pixav-first-4k-tools:1",
+            os.getenv("PIXAV_READBACK_CONTRACT_IMAGE", "pixav-storage-tools:1"),
             "python",
             "-m",
             "pixav.pixel_injector.parts_download",

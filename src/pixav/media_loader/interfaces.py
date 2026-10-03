@@ -4,6 +4,19 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from pydantic import BaseModel, Field
+
+
+class DownloadObservation(BaseModel):
+    """Validated facts from one bounded owned-torrent check."""
+
+    model_config = {"frozen": True, "extra": "forbid"}
+    progress: float = Field(ge=0, le=1, allow_inf_nan=False)
+    downloaded_bytes: int = Field(ge=0)
+    metadata_pending: bool = False
+    artifact_path: str | None = None
+    completed_at: int | None = Field(default=None, gt=0)
+
 
 @runtime_checkable
 class TorrentClient(Protocol):
@@ -11,6 +24,12 @@ class TorrentClient(Protocol):
 
     async def health_check(self) -> str:
         """Return the server version after a connectivity check."""
+        ...
+
+    async def check_download(
+        self, info_hash: str, operation_id: str, *, allow_add: bool = False
+    ) -> DownloadObservation:
+        """Observe once; only a first persisted attempt may create a torrent."""
         ...
 
     async def reconcile_download(self, info_hash: str, operation_id: str) -> str:

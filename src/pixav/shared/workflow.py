@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from pixav.media_loader.interfaces import DownloadObservation
 from pixav.media_loader.preparation import PreparedArtifact
 
 
@@ -65,7 +66,7 @@ class ActivityRequest(BaseModel):
     operation_id: UUID
     owner: UUID
     generation: int = Field(gt=0)
-    stage: Literal["download", "prepare", "upload", "verify"]
+    stage: Literal["download", "prepare", "upload", "verify", "playback"]
     identity: str
     input_path: str | None = None
     # Storage addressing. The authority resolves which segment an activity acts
@@ -74,6 +75,10 @@ class ActivityRequest(BaseModel):
     segment_index: int | None = None
     account_id: UUID | None = None
     share_url: str | None = None
+    # Playback addressing: which playable object to materialize, and whether it
+    # is a first preparation or a rebuild that must reproduce recorded bytes.
+    playable_asset_id: UUID | None = None
+    purpose: Literal["prepare", "rebuild"] | None = None
 
 
 class ActivityResult(BaseModel):
@@ -87,6 +92,7 @@ class ActivityResult(BaseModel):
     generation: int = Field(gt=0)
     outcome: Literal[
         "success",
+        "pending",
         "infrastructure",
         "source_unavailable",
         "invalid_media",
@@ -95,12 +101,15 @@ class ActivityResult(BaseModel):
         "user_action",
         "verification_failed",
     ]
+    download: DownloadObservation | None = None
     artifact_path: str | None = None
     prepared: PreparedArtifact | None = None
     asset_id: UUID | None = None
     segment_index: int | None = None
     account_id: UUID | None = None
     share_url: str | None = None
+    playable_asset_id: UUID | None = None
+    purpose: Literal["prepare", "rebuild"] | None = None
     # Integrity receipts only. Never credentials, cookies or provider payloads.
     evidence: dict = Field(default_factory=dict)
     # A bounded code, never an exception message or raw external payload.
@@ -111,6 +120,9 @@ MANAGED_QUEUE = "pixav:media-activity:v1"
 # Storage activities ride their own transport so a media worker can never claim
 # an upload, and an upload worker can never claim a download.
 STORAGE_QUEUE = "pixav:storage-activity:v1"
+# Playback materialization can take as long as a full Photos download, so it
+# rides its own transport rather than queueing behind (or ahead of) uploads.
+PLAYBACK_QUEUE = "pixav:playback-activity:v1"
 
 
 async def require_workflow_role(pool, role: Literal["pixav_execution_authority", "pixav_activity_worker"]) -> None:

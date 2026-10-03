@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
+import secrets
+import stat
 import time
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +15,36 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
+
+
+class PlaybackAuthMiddleware(BaseHTTPMiddleware):
+    """Private deployments reread a service token on every media request.
+
+    A removed or malformed file fails closed; replacing its contents revokes
+    the old token for new requests without interrupting active readers.
+    """
+
+    def __init__(self, app, *, token_file: str) -> None:
+        super().__init__(app)
+        self._file = Path(token_file) if token_file else None
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        if not request.url.path.startswith(("/stream/", "/resolve/", "/local/")):
+            return await call_next(request)
+        try:
+            path = self._file
+            if path is None or path.is_symlink() or not path.is_file():
+                raise ValueError("unavailable token")
+            if stat.S_IMODE(path.stat().st_mode) != 0o600:
+                raise ValueError("unsafe token permissions")
+            token = path.read_text().strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", token):
+                raise ValueError("invalid token")
+        except (OSError, ValueError):
+            return JSONResponse(status_code=503, content={"detail": "private playback unavailable"})
+        if not secrets.compare_digest(request.headers.get("authorization", "").encode(), ("Bearer " + token).encode()):
+            return JSONResponse(status_code=401, content={"detail": "authentication required"})
+        return await call_next(request)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

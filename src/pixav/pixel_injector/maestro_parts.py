@@ -473,10 +473,29 @@ class MaestroPartUploader:
             "-p",
             PHOTOS_PACKAGE,
         )
-        await self.flow("item-details")
-        attrs = await self.attributes()
-        if any(a.get("text") == "About" for a in attrs):
-            await self.flow("about")
+        # VIEW starts video playback. Inspection needs metadata, so pause rather
+        # than repeatedly decoding a full-resolution clip in the software GPU.
+        # MEDIA_PAUSE is idempotent; PLAY_PAUSE could restart a paused clip.
+        await self.adb("shell", "input", "keyevent", "127")
+        try:
+            attrs = await self.attributes()
+            labels = {a.get("text", "") for a in attrs}
+            if {"Viewing full screen", "GOT IT"} <= labels:
+                # Android shows this one-time hint above the item controls.
+                await self.commands([{"tapOn": "GOT IT"}])
+                attrs = await self.attributes()
+            if not any(a.get("resource-id") == PHOTOS_PACKAGE + ":id/collapse_info_panel_fab" for a in attrs):
+                await self.flow("item-details")
+                attrs = await self.attributes()
+            if any(a.get("text") == "About" for a in attrs):
+                await self.flow("about")
+            await self.commands(
+                [{"scrollUntilVisible": {"element": "pixav-.*\\.mp4", "direction": "DOWN", "timeout": 20000}}]
+            )
+        finally:
+            # The player may initialize after VIEW accepted the first pause.
+            # Also pause when UI inspection fails and leaves the guest retained.
+            await self.adb("shell", "input", "keyevent", "127")
 
     async def clipboard(self) -> str | None:
         def read() -> str | None:
@@ -513,6 +532,9 @@ class MaestroPartVerifier:
         while time.monotonic() < deadline:
             await upload.open_details()
             attrs = await upload.attributes()
+            filenames = {a.get("text", "") for a in attrs if re.fullmatch(r"pixav-.*\.mp4", a.get("text", ""))}
+            if filenames and filenames != {upload.part.filename}:
+                raise CanaryBlockedError("Photos item identity mismatch; reconcile retained upload before resuming")
             streams = upload.part.media_info["streams"]
             video = next(s for s in streams if s["codec_type"] == "video")
             try:

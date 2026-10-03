@@ -168,10 +168,20 @@ def monitored_run(
 
 
 class PartMedia:
-    def __init__(self, ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", *, prefix: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        ffmpeg: str = "ffmpeg",
+        ffprobe: str = "ffprobe",
+        *,
+        prefix: list[str] | None = None,
+        minimum_dimensions: tuple[int, int] = (3840, 2160),
+    ) -> None:
+        if min(minimum_dimensions) < 1:
+            raise ValueError("invalid minimum dimensions")
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.prefix = prefix or []
+        self.minimum_dimensions = minimum_dimensions
         self.check: Callable[[], None] | None = None
 
     @staticmethod
@@ -235,8 +245,9 @@ class PartMedia:
         streams = raw["streams"]
         videos = [s for s in streams if s["codec_type"] == "video"]
         audio = [s for s in streams if s["codec_type"] == "audio"]
-        if len(videos) != 1 or videos[0].get("width", 0) < 3840 or videos[0].get("height", 0) < 2160:
-            raise IncompatibleMediaError("source must contain one video at least 3840x2160")
+        width, height = self.minimum_dimensions
+        if len(videos) != 1 or videos[0].get("width", 0) < width or videos[0].get("height", 0) < height:
+            raise IncompatibleMediaError(f"source must contain one video at least {width}x{height}")
         if not audio:
             raise IncompatibleMediaError("complete film requires audio")
         if any(s["codec_type"] not in {"video", "audio"} for s in streams):

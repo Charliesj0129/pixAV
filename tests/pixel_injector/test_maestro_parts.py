@@ -184,6 +184,25 @@ async def test_exact_backup_is_required_before_sharing(upload):
         await verifier.wait_for_share_url(session, timeout=0)
 
 
+@pytest.mark.parametrize("include_expected", [False, True])
+async def test_other_photos_filename_stops_without_retry_or_share(upload, include_expected):
+    u, session, _ = upload
+    u.open_details = AsyncMock()
+    texts = ["pixav-other-part-0-samehash.mp4", "Backed up", "Original quality", "3840 x 2160"]
+    if include_expected:
+        texts.append(u.part.filename)
+    u.attributes = AsyncMock(return_value=[{"text": text} for text in texts])
+    verifier = MaestroPartVerifier(u)
+    verifier._share = AsyncMock()
+    with patch("pixav.pixel_injector.maestro_parts.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with pytest.raises(CanaryBlockedError, match="identity mismatch"):
+            await verifier.wait_for_share_url(session)
+    sleep.assert_not_awaited()
+    verifier._share.assert_not_awaited()
+    u.save.assert_not_awaited()
+    assert not u.backup_evidence
+
+
 async def test_long_guest_effect_stops_owned_writers_after_guard_failure(upload):
     import threading
 
@@ -577,3 +596,65 @@ def test_the_contacts_dialog_is_refused_in_both_of_its_shapes(name):
     # away is what is actually asserted.
     assert flow.count("optional: true") == 2
     assert 'assertNotVisible: "Allow Photos to access your contacts?"' in flow
+
+
+async def test_details_pause_playback_without_toggling_or_publishing(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(return_value=[{"text": "About"}])
+    await u.open_details()
+    calls = [call.args for call in u.adb.await_args_list]
+    assert "content://media/external/video/media/123" in calls[0]
+    assert calls[1] == ("shell", "input", "keyevent", "127")
+    assert calls[2] == ("shell", "input", "keyevent", "127")
+    assert len(calls) == 3
+    assert [call.args for call in u.flow.await_args_list] == [("item-details",), ("about",)]
+    u.save.assert_not_awaited()
+
+
+async def test_details_already_open_after_view_does_not_toggle_menu(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(
+        return_value=[{"resource-id": "com.google.android.apps.photos:id/collapse_info_panel_fab"}]
+    )
+    await u.open_details()
+    u.flow.assert_not_awaited()
+    u.commands.assert_awaited_once_with(
+        [{"scrollUntilVisible": {"element": "pixav-.*\\.mp4", "direction": "DOWN", "timeout": 20000}}]
+    )
+    u.save.assert_not_awaited()
+
+
+async def test_details_failure_still_pauses_retained_player(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(side_effect=CanaryBlockedError("UI unavailable"))
+    with pytest.raises(CanaryBlockedError, match="UI unavailable"):
+        await u.open_details()
+    assert u.adb.await_args.args == ("shell", "input", "keyevent", "127")
+    assert u.adb.await_count == 3
+    u.save.assert_not_awaited()
+
+
+async def test_details_dismisses_only_the_observed_fullscreen_tutorial(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(
+        side_effect=[
+            [{"text": "Viewing full screen"}, {"text": "GOT IT"}],
+            [{"resource-id": "com.google.android.apps.photos:id/collapse_info_panel_fab"}],
+        ]
+    )
+    await u.open_details()
+    assert u.commands.await_args_list[0].args == ([{"tapOn": "GOT IT"}],)
+    u.flow.assert_not_awaited()
+    u.save.assert_not_awaited()
+
+
+async def test_details_does_not_acknowledge_an_unidentified_dialog(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(return_value=[{"text": "GOT IT"}])
+    await u.open_details()
+    assert all(call.args != ([{"tapOn": "GOT IT"}],) for call in u.commands.await_args_list)

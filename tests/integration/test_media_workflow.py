@@ -12,6 +12,7 @@ import asyncpg
 import pytest
 
 from pixav.maxwell_core.media_workflow import MediaWorkflow
+from pixav.media_loader.interfaces import DownloadObservation
 from pixav.media_loader.preparation import MediaFacts, PreparedArtifact
 from pixav.shared.workflow import ActivityResult
 from pixav.sht_probe.policy import SourcePolicy
@@ -218,7 +219,7 @@ async def test_redis_duplicate_ack_loss_and_missing_dispatch(workflow, integrati
     media = tmp_path / "synthetic.mkv"
     media.write_bytes(b"downloaded artifact")
     client = AsyncMock()
-    client.reconcile_download.return_value = str(media)
+    client.check_download.return_value = DownloadObservation(progress=1, downloaded_bytes=16, artifact_path=str(media))
     worker = MediaActivityWorker(workflow.pool, client, AsyncMock(), output_dir=str(tmp_path))
     await queue.push(request.model_dump(mode="json"))
     await worker.run_one(queue)
@@ -226,7 +227,7 @@ async def test_redis_duplicate_ack_loss_and_missing_dispatch(workflow, integrati
     # Simulate ACK loss by redelivering the original immutable envelope.
     await queue.push(request.model_dump(mode="json"))
     await worker.run_one(queue)
-    client.reconcile_download.assert_awaited_once()
+    client.check_download.assert_awaited_once()
     assert await workflow.consume_results() == 1
     prepared = await workflow.next_activity()
     await queue.push(prepared.model_dump(mode="json"))
@@ -603,3 +604,83 @@ async def test_an_infrastructure_failure_never_poisons_the_candidate_bdd_015_032
     # The same candidate is still what the next attempt reaches for.
     await workflow.pool.execute("UPDATE executions SET due_at=now()-interval '1 second'")
     assert (await workflow.next_activity()).identity == request.identity
+
+
+async def test_pending_download_releases_stage_without_retry_and_completed_peer_advances(workflow):
+    _, first_task = await seed(workflow)
+    slow = await workflow.next_activity()
+    _, second_task = await seed(workflow)
+    pending = report(slow, "pending", download=DownloadObservation(progress=0.2, downloaded_bytes=20))
+    assert await submit(workflow, pending)
+    await workflow.consume_results()
+    row = await workflow.pool.fetchrow("SELECT * FROM executions WHERE task_id=$1", first_task)
+    assert row["state"] == "READY" and row["infrastructure_retries"] == 0
+    checkpoint = json.loads(row["checkpoint"])["download_poll"]
+    complete = await workflow.next_activity()
+    assert complete.task_id == second_task
+    assert await submit(workflow, report(complete, artifact_path="/staging/synthetic.mp4"))
+    await workflow.consume_results()
+    prepare = await workflow.next_activity()
+    assert prepare.task_id == second_task and prepare.stage == "prepare"
+    await workflow.pool.execute("UPDATE executions SET due_at=now() WHERE task_id=$1", first_task)
+    resumed = await workflow.next_activity()
+    assert resumed.operation_id == slow.operation_id
+    assert resumed.stage == "download"  # preparation does not occupy its capacity
+    assert not await submit(workflow, pending)  # old generation is inert
+    assert await submit(
+        workflow, report(resumed, "pending", download=DownloadObservation(progress=0.2, downloaded_bytes=20))
+    )
+    await workflow.consume_results()
+    row = await workflow.pool.fetchrow("SELECT * FROM executions WHERE task_id=$1", first_task)
+    assert row["infrastructure_retries"] == 0
+    assert json.loads(row["checkpoint"])["download_poll"]["last_progress_at"] == checkpoint["last_progress_at"]
+    assert await workflow.pool.fetchval("SELECT count(*) FROM workflow_artifacts") == 1
+
+
+@pytest.mark.parametrize(
+    "limit,code", [("deadline", "DOWNLOAD_DEADLINE_EXCEEDED"), ("stall", "DOWNLOAD_PROGRESS_TIMEOUT")]
+)
+async def test_poll_deadlines_are_persisted_not_reset_by_worker_restart(workflow, limit, code):
+    await seed(workflow)
+    request = await workflow.next_activity()
+    if limit == "deadline":
+        await workflow.pool.execute(
+            "UPDATE operation_intents SET created_at=now()-interval '2 hours' WHERE id=$1", request.operation_id
+        )
+    else:
+        await workflow.pool.execute(
+            "UPDATE operation_intents SET created_at=now()-interval '20 minutes' WHERE id=$1", request.operation_id
+        )
+    assert await submit(
+        workflow, report(request, "pending", download=DownloadObservation(progress=0, downloaded_bytes=0))
+    )
+    await workflow.consume_results()
+    row = await workflow.pool.fetchrow(
+        "SELECT state,error_code,infrastructure_retries FROM executions WHERE id=$1", request.execution_id
+    )
+    assert row["state"] == "USER_ACTION_REQUIRED" and row["error_code"] == code
+    assert row["infrastructure_retries"] == 0
+    assert await workflow.next_activity() is None
+
+
+async def test_metadata_wait_survives_poll_generation_and_expires_without_retry(workflow):
+    await seed(workflow)
+    first = await workflow.next_activity()
+    observation = DownloadObservation(progress=0, downloaded_bytes=0, metadata_pending=True)
+    assert await submit(workflow, report(first, "pending", download=observation))
+    await workflow.consume_results()
+    await workflow.pool.execute(
+        """UPDATE executions SET due_at=now(),checkpoint=jsonb_set(checkpoint,
+        '{download_poll,metadata_since}',to_jsonb($2::text)) WHERE id=$1""",
+        first.execution_id,
+        (await workflow.pool.fetchval("SELECT now()-interval '6 minutes'")).isoformat(),
+    )
+    resumed = await workflow.next_activity()
+    assert resumed.operation_id == first.operation_id
+    assert await submit(workflow, report(resumed, "pending", download=observation))
+    await workflow.consume_results()
+    row = await workflow.pool.fetchrow(
+        "SELECT state,error_code,infrastructure_retries FROM executions WHERE id=$1", first.execution_id
+    )
+    assert row["state"] == "USER_ACTION_REQUIRED"
+    assert row["error_code"] == "DOWNLOAD_METADATA_TIMEOUT" and row["infrastructure_retries"] == 0

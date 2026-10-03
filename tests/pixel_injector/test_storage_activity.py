@@ -398,3 +398,30 @@ async def test_claimed_activity_reports_its_result_bdd_046():
     assert len(pool.reported) == 1
     assert SHARE in pool.reported[0]
     assert queue.acked == ["receipt-1"]
+
+
+async def test_retained_runtime_or_ui_review_stops_automatic_retry():
+    from pixav.pixel_injector.canary import CanaryBlockedError
+
+    pool = FakePool(segment_row(recovery={"backup_intent": True, "media_id": "123"}))
+    activity = worker(pool, uploader=Uploader(CanaryBlockedError("private diagnostic")))
+    result = await activity.execute(request(), uuid.uuid4())
+    assert result.outcome == "user_action"
+    assert result.error_code == "USER_ACTION_REQUIRED"
+    assert "private diagnostic" not in result.model_dump_json()
+    assert pool._row["recovery"] == {"backup_intent": True, "media_id": "123"}
+
+
+@pytest.mark.parametrize("error", ["TimeoutError", "ModuleNotFoundError"])
+async def test_readonly_dependency_failure_is_retryable_not_remote_loss(error):
+    from unittest.mock import AsyncMock
+
+    from pixav.shared.exceptions import ReadbackUnavailableError
+
+    reader = Readback({})
+    reader.read_back = AsyncMock(side_effect=ReadbackUnavailableError(error))
+    result = await worker(FakePool(segment_row(share_url=SHARE)), readback=reader).execute(
+        request(stage="verify"), uuid.uuid4()
+    )
+    assert result.outcome == "infrastructure"
+    assert result.evidence == {"readback_dependency": error}

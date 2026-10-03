@@ -9,9 +9,11 @@ means an independent cold read-back satisfied a recorded policy version.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
+from datetime import datetime, timedelta
 from typing import Any
 
 import asyncpg
@@ -24,8 +26,8 @@ from pixav.shared.metrics import (
     record_remote_upload_failure,
     record_remote_verification_failure,
 )
-from pixav.shared.remote_assets import RemoteAssetRepository
-from pixav.shared.storage_models import IntegrityError, current_policy
+from pixav.shared.remote_assets import RemoteAssetRepository, expectation, segment_from_row
+from pixav.shared.storage_models import IntegrityError, ProviderSegmentIdentity, current_policy, policy_for
 from pixav.shared.workflow import ActivityResult
 
 logger = logging.getLogger(__name__)
@@ -43,9 +45,12 @@ OPERATOR_CONFIRMED_LOSS = "OPERATOR_CONFIRMED"
 class StorageWorkflow:
     """Account leasing, segment sequencing and durability commits."""
 
-    def __init__(self, pool: asyncpg.Pool, *, lease_seconds: int = 120) -> None:
+    def __init__(self, pool: asyncpg.Pool, *, lease_seconds: int = 120, local_retention_hours: int = 24) -> None:
+        if local_retention_hours < 1:
+            raise ValueError("local retention must be at least one hour")
         self.pool = pool
         self.lease_seconds = lease_seconds
+        self.local_retention_hours = local_retention_hours
         self.assets = RemoteAssetRepository(pool)
         self.policy = current_policy()
 
@@ -245,11 +250,22 @@ class StorageWorkflow:
             record_remote_verification_failure("REMOTE_MANIFEST_INCONSISTENT")
             return
         await conn.execute(
-            """UPDATE executions SET state='SUCCEEDED',owner=NULL,lease_until=NULL,updated_at=now()
+            """UPDATE executions SET state='SUCCEEDED',error_code=NULL,failure_class=NULL,
+            blocked_reason=NULL,owner=NULL,lease_until=NULL,updated_at=now()
             WHERE id=$1""",
             execution["id"],
         )
         await conn.execute("UPDATE tasks SET state='complete',updated_at=now() WHERE id=$1", execution["task_id"])
+        # Durability starts retention; it does not authorize deletion. Reverification
+        # keeps the original deadline and every janitor gate still has to hold.
+        await conn.execute(
+            """UPDATE videos v SET local_cleanup_after=GREATEST(v.local_cleanup_after,
+                a.durable_at + make_interval(hours => $2)),updated_at=now()
+            FROM remote_assets a WHERE a.id=$1 AND a.video_id=v.id AND a.state='DURABLE'
+              AND v.local_path IS NOT NULL AND COALESCE(v.share_url,'') NOT LIKE 'pixav-local://%'""",
+            asset_id,
+            self.local_retention_hours,
+        )
         await self.release_lease(conn, execution["id"])
         if promoted:
             record_remote_asset_durable()
@@ -268,6 +284,214 @@ class StorageWorkflow:
     # be an instruction to redo an external side effect blindly.
     RESUMABLE_RECOVERY = ("user_action", "email_submitted", "password_submitted")
     RESUMABLE_OPERATIONS = ("credential_email", "credential_password")
+
+    async def reconcile_existing_segment(
+        self,
+        execution_id: uuid.UUID,
+        segment_index: int,
+        source_asset_id: uuid.UUID,
+        source_segment_index: int,
+        evidence: dict,
+        *,
+        operator: str,
+        reason: str,
+        apply: bool = False,
+    ) -> bool:
+        """Audited reuse of a cold-proven original; never upload or debit again.
+
+        The held operation and all recovery facts survive. Only the existing
+        authority dispatches the subsequent independent verification. A donor's
+        old durability policy is never used to promote the receiving asset.
+        """
+        if not operator.strip() or not reason.strip():
+            raise ValueError("reconciliation requires operator and reason")
+        async with self.pool.acquire() as conn, conn.transaction():
+            execution = await conn.fetchrow("SELECT * FROM executions WHERE id=$1 FOR UPDATE", execution_id)
+            if execution is None:
+                raise ValueError("unknown execution")
+            checkpoint = json.loads(execution["checkpoint"])
+            asset_id = uuid.UUID(checkpoint["asset_id"])
+            if asset_id == source_asset_id:
+                raise ValueError("reconciliation requires a different source asset")
+            assets = await conn.fetch(
+                "SELECT * FROM remote_assets WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                [asset_id, source_asset_id],
+            )
+            target_asset = next((row for row in assets if row["id"] == asset_id), None)
+            source_asset = next((row for row in assets if row["id"] == source_asset_id), None)
+            if target_asset is None or source_asset is None or source_asset["state"] != "DURABLE":
+                raise ValueError("source must be an existing durable asset")
+            rows = await conn.fetch(
+                """SELECT * FROM remote_asset_segments WHERE
+                (asset_id=$1 AND segment_index=$2) OR (asset_id=$3 AND segment_index=$4)
+                ORDER BY asset_id,segment_index FOR UPDATE""",
+                asset_id,
+                segment_index,
+                source_asset_id,
+                source_segment_index,
+            )
+            if len(rows) != 2:
+                raise ValueError("both exact segments must exist")
+            target = segment_from_row(next(row for row in rows if row["asset_id"] == asset_id))
+            source = segment_from_row(next(row for row in rows if row["asset_id"] == source_asset_id))
+            previous = target.verification.get("reconciled_from", {})
+            if previous:
+                if (
+                    previous.get("asset_id") == str(source_asset_id)
+                    and previous.get("segment_index") == source_segment_index
+                ):
+                    return False
+                raise ValueError("segment already reconciled to a different source")
+            if (
+                execution["state"] != "USER_ACTION_REQUIRED"
+                or execution["stage"] != "upload"
+                or target.state != "user_action_required"
+                or target.usage_counted_at is not None
+            ):
+                raise ValueError("only an unconfirmed held upload segment may be reconciled")
+            now = await conn.fetchval("SELECT clock_timestamp()")
+            self._validate_reuse(source, target, target_asset, evidence, now)
+            identity = source.provider_identity or ProviderSegmentIdentity(
+                asset_id=source.asset_id, segment_index=source.segment_index
+            )
+            audit = {
+                "asset_id": str(source.asset_id),
+                "segment_index": source.segment_index,
+                "provider_identity": identity.model_dump(mode="json"),
+                "operator": operator,
+                "reason": reason,
+                "at": now.isoformat(),
+                "usage_debit_bytes": 0,
+                "cold_readback": evidence,
+            }
+            if not apply:
+                return True
+            verification = {
+                **target.verification,
+                "backed_up": True,
+                "original_quality": True,
+                "reconciled_from": audit,
+            }
+            await conn.execute(
+                """UPDATE remote_asset_segments SET state='backed_up',share_url=$3,uploaded_at=$4,
+                usage_counted_at=now(),verification=$5::jsonb,retry_not_before=NULL,updated_at=now()
+                WHERE asset_id=$1 AND segment_index=$2""",
+                asset_id,
+                segment_index,
+                source.share_url,
+                source.uploaded_at,
+                json.dumps(verification),
+            )
+            await conn.execute(
+                "UPDATE remote_assets SET state='CREATED',updated_at=now() WHERE id=$1 AND state='REQUESTED'", asset_id
+            )
+            checkpoint.setdefault("remote_reconciliations", []).append(audit)
+            await conn.execute(
+                """UPDATE executions SET state='READY',blocked_reason=NULL,error_code=NULL,failure_class=NULL,owner=NULL,
+                lease_until=NULL,due_at=now(),generation=generation+1,checkpoint=$2::jsonb,updated_at=now()
+                WHERE id=$1""",
+                execution_id,
+                json.dumps(checkpoint),
+            )
+            await self.release_lease(conn, execution_id)
+            return True
+
+    @staticmethod
+    def _validate_reuse(source, target, target_asset, evidence: dict, now: datetime) -> None:
+        if (
+            source.state != "verified"
+            or source.usage_counted_at is None
+            or not source.share_url
+            or source.account_id is None
+            or source.account_id != target.account_id
+            or source.sha256 != target.sha256
+            or source.size_bytes != target.size_bytes
+        ):
+            raise IntegrityError("source identity, account or confirmed usage differs")
+        StorageWorkflow._validate_cold_proof(source, target, target_asset, evidence, now)
+
+    @staticmethod
+    def _validate_cold_proof(source, target, target_asset, evidence: dict, now: datetime) -> None:
+        if (
+            evidence.get("provider_asset_id") != str(source.asset_id)
+            or evidence.get("provider_segment_index") != source.segment_index
+            or evidence.get("provider_share_sha256") != hashlib.sha256((source.share_url or "").encode()).hexdigest()
+            or evidence.get("cold_inputs") != "provider-only"
+            or sorted(evidence.get("cold_mounts", [])) != ["/app/src:ro", "/work:rw"]
+        ):
+            raise IntegrityError("cold evidence is not bound to the exact source")
+        at = datetime.fromisoformat(evidence.get("at", ""))
+        if at.tzinfo is None or not now - timedelta(hours=1) <= at <= now:
+            raise IntegrityError("reconciliation requires a recent cold read-back")
+        policy = policy_for(target_asset["policy_version"])
+        policy.validate_backup_evidence(source.verification)
+        policy.validate_segment_readback(target, evidence)
+        policy.validate_segment_media(target, expectation(target_asset), evidence)
+
+    async def retry_verification(
+        self,
+        execution_id: uuid.UUID,
+        segment_index: int,
+        evidence: dict,
+        *,
+        operator: str,
+        reason: str,
+        apply: bool = False,
+    ) -> bool:
+        """Recheck a failed read-only retrieval after independent recovery proof.
+
+        No replay, new upload, accounting change or durability promotion occurs.
+        The old failure and operation remain in the execution's audit history.
+        """
+        if not operator.strip() or not reason.strip():
+            raise ValueError("verification recovery requires operator and reason")
+        async with self.pool.acquire() as conn, conn.transaction():
+            execution = await conn.fetchrow("SELECT * FROM executions WHERE id=$1 FOR UPDATE", execution_id)
+            if execution is None or execution["state"] != "FAILED" or execution["stage"] != "verify":
+                raise ValueError("only failed verification can be reviewed")
+            if execution["error_code"] != "READBACK_FAILED":
+                raise ValueError("this recovery only addresses a failed retrieval")
+            checkpoint = json.loads(execution["checkpoint"])
+            asset_id = uuid.UUID(checkpoint["asset_id"])
+            asset = await conn.fetchrow("SELECT * FROM remote_assets WHERE id=$1 FOR UPDATE", asset_id)
+            row = await conn.fetchrow(
+                "SELECT * FROM remote_asset_segments WHERE asset_id=$1 AND segment_index=$2 FOR UPDATE",
+                asset_id,
+                segment_index,
+            )
+            if asset is None or asset["state"] != "CREATED" or row is None:
+                raise ValueError("only an unpromoted remote creation may be rechecked")
+            segment = segment_from_row(row)
+            if segment.state != "failed" or segment.usage_counted_at is None or not segment.share_url:
+                raise ValueError("no confirmed remote creation to recheck")
+            now = await conn.fetchval("SELECT clock_timestamp()")
+            self._validate_cold_proof(segment, segment, asset, evidence, now)
+            if not apply:
+                return True
+            checkpoint.setdefault("verification_recoveries", []).append(
+                {
+                    "operator": operator,
+                    "reason": reason,
+                    "at": now.isoformat(),
+                    "previous_error_code": execution["error_code"],
+                    "previous_retries": execution["infrastructure_retries"],
+                    "segment_index": segment_index,
+                    "cold_readback": evidence,
+                }
+            )
+            await conn.execute(
+                "UPDATE remote_asset_segments SET state='backed_up',updated_at=now() WHERE asset_id=$1 AND segment_index=$2",
+                asset_id,
+                segment_index,
+            )
+            await conn.execute(
+                """UPDATE executions SET state='READY',blocked_reason=NULL,error_code=NULL,failure_class=NULL,owner=NULL,
+                lease_until=NULL,due_at=now(),infrastructure_retries=0,generation=generation+1,checkpoint=$2::jsonb,updated_at=now()
+                WHERE id=$1""",
+                execution_id,
+                json.dumps(checkpoint),
+            )
+            return True
 
     async def resume_after_user_action(
         self, execution_id: uuid.UUID, *, operator: str, reason: str, cleared: tuple[str, ...] = ()
@@ -299,7 +523,7 @@ class StorageWorkflow:
                 "cleared": sorted(cleared),
             }
             await conn.execute(
-                """UPDATE executions SET state='READY',blocked_reason=NULL,error_code=NULL,owner=NULL,
+                """UPDATE executions SET state='READY',blocked_reason=NULL,error_code=NULL,failure_class=NULL,owner=NULL,
                 lease_until=NULL,due_at=now(),generation=generation+1,checkpoint=$2::jsonb,updated_at=now()
                 WHERE id=$1""",
                 execution_id,
@@ -485,7 +709,8 @@ class StorageWorkflow:
             await self.assets.confirm_readback(conn, asset_id, segment_index, result.evidence)
         await conn.execute(
             """UPDATE executions SET state='READY',due_at=now(),owner=NULL,lease_until=NULL,
-            infrastructure_retries=0,blocked_reason=NULL,updated_at=now() WHERE id=$1""",
+            infrastructure_retries=0,blocked_reason=NULL,error_code=NULL,failure_class=NULL,
+            updated_at=now() WHERE id=$1""",
             execution["id"],
         )
         if execution["stage"] == "upload":

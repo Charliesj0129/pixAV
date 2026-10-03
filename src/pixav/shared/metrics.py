@@ -12,6 +12,7 @@ label names cannot drift.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
@@ -141,6 +142,69 @@ remote_assets_invalidated = Counter(
 remote_assets_due_reverification = Gauge(
     "pixav_remote_assets_due_reverification",
     "Durable remote assets overdue for an independent cold re-read",
+    registry=_REGISTRY,
+)
+
+# ── Playback and library projection ─────────────────────────────────────────
+# Every label below is drawn from a closed vocabulary defined next to its
+# helper; a value outside it is folded into "other" rather than exported.
+
+PLAYBACK_REQUEST_OUTCOMES = (
+    "hit",
+    "cold_hit",
+    "head",
+    "range_unsatisfiable",
+    "incomplete",
+    "cold_timeout",
+    "cache_unreadable",
+    "legacy",
+)
+PLAYBACK_EVICTION_REASONS = ("expired", "not_ready", "over_budget", "orphan")
+PLAYBACK_PURPOSES = ("prepare", "rebuild")
+PLAYBACK_MATERIALIZATION_OUTCOMES = ("success", "infrastructure", "verification_failed", "not_eligible")
+PLAYABLE_STATES = ("PREPARING", "READY", "STALE", "INVALID")
+PUBLICATION_STATES = ("PENDING", "PUBLISHED", "STALE", "FAILED")
+_FAILURE_CODE = re.compile(r"[A-Z_]{1,80}")
+
+playback_requests = Counter(
+    "pixav_playback_requests_total",
+    "Stable stream requests for managed videos, by how they were answered",
+    ["outcome"],
+    registry=_REGISTRY,
+)
+
+playback_cache_evictions = Counter(
+    "pixav_playback_cache_evictions_total",
+    "Playback cache objects removed, by why they were removed",
+    ["reason"],
+    registry=_REGISTRY,
+)
+
+playback_materializations = Counter(
+    "pixav_playback_materializations_total",
+    "Playback materializations committed by the authority, by purpose and outcome",
+    ["purpose", "outcome"],
+    registry=_REGISTRY,
+)
+
+playable_assets = Gauge(
+    "pixav_playable_assets",
+    "PlayableAsset rows by state",
+    ["state"],
+    registry=_REGISTRY,
+)
+
+library_publications = Gauge(
+    "pixav_library_publications",
+    "LibraryPublication rows by state",
+    ["state"],
+    registry=_REGISTRY,
+)
+
+library_projection_failures = Counter(
+    "pixav_library_projection_failures_total",
+    "Library projection writes that failed, by bounded failure code",
+    ["code"],
     registry=_REGISTRY,
 )
 
@@ -352,6 +416,41 @@ def record_remote_asset_invalidated(reason: str) -> None:
 
 def set_remote_assets_due_reverification(count: int) -> None:
     remote_assets_due_reverification.set(count)
+
+
+def _bounded(value: str, known: Iterable[str]) -> str:
+    return value if value in known else "other"
+
+
+def record_playback_request(outcome: str) -> None:
+    playback_requests.labels(outcome=_bounded(outcome, PLAYBACK_REQUEST_OUTCOMES)).inc()
+
+
+def record_playback_cache_eviction(reason: str) -> None:
+    playback_cache_evictions.labels(reason=_bounded(reason, PLAYBACK_EVICTION_REASONS)).inc()
+
+
+def record_playback_materialization(purpose: str, outcome: str) -> None:
+    playback_materializations.labels(
+        purpose=_bounded(purpose, PLAYBACK_PURPOSES),
+        outcome=_bounded(outcome, PLAYBACK_MATERIALIZATION_OUTCOMES),
+    ).inc()
+
+
+def set_playable_assets(counts: Mapping[str, int]) -> None:
+    """Export every known state, zeroing the ones with no rows."""
+    for state in PLAYABLE_STATES:
+        playable_assets.labels(state=state).set(counts.get(state, 0))
+
+
+def set_library_publications(counts: Mapping[str, int]) -> None:
+    for state in PUBLICATION_STATES:
+        library_publications.labels(state=state).set(counts.get(state, 0))
+
+
+def record_library_projection_failure(code: str) -> None:
+    """The code is a bounded ``^[A-Z_]{1,80}$`` value chosen by the writer."""
+    library_projection_failures.labels(code=code if _FAILURE_CODE.fullmatch(code) else "OTHER").inc()
 
 
 def record_source_adapter_error(reason: str = "INVALID_PROVIDER_PAYLOAD") -> None:

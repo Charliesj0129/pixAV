@@ -124,3 +124,124 @@ def test_complete_projection_without_available_video_is_unfinished():
     task = {"task_id": "one", "state": "complete", "video_status": "uploading", "retry_not_before": None}
     report = build_report(observation(at, [task]), [observation(at, [task])], [], {})
     assert report["unfinished_task_ids"] == ["one"]
+
+
+async def test_managed_sample_correlates_operations_and_never_reads_payloads():
+    from unittest.mock import AsyncMock
+
+    from scripts.phase0_cohort import managed_sample
+
+    task, operation = uuid.uuid4(), uuid.uuid4()
+    at = datetime.now(timezone.utc)
+    pool = AsyncMock()
+    pool.fetch.side_effect = [[], [], [{"operation_id": operation, "started_at": at}], [], [], []]
+    result = await managed_sample(pool, [task])
+    assert result["attempts"] == [{"operation_id": str(operation), "started_at": at.isoformat()}]
+    for call in pool.fetch.call_args_list:
+        sql, selected = call.args
+        assert selected == [task]
+        assert "SELECT *" not in sql
+        assert not any(secret in sql for secret in ("password", "email", "share_url"))
+        if "checkpoint" in sql:
+            assert "e.checkpoint," not in sql
+            assert "download_last_checked_at" in sql
+            assert "completion_to_prepare_seconds" in sql
+        if "recovery" in sql:
+            assert "s.recovery#>>'{operations,backup,intent_at}' AS backup_intent_at" in sql
+            assert sql.count("recovery") == 1
+
+
+def test_managed_success_does_not_promote_without_live_evidence():
+    at = datetime.now(timezone.utc)
+    final = observation(at, [])
+    final["managed"] = {"assets": [{"state": "DURABLE", "policy_version": "photos-original-v1"}]}
+    report = build_report(final, [final], [], {})
+    assert report["managed"] == final["managed"]
+    assert report["photos_acceptance"] == report["production_gate"] == "OPEN"
+
+
+def test_managed_window_uses_last_upload_and_distinct_v2_videos():
+    from scripts.phase0_cohort import managed_window
+
+    at = datetime(2026, 9, 19, tzinfo=timezone.utc)
+    asset = {"video_id": "one", "state": "DURABLE", "policy_version": "photos-original-v2", "segment_count": 2}
+    sample = observation(at, [])
+    sample["managed"] = {
+        "assets": [asset, asset, dict(asset, video_id="old", policy_version="photos-original-v1")],
+        "segments": [{"uploaded_at": (at - timedelta(hours=h)).isoformat()} for h in (25, 23)],
+    }
+    window = managed_window(sample)
+    assert window["durable_v2_video_count"] == 1
+    assert window["seconds_since_last_upload"] == 23 * 3600
+    assert not window["upload_age_at_least_24h"]
+    sample["at"] = (at + timedelta(hours=1)).isoformat()
+    assert managed_window(sample)["upload_age_at_least_24h"]
+    assert not managed_window(sample)["provider_quota_verified"]
+
+
+def test_network_rates_refuse_restart_counter_reset_and_missing_samples():
+    from scripts.phase0_cohort import network_rates
+
+    def point(at, rx, tx, **changes):
+        return {
+            "transfer": {
+                "guest_network": {
+                    "status": "observed",
+                    "container_id": "guest",
+                    "started_at": "boot1",
+                    "at": at,
+                    "rx_bytes": rx,
+                    "tx_bytes": tx,
+                    **changes,
+                }
+            }
+        }
+
+    old = point("2026-01-01T00:00:00Z", 100, 200)
+    new = point("2026-01-01T00:01:00Z", 700, 1400)
+    assert network_rates(old, new)["egress_Bps"] == 20
+    assert network_rates(old, new)["ingress_Bps"] == 10
+    assert network_rates({}, new)["status"] == "unknown"
+    assert network_rates(old, point("2026-01-01T00:01:00Z", 1, 2))["status"] == "unknown"
+    assert network_rates(old, point("2026-01-01T00:01:00Z", 700, 1400, started_at="boot2"))["status"] == "unknown"
+
+
+def test_confirmed_upload_speed_excludes_reused_originals():
+    from scripts.phase0_cohort import confirmed_upload_rates
+
+    row = {
+        "asset_id": "asset",
+        "segment_index": 0,
+        "size_bytes": 6000,
+        "backup_intent_at": "2026-01-01T00:00:00Z",
+        "uploaded_at": "2026-01-01T00:01:00Z",
+    }
+    rates = confirmed_upload_rates({"managed": {"segments": [row, {**row, "reused": True}]}})
+    assert len(rates) == 1 and rates[0]["effective_Bps"] == 100
+
+
+async def test_scheduling_summary_separates_waiting_from_running():
+    from unittest.mock import AsyncMock
+
+    from scripts.phase0_cohort import managed_sample
+
+    pool = AsyncMock()
+    pool.fetch.side_effect = [
+        [],
+        [
+            {"stage": "download", "state": "READY", "overdue_check": True, "due_wait_seconds": 12.0},
+            {"stage": "download", "state": "READY", "overdue_check": False, "due_wait_seconds": 0.0},
+            {"stage": "prepare", "state": "READY", "overdue_check": False, "due_wait_seconds": 4.0},
+            {"stage": "upload", "state": "RUNNING", "overdue_check": False, "due_wait_seconds": 100.0},
+        ],
+        [],
+        [],
+        [],
+        [],
+    ]
+    report = (await managed_sample(pool, [uuid.uuid4()]))["scheduling_summary"]
+    assert report["overdue_download_checks"] == 1
+    assert report["waiting_by_stage"] == {
+        "download": {"count": 2, "max_due_wait_seconds": 12.0},
+        "prepare": {"count": 1, "max_due_wait_seconds": 4.0},
+    }

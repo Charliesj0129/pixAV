@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 from pixav.config import get_settings
@@ -98,8 +99,43 @@ async def _run(args: argparse.Namespace) -> int:
         await pool.close()
 
 
+async def _review_storage(args: argparse.Namespace, pool: Any) -> int:
+    if args.command == "retry-verification":
+        if not args.db_identity:
+            raise ValueError("verification recovery requires exact --db-identity")
+        payload = json.loads(args.evidence.read_text())
+        changed = await StorageWorkflow(pool).retry_verification(
+            args.execution_id,
+            args.segment_index,
+            payload.get("evidence", payload),
+            operator=args.operator,
+            reason=args.reason,
+            apply=args.apply,
+        )
+        print(json.dumps({"apply": args.apply, "eligible_or_changed": changed, "quota_debit_bytes": 0}))
+        return 0
+    else:
+        if not args.db_identity:
+            raise ValueError("reconciliation requires exact --db-identity")
+        payload = json.loads(args.evidence.read_text())
+        changed = await StorageWorkflow(pool).reconcile_existing_segment(
+            args.execution_id,
+            args.segment_index,
+            args.source_asset_id,
+            args.source_segment_index,
+            payload.get("evidence", payload),
+            operator=args.operator,
+            reason=args.reason,
+            apply=args.apply,
+        )
+        print(json.dumps({"apply": args.apply, "eligible_or_changed": changed, "quota_debit_bytes": 0}))
+        return 0
+
+
 async def _write(args: argparse.Namespace, workflow: MediaWorkflow, pool: Any) -> int:
     """Operator acts. Each one refuses a state it has no business changing."""
+    if args.command in {"retry-verification", "reconcile-existing"}:
+        return await _review_storage(args, pool)
     if args.command == "resume":
         await StorageWorkflow(pool).resume_after_user_action(
             args.execution_id,
@@ -145,6 +181,23 @@ def main() -> None:
 
     inspection = commands.add_parser("inspect", help="show one execution with its attempt history")
     inspection.add_argument("execution_id", type=uuid.UUID)
+
+    reconcile = commands.add_parser("reconcile-existing", help="cold-proven existing original; defaults to dry-run")
+    reconcile.add_argument("execution_id", type=uuid.UUID)
+    reconcile.add_argument("--segment-index", type=int, required=True)
+    reconcile.add_argument("--source-asset-id", type=uuid.UUID, required=True)
+    reconcile.add_argument("--source-segment-index", type=int, required=True)
+    reconcile.add_argument("--evidence", type=Path, required=True)
+    reconcile.add_argument("--operator", required=True)
+    reconcile.add_argument("--reason", required=True)
+    reconcile.add_argument("--apply", action="store_true")
+    retry_verify = commands.add_parser("retry-verification", help="fresh proof after failed retrieval; dry-run default")
+    retry_verify.add_argument("execution_id", type=uuid.UUID)
+    retry_verify.add_argument("--segment-index", type=int, required=True)
+    retry_verify.add_argument("--evidence", type=Path, required=True)
+    retry_verify.add_argument("--operator", required=True)
+    retry_verify.add_argument("--reason", required=True)
+    retry_verify.add_argument("--apply", action="store_true")
 
     # Addresses a remote asset, not an execution, so it stands apart from the
     # execution acts below rather than sharing their argument shape.

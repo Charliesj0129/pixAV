@@ -11,6 +11,9 @@
 .env
 cookies*.txt
 .agent
+.agents
+.claude
+.codex
 node_modules
 
 # Heavy runtime data

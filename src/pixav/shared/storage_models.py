@@ -47,6 +47,14 @@ SegmentState = Literal[
 ]
 
 
+class ProviderSegmentIdentity(BaseModel):
+    """An explicitly reconciled provider name, distinct from local identity."""
+
+    model_config = {"frozen": True, "extra": "forbid"}
+    asset_id: uuid.UUID
+    segment_index: int = Field(ge=0)
+
+
 class RemoteAssetSegment(BaseModel):
     """One uploadable piece of a remote asset; effects live in PostgreSQL."""
 
@@ -69,6 +77,7 @@ class RemoteAssetSegment(BaseModel):
     usage_counted_at: datetime | None = None
     retry_not_before: datetime | None = None
     updated_at: datetime | None = None
+    provider_identity: ProviderSegmentIdentity | None = None
 
     @property
     def filename(self) -> str:
@@ -78,6 +87,13 @@ class RemoteAssetSegment(BaseModel):
         never be mistaken for this one inside the guest's media store.
         """
         return f"pixav-{self.asset_id}-part-{self.segment_index}-{self.sha256[:16]}.mp4"
+
+    @property
+    def provider_filename(self) -> str:
+        if self.provider_identity is None:
+            return self.filename
+        origin = self.provider_identity
+        return f"pixav-{origin.asset_id}-part-{origin.segment_index}-{self.sha256[:16]}.mp4"
 
 
 class TransferableFile(Protocol):

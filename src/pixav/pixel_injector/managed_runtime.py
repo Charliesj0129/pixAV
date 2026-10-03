@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+from docker.errors import NotFound
 
 from pixav.pixel_injector.canary import OWNER_LABEL, TOOLS_IMAGE, CanaryBlockedError, owned_containers
 from pixav.pixel_injector.profiles import AndroidProfile, get_profile
@@ -52,6 +53,10 @@ class ManagedRuntime:
         tools_image: str = TOOLS_IMAGE,
         host_project_root: str = "",
         project_root: Path | None = None,
+        guest_cpus: float = 2.0,
+        guest_memory_mb: int = 4096,
+        tools_cpus: float = 1.0,
+        tools_memory_mb: int = 2048,
     ) -> None:
         self.pool = pool
         self.client = client
@@ -61,6 +66,10 @@ class ManagedRuntime:
         self.profile_name = profile_name
         self.profiles_path = profiles_path
         self.tools_image = tools_image
+        self.limits = {
+            "guest": {"nano_cpus": int(guest_cpus * 1_000_000_000), "mem_limit": guest_memory_mb * 1024**2},
+            "tools": {"nano_cpus": int(tools_cpus * 1_000_000_000), "mem_limit": tools_memory_mb * 1024**2},
+        }
         # A bind-mount source is resolved by the Docker daemon on its own host.
         # When this worker is itself containerised, handing it the path this
         # process sees makes the daemon create an empty host directory and mount
@@ -113,6 +122,10 @@ class ManagedRuntime:
             raise CanaryBlockedError("interrupted runtime creation; inspect the retained containers")
 
         if record is not None and record["state"] == "READY":
+            recorded = {record["guest_id"], record["tools_id"]}
+            if not recorded <= {item.id for item in containers}:
+                await self._journal("REVIEW_REQUIRED", review_reason="recorded runtime container missing")
+                raise CanaryBlockedError("recorded runtime missing; reconcile before replacing any container")
             signed_in = str(record["account_id"]) if record["account_id"] else None
             if account_id is not None and signed_in != str(account_id):
                 await self._retire(containers)
@@ -144,6 +157,8 @@ class ManagedRuntime:
                 name=f"pixav-managed-guest-{self.owner}",
                 detach=True,
                 privileged=True,
+                **self.limits["guest"],
+                memswap_limit=self.limits["guest"]["mem_limit"],
                 labels={OWNER_LABEL: self.owner, "pixav.photos_canary.role": "guest"},
                 volumes={self.host_source(self.guest_data_root): {"bind": GUEST_DATA_MOUNT, "mode": "rw"}},
                 ports={"5555/tcp": ("127.0.0.1", None)},
@@ -156,6 +171,8 @@ class ManagedRuntime:
                 name=f"pixav-managed-tools-{self.owner}",
                 detach=True,
                 network_mode=f"container:{guest.id}",
+                **self.limits["tools"],
+                memswap_limit=self.limits["tools"]["mem_limit"],
                 labels={OWNER_LABEL: self.owner, "pixav.photos_canary.role": "tools"},
                 volumes={self.host_source(self.staging_root): {"bind": GUEST_STAGING_MOUNT, "mode": "ro"}},
                 tmpfs={"/tmp": "rw,exec,nosuid,nodev,mode=1777"},  # noqa: S108 - private container tmpfs
@@ -197,7 +214,11 @@ class ManagedRuntime:
         ):
             if not record[key]:
                 raise CanaryBlockedError("retained runtime is missing a container identity")
-            item = await asyncio.to_thread(self.client.containers.get, record[key])
+            try:
+                item = await asyncio.to_thread(self.client.containers.get, record[key])
+            except NotFound:
+                await self._journal("REVIEW_REQUIRED", review_reason="recorded runtime container missing")
+                raise CanaryBlockedError("recorded runtime disappeared; reconcile before recovery") from None
             self._verify(item, role=role, image=image, destination=destination, writable=writable)
             items.append(item)
         if items[1].attrs["HostConfig"]["NetworkMode"] != "container:" + items[0].id:

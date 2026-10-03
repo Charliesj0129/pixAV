@@ -187,20 +187,38 @@ async def test_parts_dump_restores_with_parent_and_account(integration_db, tmp_p
     await admin.execute(f'CREATE DATABASE "{target}"')
     try:
         dump = subprocess.run(
-            ["docker", "exec", "pixav-integration-postgres-1", "pg_dump", "-U", "pixav_test", "-Fc", name],
+            [
+                "docker",
+                "compose",
+                "-f",
+                "docker-compose.integration.yml",
+                "exec",
+                "-T",
+                "postgres",
+                "pg_dump",
+                "-U",
+                "pixav_test",
+                "-Fc",
+                name,
+            ],
             capture_output=True,
             check=True,
             timeout=60,
         )  # noqa: S603,S607
         backup = tmp_path / "full.dump"
-        backup.write_bytes(dump.stdout)
-        backup.chmod(0o600)
+        from scripts.backup_files import create_backup_file
+
+        with create_backup_file(backup, binary=True) as handle:
+            handle.write(dump.stdout)
         subprocess.run(
             [
                 "docker",
+                "compose",
+                "-f",
+                "docker-compose.integration.yml",
                 "exec",
-                "-i",
-                "pixav-integration-postgres-1",
+                "-T",
+                "postgres",
                 "pg_restore",
                 "-U",
                 "pixav_test",

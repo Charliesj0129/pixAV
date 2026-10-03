@@ -61,17 +61,27 @@ async def test_expand_contract_and_candidate_switch(integration_db):
     assert (await videos.find_by_id(inserted.id)).title == "contract insert"
 
 
-async def test_cohort_freezes_actual_open_tasks(integration_db, integration_redis):
+@pytest.mark.parametrize("managed", [False, True])
+async def test_cohort_freezes_actual_open_tasks(integration_db, integration_redis, managed):
     from types import SimpleNamespace
 
     pool = integration_db
     redis, key = integration_redis
-    await migrate(pool)
+    await migrate(pool, 18 if managed else 9)
     video = await pool.fetchval("INSERT INTO videos(title) VALUES('cohort') RETURNING id")
     task = await pool.fetchval("INSERT INTO tasks(video_id) VALUES($1) RETURNING id", video)
     await pool.execute("INSERT INTO tasks(video_id,state) VALUES($1,'complete')", video)
-    settings = SimpleNamespace(queue_download=key, queue_upload=f"{key}:processing")
+    settings = SimpleNamespace(queue_download=key, queue_upload=f"{key}:processing", managed_media_workflow=False)
+    settings.managed_media_workflow = managed
+    if managed:
+        await pool.execute("INSERT INTO workflow_tasks(task_id,video_id) VALUES($1,$2)", task, video)
+        await pool.execute("INSERT INTO executions(id,task_id,max_retries) VALUES(uuid_generate_v4(),$1,3)", task)
     initial = await sample(pool, redis, settings, None)
+    if managed:
+        assert initial["managed"]["executions"][0]["task_id"] == str(task)
+        assert initial["managed"]["segments"] == []
+    else:
+        assert initial["managed"] is None
     assert [row["task_id"] for row in initial["tasks"]] == [str(task)]
     await pool.execute("INSERT INTO tasks(video_id) VALUES($1)", video)
     await pool.execute(
@@ -104,7 +114,7 @@ async def test_cohort_process_kill_and_redis_restart(integration_db, integration
     await migrate(pool)
     video = await pool.fetchval("INSERT INTO videos(title) VALUES('interruption') RETURNING id")
     task = await pool.fetchval("INSERT INTO tasks(video_id) VALUES($1) RETURNING id", video)
-    settings = SimpleNamespace(queue_download=key, queue_upload=f"{key}:processing")
+    settings = SimpleNamespace(queue_download=key, queue_upload=f"{key}:processing", managed_media_workflow=False)
     initial = await sample(pool, redis, settings, None)
     manifest = tmp_path / "cohort.json"
     write_json(manifest, initial)
@@ -126,11 +136,12 @@ async def test_cohort_process_kill_and_redis_restart(integration_db, integration
         process.stdout.close()
     await pool.execute("INSERT INTO tasks(video_id) VALUES($1)", video)
     # Verify project labels before the isolated restart, never infer from a port.
-    info = json.loads(subprocess.check_output(["docker", "inspect", "pixav-integration-redis-1"]))[0]  # noqa: S603,S607
-    assert info["Config"]["Labels"]["com.docker.compose.project"] == "pixav-integration"
-    assert [m["Name"] for m in info["Mounts"]] == ["pixav-integration_integration_redis"]
+    project = os.getenv("COMPOSE_PROJECT_NAME", "pixav-integration")
+    info = json.loads(subprocess.check_output(["docker", "inspect", f"{project}-redis-1"]))[0]  # noqa: S603,S607
+    assert info["Config"]["Labels"]["com.docker.compose.project"] == project
+    assert [m["Name"] for m in info["Mounts"]] == [f"{project}_integration_redis"]
     subprocess.run(  # noqa: S603 -- fixed dedicated project
-        ["docker", "compose", "-f", "docker-compose.integration.yml", "restart", "redis"],  # noqa: S607
+        ["docker", "compose", "-p", project, "-f", "docker-compose.integration.yml", "restart", "redis"],  # noqa: S607
         check=True,
         capture_output=True,
         timeout=30,

@@ -15,6 +15,7 @@ from typing import Any
 
 import asyncpg
 
+from pixav.shared.playable_assets import invalidate_for_remote
 from pixav.shared.repository import AccountRepository
 from pixav.shared.storage_models import (
     IntegrityError,
@@ -44,6 +45,9 @@ def segment_from_row(row: Any) -> RemoteAssetSegment:
     for key in ("media_info", "recovery", "verification"):
         if isinstance(data.get(key), str):
             data[key] = json.loads(data[key])
+    reuse = data.get("verification", {}).get("reconciled_from")
+    if reuse:
+        data["provider_identity"] = reuse["provider_identity"]
     return RemoteAssetSegment.model_validate(data)
 
 
@@ -254,11 +258,18 @@ class RemoteAssetRepository:
         """Confirmed remote loss or corruption. Expiry of a URL is not this.
 
         The caller may supply the transaction that decided it, so the decision
-        and the state it is based on commit together or not at all.
+        and the state it is based on commit together or not at all. Every
+        playable object built on the asset is withdrawn in the same transaction,
+        so no stream can outlive the copy it was served from.
         """
-        await (conn or self.pool).execute(
+        if conn is None:
+            async with self.pool.acquire() as owned, owned.transaction():
+                await self.invalidate(asset_id, reason, conn=owned)
+            return
+        await conn.execute(
             """UPDATE remote_assets SET state='INVALID',durable_at=NULL,
             invalidated_reason=$2,updated_at=now() WHERE id=$1""",
             asset_id,
             reason,
         )
+        await invalidate_for_remote(conn, asset_id)

@@ -9,10 +9,12 @@ what makes the read-back independent evidence rather than a local echo.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import socket
+import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -21,7 +23,7 @@ from typing import Any, cast
 from pixav.pixel_injector.maestro_parts import MaestroPartUploader, MaestroPartVerifier
 from pixav.pixel_injector.segment_staging import release_segment, stage_segment
 from pixav.pixel_injector.session import RedroidSession
-from pixav.shared.exceptions import UploadError, VerificationError
+from pixav.shared.exceptions import ReadbackUnavailableError, UploadError, VerificationError
 from pixav.shared.host_paths import host_path
 from pixav.shared.models import Account
 from pixav.shared.storage_models import RemoteAssetSegment
@@ -37,6 +39,18 @@ COLD_WORK_MOUNT = "/work"
 COLD_SOURCE_MOUNT = "/app/src"
 COLD_READBACK_LABEL = "cold-readback"
 COLD_MOUNTS = (f"{COLD_SOURCE_MOUNT}:ro", f"{COLD_WORK_MOUNT}:rw")
+
+
+class ColdProcessError(VerificationError):
+    """The isolated process reported a failure; only its exception type is known.
+
+    The type is the one detail the child is allowed to say, so it is kept as
+    data for callers that classify failures, never as a free-form message.
+    """
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(f"cold read-back failed: {error_type}")
+        self.error_type = error_type
 
 
 class MaestroSegmentUploader:
@@ -112,6 +126,11 @@ class PhotosColdReadback:
     ``cold_inputs: provider-only`` a fact rather than an assertion.
     """
 
+    # The module the isolated container runs, and the label it carries. Other
+    # cold processes reuse the same isolation by naming their own entry point.
+    ENTRY = "pixav.pixel_injector.segment_readback"
+    LABEL = COLD_READBACK_LABEL
+
     def __init__(
         self,
         root: Path,
@@ -146,7 +165,10 @@ class PhotosColdReadback:
         if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
             raise VerificationError("symlink in the read-back path")
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-        return destination
+        # Each activity must use a new browser/workspace, including retries.
+        # Retain previous provider downloads as evidence, but never echo them
+        # back as a fresh cold acquisition.
+        return Path(tempfile.mkdtemp(prefix="session-", dir=destination))
 
     @staticmethod
     def manifest(segment: RemoteAssetSegment) -> dict:
@@ -158,17 +180,29 @@ class PhotosColdReadback:
     async def read_back(self, segment: RemoteAssetSegment) -> dict:
         destination = self._work_dir(segment)
         payload = json.dumps(self.manifest(segment)).encode()
-        receipt = await asyncio.to_thread(self._run, destination, payload)
-        return {**receipt, "cold_inputs": "provider-only", "cold_mounts": list(COLD_MOUNTS)}
+        try:
+            receipt = await asyncio.to_thread(self._run, destination, payload)
+        except ColdProcessError as exc:
+            if exc.error_type == "OriginalMismatchError":
+                raise VerificationError("cold read-back original does not match the manifest") from exc
+            raise ReadbackUnavailableError(exc.error_type) from exc
+        return {
+            **receipt,
+            "cold_inputs": "provider-only",
+            "cold_mounts": list(COLD_MOUNTS),
+            "provider_asset_id": str(segment.asset_id),
+            "provider_segment_index": segment.segment_index,
+            "provider_share_sha256": hashlib.sha256((segment.share_url or "").encode()).hexdigest(),
+        }
 
-    def _run(self, destination: Path, payload: bytes) -> dict:
+    def _run(self, destination: Path, payload: bytes, *, timeout_seconds: int | None = None) -> dict:
         client = self._client()
         container = client.containers.create(
             self._image,
-            command=["python", "-m", "pixav.pixel_injector.segment_readback"],
+            command=["python", "-m", self.ENTRY],
             stdin_open=True,
             user=f"{os.getuid()}:{os.getgid()}",
-            labels={"pixav.photos_canary.role": COLD_READBACK_LABEL},
+            labels={"pixav.photos_canary.role": self.LABEL},
             environment={"PYTHONPATH": COLD_SOURCE_MOUNT, "HOME": COLD_WORK_MOUNT},
             volumes={
                 self._host(self._source_root): {"bind": COLD_SOURCE_MOUNT, "mode": "ro"},
@@ -183,7 +217,7 @@ class PhotosColdReadback:
                 stream._sock.sendall(payload)
                 stream._sock.shutdown(socket.SHUT_WR)
                 container.start()
-                status = container.wait(timeout=self._timeout_seconds)
+                status = container.wait(timeout=timeout_seconds or self._timeout_seconds)
             finally:
                 stream.close()
             return self._receipt(container, status)
@@ -210,8 +244,10 @@ class PhotosColdReadback:
             report = json.loads(text[-1]) if text else {}
         except ValueError:
             report = {}
-        if code != 0 or not isinstance(report, dict) or report.get("status") == "BLOCKED":
+        if not isinstance(report, dict):
+            report = {}
+        if code != 0 or report.get("status") == "BLOCKED":
             # The child only ever reports an exception type, so nothing here can
             # carry a share location, a path or a provider payload.
-            raise VerificationError(f"cold read-back failed: {report.get('error_type', 'NO_REPORT')}")
+            raise ColdProcessError(str(report.get("error_type", "NO_REPORT")))
         return report

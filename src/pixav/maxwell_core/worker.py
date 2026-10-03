@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -26,6 +27,7 @@ from pixav.shared.metrics import (
     set_executions_terminal,
     set_executions_user_action_required,
     set_executions_waiting_quota,
+    set_playable_assets,
     set_queue_depth,
     set_remote_assets_due_reverification,
 )
@@ -183,6 +185,43 @@ async def _open_reverifications(managed: Any, *, interval_days: int) -> None:
         logger.info("opened %d re-verification execution(s)", len(opened))
 
 
+async def _open_playback_preparations(managed: Any) -> None:
+    """Open preparations for newly durable assets and rebuilds readers asked for.
+
+    Runs before the dispatch step of the same tick, so a reader waiting on a
+    cold object is not also waiting for the next tick. A failure here must not
+    stop the tick: nothing already READY depends on it.
+    """
+    if managed is None:
+        return
+    try:
+        opened = await managed.playback.open_due()
+        set_playable_assets(await managed.playback.observe())
+    except Exception as exc:  # pragma: no cover - playback preparation must never break the tick
+        logger.warning("failed to open playback preparations: %s", exc)
+        return
+    if opened:
+        logger.info("opened %d playback execution(s)", len(opened))
+
+
+async def _reconcile_library(library: Any) -> None:
+    """Converge the library projection with PostgreSQL. A failure never stops the tick.
+
+    The projection is derived state: a pass that fails leaves the previously
+    published items in place, and the next pass starts from the facts again.
+    """
+    if library is None:
+        return
+    try:
+        counts = await library.reconcile()
+    except Exception as exc:  # pragma: no cover - projection must never break the tick
+        logger.warning("library reconciliation failed: %s", exc)
+        return
+    changed = {outcome: n for outcome, n in counts.items() if outcome != "unchanged"}
+    if changed:
+        logger.info("library reconciliation: %s", changed)
+
+
 async def run_loop(  # noqa: C901
     settings: Settings,
     *,
@@ -206,22 +245,40 @@ async def run_loop(  # noqa: C901
         managed = None
         managed_queue = None
         storage_queue = None
+        playback_queue = None
         if settings.managed_media_workflow:
             from pixav.maxwell_core.media_workflow import MediaWorkflow
             from pixav.shared.retry import parse_retry_backoff
-            from pixav.shared.workflow import MANAGED_QUEUE, STORAGE_QUEUE, require_workflow_role
+            from pixav.shared.workflow import (
+                MANAGED_QUEUE,
+                PLAYBACK_QUEUE,
+                STORAGE_QUEUE,
+                require_workflow_role,
+            )
             from pixav.sht_probe.policy import SourcePolicy
 
             await require_workflow_role(pool, "pixav_execution_authority")
             managed = MediaWorkflow(
                 pool,
+                local_retention_hours=settings.local_cleanup_success_hours,
                 backoff=parse_retry_backoff(settings.retry_backoff_seconds),
                 cooldown_seconds=settings.source_candidate_cooldown_hours * 3600,
                 max_retries=settings.download_max_retries,
+                download_poll_seconds=settings.managed_download_poll_seconds,
+                download_timeout_seconds=settings.qbit_download_timeout_seconds,
+                download_stall_seconds=settings.managed_download_stall_seconds,
+                download_metadata_seconds=settings.qbit_no_peer_grace_seconds,
                 source_policy=SourcePolicy(min_score=settings.source_min_quality_score),
             )
             managed_queue = TaskQueue(redis=redis, queue_name=MANAGED_QUEUE)
             storage_queue = TaskQueue(redis=redis, queue_name=STORAGE_QUEUE)
+            playback_queue = TaskQueue(redis=redis, queue_name=PLAYBACK_QUEUE)
+        library = None
+        if settings.library_reconcile_seconds > 0:
+            from pixav.library_projection.reconciler import build_reconciler
+
+            library = build_reconciler(pool, settings)
+        next_library_pass = 0.0
         task_repo = TaskRepository(pool)
         video_repo = VideoRepository(pool)
 
@@ -245,6 +302,7 @@ async def run_loop(  # noqa: C901
             pool,
             download_dir=settings.download_dir,
             batch_size=settings.local_cleanup_batch_size,
+            library_root=settings.library_root,
             apply_deletions=settings.local_cleanup_apply,
         )
         disk_guard = DownloadSpaceGuard(
@@ -293,10 +351,19 @@ async def run_loop(  # noqa: C901
                     managed_workflow=managed,
                 )
                 disk_status = await disk_guard.check_and_latch()
+                await _open_playback_preparations(managed)
                 if managed is not None:
-                    await managed.tick(managed_queue, download_paused=disk_status.paused, storage_queue=storage_queue)
+                    await managed.tick(
+                        managed_queue,
+                        download_paused=disk_status.paused,
+                        storage_queue=storage_queue,
+                        playback_queue=playback_queue,
+                    )
                 stats = await orchestrator.tick(download_paused=disk_status.paused)
                 await _open_reverifications(managed, interval_days=settings.remote_reverify_interval_days)
+                if library is not None and time.monotonic() >= next_library_pass:
+                    await _reconcile_library(library)
+                    next_library_pass = time.monotonic() + settings.library_reconcile_seconds
                 await _publish_queue_depths(crawl_queue, queues)
                 await _publish_execution_metrics(managed, reverify_interval_days=settings.remote_reverify_interval_days)
                 if created:
@@ -304,7 +371,23 @@ async def run_loop(  # noqa: C901
                 logger.info("tick result: %s", stats)
             except Exception as exc:
                 logger.exception("tick error: %s", exc)
-            await asyncio.sleep(interval)
+            if managed is None:
+                await asyncio.sleep(interval)
+            else:
+                # Keep the existing maintenance cadence, but do not add a full
+                # 30-second tick delay to every short download observation.
+                deadline = asyncio.get_running_loop().time() + interval
+                while asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(1)
+                    if await _is_paused(redis, settings.system_pause_key):
+                        break
+                    try:
+                        disk_status = await disk_guard.check_and_latch()
+                        await managed.tick(
+                            managed_queue, download_paused=disk_status.paused, storage_queue=storage_queue
+                        )
+                    except Exception:
+                        logger.warning("managed scheduling dependency unavailable; retry on next tick")
 
     finally:
         await redis.aclose()

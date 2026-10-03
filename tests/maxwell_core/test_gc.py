@@ -121,8 +121,8 @@ class _FakeConnection:
     async def fetchval(self, sql: str, *args):
         if "to_regclass" in sql:
             # Only the projection table these fakes can stand in for exists.
-            # ``playable_assets`` and ``cleanup_authorizations`` belong to
-            # Component D, which has not landed, so they answer absent.
+            # ``playable_assets`` and ``cleanup_authorizations`` answer absent,
+            # as on a schema that predates PlaybackResolver.
             return args[0] if (self._publications and args[0] == "public.library_publications") else None
         if "library_publications" in sql:
             return True
@@ -187,7 +187,7 @@ class TestLocalFileJanitor:
         assert conn.audits and conn.audits[0][3] == "rejected"
 
     async def test_durable_without_publication_is_still_rejected_bdd_005_131(self, tmp_path) -> None:
-        """Component D/E are absent, so no artifact can show a complete projection."""
+        """Without a projection table no artifact can show a complete projection."""
         media = tmp_path / "synthetic.mp4"
         media.write_bytes(b"recoverable")
         pool, _ = _janitor_pool(media, durable=True, publications=False)
@@ -255,3 +255,11 @@ class TestLocalFileJanitor:
         assert stats["unsafe"] == 1 and stats["deleted"] == 0
         assert outside.read_bytes() == b"not ours"
         assert conn.audits and conn.audits[0][3] == "unsafe"
+
+
+async def test_http_only_evidence_never_authorizes_staging_cleanup(tmp_path):
+    pool = AsyncMock()
+    pool.fetchval.return_value = True
+    pool.fetchrow.return_value = {"playback_evidence": {"method": "stable-url-acceptance-v1", "get": "PASS"}}
+    janitor = LocalFileJanitor(pool, download_dir=str(tmp_path))
+    assert await janitor._verified_playback(pool, uuid.uuid4()) is False

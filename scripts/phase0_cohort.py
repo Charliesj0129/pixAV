@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ def write_json(path: Path, data: dict) -> None:
 
 
 def seconds(value: str) -> float:
+    # Docker timestamps carry nanoseconds and Z; Python 3.10 accepts microseconds.
+    value = re.sub(r"(\.\d{6})\d+", r"\1", value).replace("Z", "+00:00")
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         raise ValueError("evidence timestamps must include timezone")
@@ -47,6 +50,69 @@ def percentiles(values: list[float]) -> dict[str, Any]:
         "n": len(values),
         **{f"p{p}": ordered[max(0, math.ceil(len(ordered) * p / 100) - 1)] if ordered else None for p in (50, 95)},
     }
+
+
+async def managed_sample(pool: Any, task_ids: list[uuid.UUID]) -> dict:
+    """Read explicit columns only: never persist checkpoint, credentials or URLs.
+
+    The caller holds a read-only repeatable-read transaction so asset, segment
+    and quota facts cannot straddle a successful upload commit.
+    """
+    queries = {
+        "executions": "SELECT id,task_id,state,stage,generation,owner,lease_until,due_at,"
+        "failure_class,created_at,updated_at FROM executions WHERE task_id=ANY($1::uuid[]) ORDER BY id",
+        "scheduling": "SELECT e.id,e.stage,e.state,"
+        "(e.stage='download' AND e.state IN ('READY','WAITING_RETRY') AND e.due_at<now()) AS overdue_check,"
+        "GREATEST(0,extract(epoch FROM now()-e.due_at))::double precision AS due_wait_seconds,"
+        "e.checkpoint#>>'{download_poll,last_checked_at}' AS download_last_checked_at,"
+        "e.checkpoint->>'download_confirmed_at' AS download_confirmed_at,"
+        "extract(epoch FROM (SELECT min(a.started_at) FROM activity_attempts a "
+        "WHERE a.execution_id=e.id AND a.stage='prepare'))::double precision "
+        "- (e.checkpoint->>'torrent_completed_at')::double precision AS completion_to_prepare_seconds "
+        "FROM executions e WHERE e.task_id=ANY($1::uuid[]) ORDER BY e.id",
+        "attempts": "SELECT a.id,a.execution_id,a.generation,a.stage,a.operation_id,a.started_at,a.completed_at "
+        "FROM activity_attempts a JOIN executions e ON e.id=a.execution_id "
+        "WHERE e.task_id=ANY($1::uuid[]) ORDER BY a.started_at,a.id",
+        "assets": "SELECT r.id,r.video_id,r.state,r.policy_version,r.segment_count,r.durable_at "
+        "FROM remote_assets r JOIN workflow_tasks w ON w.video_id=r.video_id "
+        "WHERE w.task_id=ANY($1::uuid[]) ORDER BY r.id",
+        "segments": "SELECT DISTINCT s.asset_id,s.segment_index,s.state,s.size_bytes,s.sha256,"
+        "s.account_id,s.uploaded_at,s.usage_counted_at,s.retry_not_before "
+        ",s.recovery#>>'{operations,backup,intent_at}' AS backup_intent_at,"
+        "s.verification ? 'reconciled_from' AS reused "
+        "FROM remote_asset_segments s JOIN remote_assets r ON r.id=s.asset_id "
+        "JOIN workflow_tasks w ON w.video_id=r.video_id "
+        "WHERE w.task_id=ANY($1::uuid[]) ORDER BY s.asset_id,s.segment_index",
+        "quota": "SELECT id,status,daily_uploaded_bytes,daily_quota_bytes,quota_reset_at,cooldown_until "
+        "FROM accounts WHERE id IN (SELECT s.account_id FROM remote_asset_segments s "
+        "JOIN remote_assets r ON r.id=s.asset_id JOIN workflow_tasks w ON w.video_id=r.video_id "
+        "WHERE w.task_id=ANY($1::uuid[])) ORDER BY id",
+    }
+    result = {}
+    for name, query in queries.items():
+        result[name] = [
+            {
+                key: (
+                    value.isoformat()
+                    if isinstance(value, datetime)
+                    else str(value) if isinstance(value, uuid.UUID) else value
+                )
+                for key, value in dict(row).items()
+            }
+            for row in await pool.fetch(query, task_ids)
+        ]
+    waiting: dict[str, dict[str, float | int]] = {}
+    for row in result["scheduling"]:
+        if row["state"] not in {"READY", "WAITING_RETRY", "WAITING_QUOTA"}:
+            continue
+        stage = waiting.setdefault(row["stage"], {"count": 0, "max_due_wait_seconds": 0.0})
+        stage["count"] += 1
+        stage["max_due_wait_seconds"] = max(stage["max_due_wait_seconds"], row["due_wait_seconds"])
+    result["scheduling_summary"] = {
+        "overdue_download_checks": sum(bool(row["overdue_check"]) for row in result["scheduling"]),
+        "waiting_by_stage": waiting,
+    }
+    return result
 
 
 async def sample(pool: Any, redis: Any, settings: Any, task_ids: list[uuid.UUID] | None) -> dict:
@@ -76,7 +142,8 @@ async def sample(pool: Any, redis: Any, settings: Any, task_ids: list[uuid.UUID]
     owners = await pool.fetch("SELECT id,state FROM tasks WHERE id=ANY($1::uuid[])", processing_ids)
     open_owners = {str(row["id"]) for row in owners if row["state"] not in {"complete", "failed"}}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "managed": await managed_sample(pool, [row["id"] for row in rows]) if settings.managed_media_workflow else None,
         "at": (await pool.fetchval("SELECT clock_timestamp()")).isoformat(),
         "database_identity": await database_identity(pool),
         "database": await pool.fetchval("SELECT current_database()"),
@@ -104,6 +171,122 @@ async def qbit_inventory(settings: Any, pool: Any) -> dict:
         return {"status": "unavailable", "hashes": None, "unowned_hashes": None}
     finally:
         await client.aclose()
+
+
+def guest_network(owner: str) -> dict:
+    """One owned namespace only; tools shares it and must not be counted twice."""
+    import docker
+
+    client = docker.from_env(timeout=10)
+    try:
+        guests = client.containers.list(
+            filters={
+                "label": [
+                    f"pixav.photos_canary.owner={owner}",
+                    "pixav.photos_canary.role=guest",
+                ]
+            }
+        )
+        if len(guests) != 1:
+            return {"status": "unavailable", "guest_count": len(guests)}
+        guest = guests[0]
+        stats = guest.stats(stream=False)
+        networks = stats.get("networks", {})
+        return {
+            "status": "observed",
+            "container_id": guest.id,
+            "started_at": guest.attrs["State"]["StartedAt"],
+            "at": stats["read"],
+            "rx_bytes": sum(n["rx_bytes"] for n in networks.values()),
+            "tx_bytes": sum(n["tx_bytes"] for n in networks.values()),
+            "scope": "guest network including background traffic; not confirmed Photos upload bytes",
+        }
+
+    finally:
+        client.close()
+
+
+async def transfer_sample(settings: Any) -> dict:
+    client = QBitClient(settings.qbit_url, settings.qbit_user, settings.qbit_password, timeout=10)
+    result: dict = {}
+    try:
+        result["qbit"] = await client.transfer_snapshot()
+    except Exception as error:
+        result["qbit"] = {"status": "unavailable", "error_type": type(error).__name__}
+    finally:
+        await client.aclose()
+    try:
+        result["guest_network"] = await asyncio.to_thread(guest_network, str(settings.storage_worker_owner))
+    except Exception as error:
+        result["guest_network"] = {"status": "unavailable", "error_type": type(error).__name__}
+    return result
+
+
+def network_rates(previous: dict, current: dict) -> dict:
+    """Reset/restarted/missing counters are unknown, never a zero-speed claim."""
+    old = previous.get("transfer", {}).get("guest_network", {})
+    new = current.get("transfer", {}).get("guest_network", {})
+    if (
+        old.get("status") != "observed"
+        or new.get("status") != "observed"
+        or old.get("container_id") != new.get("container_id")
+        or old.get("started_at") != new.get("started_at")
+    ):
+        return {"status": "unknown"}
+    elapsed = seconds(new["at"]) - seconds(old["at"])
+    if elapsed <= 0 or any(new[k] < old[k] for k in ("rx_bytes", "tx_bytes")):
+        return {"status": "unknown"}
+    return {
+        "status": "observed",
+        "interval_seconds": elapsed,
+        "ingress_Bps": (new["rx_bytes"] - old["rx_bytes"]) / elapsed,
+        "egress_Bps": (new["tx_bytes"] - old["tx_bytes"]) / elapsed,
+        "scope": "guest network; not Photos-specific",
+    }
+
+
+def confirmed_upload_rates(observation: dict) -> list[dict]:
+    result = []
+    for row in (observation.get("managed") or {}).get("segments", []):
+        if row.get("reused") or not row.get("uploaded_at") or not row.get("backup_intent_at"):
+            continue
+        elapsed = seconds(row["uploaded_at"]) - seconds(row["backup_intent_at"])
+        if elapsed > 0:
+            result.append(
+                {
+                    "asset_id": row["asset_id"],
+                    "segment_index": row["segment_index"],
+                    "bytes": row["size_bytes"],
+                    "seconds": elapsed,
+                    "effective_Bps": row["size_bytes"] / elapsed,
+                    "scope": "backup intent to confirmed result; not wire speed",
+                }
+            )
+    return result
+
+
+def managed_window(observation: dict) -> dict:
+    """Summarize DB facts without treating them as live acceptance evidence."""
+    managed = observation.get("managed") or {}
+    assets = managed.get("assets", [])
+    uploads = [row["uploaded_at"] for row in managed.get("segments", []) if row.get("uploaded_at")]
+    latest = max(uploads, key=seconds) if uploads else None
+    elapsed = seconds(observation["at"]) - seconds(latest) if latest else None
+    return {
+        "durable_v2_video_count": len(
+            {
+                row["video_id"]
+                for row in assets
+                if row["state"] == "DURABLE" and row["policy_version"] == "photos-original-v2"
+            }
+        ),
+        "segmented_asset_count": sum(row.get("segment_count", 0) > 1 for row in assets),
+        "last_uploaded_at": latest,
+        "seconds_since_last_upload": elapsed,
+        "upload_age_at_least_24h": elapsed is not None and elapsed >= 86400,
+        "provider_quota_verified": False,
+        "restart_recovery_verified": False,
+    }
 
 
 def build_report(cohort: dict, observations: list[dict], events: list[dict], inventory: dict) -> dict:
@@ -186,6 +369,10 @@ def build_report(cohort: dict, observations: list[dict], events: list[dict], inv
             if item.get("redis_restart_from")
         ],
         "qbit": inventory,
+        "managed": ordered[-1].get("managed"),
+        "transfer": ordered[-1].get("transfer"),
+        "managed_window": managed_window(ordered[-1]),
+        "photos_acceptance": "OPEN",  # Counts cannot establish cold-path or provider quota evidence.
         "production_gate": "OPEN",  # Timing alone cannot prove playback/VPN/promotion.
     }
 
@@ -218,9 +405,21 @@ async def run(args: argparse.Namespace) -> None:
             or await redis_identity(redis) != args.expect_redis_identity
         ):
             raise RuntimeError("cohort requires fresh exact PostgreSQL and Redis identities")
-        observation = await sample(
-            pool, redis, settings, [uuid.UUID(row["task_id"]) for row in cohort["tasks"]] if cohort else None
-        )
+        selected = [uuid.UUID(row["task_id"]) for row in cohort["tasks"]] if cohort else args.task_id
+        async with pool.acquire() as connection:
+            async with connection.transaction(isolation="repeatable_read", readonly=True):
+                observation = await sample(connection, redis, settings, selected)
+        observation["transfer"] = await transfer_sample(settings)
+        observation["transfer"]["confirmed_uploads"] = confirmed_upload_rates(observation)
+        observation["transfer"]["storage_executions"] = [
+            {k: row[k] for k in ("id", "state", "stage")}
+            for row in (observation.get("managed") or {}).get("executions", [])
+            if row["stage"] in {"upload", "verify"}
+        ]
+        if selected is not None and {str(item) for item in selected} != {
+            row["task_id"] for row in observation["tasks"]
+        }:
+            raise RuntimeError("selected cohort tasks are missing")
         if cohort:
             if any(observation[key] != cohort[key] for key in ("database_identity", "database")):
                 raise RuntimeError("cohort instance changed")
@@ -228,6 +427,7 @@ async def run(args: argparse.Namespace) -> None:
                 [cohort, *(json.loads(p.read_text()) for p in (root / "samples").glob("*.json"))],
                 key=lambda item: seconds(item["at"]),
             )[-1]
+            observation["transfer"]["guest_rates"] = network_rates(previous, observation)
             if observation["redis_run_id"] != previous["redis_run_id"]:
                 if not args.accept_redis_restart:
                     raise RuntimeError("reconcile Redis restart and pass --accept-redis-restart with fresh identity")
@@ -235,6 +435,9 @@ async def run(args: argparse.Namespace) -> None:
             write_json(root / "samples" / f"{uuid.uuid4()}.json", observation)
         else:
             write_json(manifest, observation)
+        latest = root / f"transfer-{uuid.uuid4()}.tmp"
+        write_json(latest, {"at": observation["at"], **observation["transfer"]})
+        latest.replace(root / "transfer-latest.json")
         if args.command == "report":
             observations = [json.loads(p.read_text()) for p in (root / "samples").glob("*.json")]
             events = [json.loads(p.read_text()) for p in (root / "events").glob("*.json")]
@@ -250,6 +453,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("snapshot", "sample", "report", "mark"))
     parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument("--task-id", type=uuid.UUID, action="append", help="snapshot exact task; repeatable")
     parser.add_argument("--expect-db-identity", default="")
     parser.add_argument("--expect-redis-identity", default="")
     parser.add_argument("--accept-redis-restart", action="store_true")
@@ -259,6 +463,8 @@ def main() -> None:
         default="operator_interruption",
     )
     args = parser.parse_args()
+    if args.task_id and args.command != "snapshot":
+        parser.error("--task-id is only valid for snapshot; subsequent samples use the frozen cohort")
     try:
         asyncio.run(run(args))
     except (OSError, ValueError, RuntimeError) as exc:

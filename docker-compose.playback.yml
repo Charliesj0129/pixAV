@@ -1,0 +1,60 @@
+# Add to the selected base/prod/network-mode files; never start a second authority.
+services:
+  maxwell_core:
+    environment:
+      PIXAV_RESOLVER_BASE_URL: http://playback-gateway:8080
+  strm_resolver:
+    environment:
+      PIXAV_RESOLVER_AUTH_REQUIRED: "true"
+      PIXAV_RESOLVER_TOKEN_FILE: /run/secrets/resolver_token
+    volumes:
+      - ${PIXAV_RESOLVER_TOKEN_HOST_FILE:-./secrets/resolver_token}:/run/secrets/resolver_token:ro
+    networks:
+      - pixav
+      - playback_private
+  playback-gateway:
+    image: nginx:stable-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/pixav/start.sh"]
+    cpus: 0.5
+    mem_limit: 128m
+    volumes:
+      - ./docker/playback-gateway/start.sh:/opt/pixav/start.sh:ro
+      - ./docker/playback-gateway/default.conf.template:/etc/nginx/pixav.conf.template:ro
+      - ${PIXAV_RESOLVER_TOKEN_HOST_FILE:-./secrets/resolver_token}:/run/secrets/resolver_token:ro
+    networks: [playback_private]
+    depends_on:
+      strm_resolver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  jellyfin:
+    image: jellyfin/jellyfin:12.1@sha256:78d3ea1207d1322471fcac39a614f004f2ccf7e878f95ab2977d752f07e4dd7e
+    restart: unless-stopped
+    cpus: 2
+    mem_limit: 2g
+    ports: ["127.0.0.1:${PIXAV_JELLYFIN_PORT:-8096}:8096"]
+    volumes:
+      - ./data/jellyfin/config:/config
+      - ./data/jellyfin/cache:/cache
+      - ./data/library:/media:ro
+    networks: [playback_private, jellyfin_egress]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+networks:
+  playback_private:
+    internal: true
+  jellyfin_egress: {}

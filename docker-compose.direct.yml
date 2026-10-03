@@ -1,5 +1,6 @@
 # Explicit opt-in direct networking; traffic does not use the VPN tunnel.
-# Use with docker-compose.yml. Omit this override to restore the VPN dependency.
+# Production: base + prod + direct. VPN production: base + prod.
+# Stop the previous mode explicitly before switching; profiles do not stop existing containers.
 services:
   gluetun:
     profiles: [vpn]
@@ -17,3 +18,5 @@ services:
   media_loader:
     environment:
       PIXAV_QBIT_URL: http://qbittorrent:${PIXAV_QBIT_PORT:-8085}
+      # No VPN report is expected in direct mode, including stale Redis reports.
+      PIXAV_VPN_EGRESS_ECHO_URL: ""

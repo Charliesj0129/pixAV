@@ -41,6 +41,28 @@ class VerificationError(PixavError):
     """Share URL verification failed."""
 
 
+class ReadbackUnavailableError(VerificationError):
+    """No integrity verdict: the read-only browser/probe did not complete."""
+
+    def __init__(self, error_type: str) -> None:
+        self.error_type = (
+            error_type
+            if error_type
+            in {
+                "TimeoutError",
+                "ModuleNotFoundError",
+                "ImportError",
+                "PermissionError",
+                "FileNotFoundError",
+                "Error",
+                "ValueError",
+                "NO_REPORT",
+            }
+            else "UNKNOWN_DEPENDENCY"
+        )
+        super().__init__(f"cold read-back unavailable: {self.error_type}")
+
+
 # ── Media-Loader ────────────────────────────────────────────────
 
 

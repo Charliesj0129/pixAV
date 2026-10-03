@@ -48,6 +48,10 @@ def default_runtime(pool: asyncpg.Pool, settings: Settings, *, owner: str) -> Ca
         profile_name=settings.redroid_profile,
         profiles_path=settings.redroid_profiles_path or None,
         host_project_root=settings.host_project_root,
+        guest_cpus=settings.storage_guest_cpus,
+        guest_memory_mb=settings.storage_guest_memory_mb,
+        tools_cpus=settings.storage_tools_cpus,
+        tools_memory_mb=settings.storage_tools_memory_mb,
     ).acquire
 
 

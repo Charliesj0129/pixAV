@@ -14,6 +14,8 @@ from pydantic import ValidationError
 from pixav.media_loader.interfaces import Remuxer, TorrentClient
 from pixav.media_loader.preparation import prepare_media
 from pixav.media_loader.remuxer import select_media_input
+from pixav.media_loader.segmented_preparation import prepare_segments
+from pixav.media_loader.video_parts import LIMIT_BYTES, TARGET_BYTES
 from pixav.shared.exceptions import MediaDependencyError, RemuxError, SourceUnavailableError, TorrentOwnershipError
 from pixav.shared.queue import TaskQueue
 from pixav.shared.workflow import ActivityRequest, ActivityResult
@@ -22,9 +24,20 @@ logger = logging.getLogger(__name__)
 
 
 class MediaActivityWorker:
-    def __init__(self, pool: asyncpg.Pool, client: TorrentClient, remuxer: Remuxer, *, output_dir: str) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        client: TorrentClient,
+        remuxer: Remuxer,
+        *,
+        output_dir: str,
+        segment_target_bytes: int = TARGET_BYTES,
+    ) -> None:
+        if not 0 < segment_target_bytes < LIMIT_BYTES:
+            raise ValueError("invalid segment target")
         self.pool, self.client, self.remuxer = pool, client, remuxer
         self.output_dir = output_dir
+        self.segment_target_bytes = segment_target_bytes
 
     async def execute(self, request: ActivityRequest) -> ActivityResult:
         fields = request.model_dump(exclude={"stage", "identity", "input_path"})
@@ -32,12 +45,30 @@ class MediaActivityWorker:
             if request.stage not in {"download", "prepare"}:
                 raise ValueError("unsupported media activity stage")
             if request.stage == "download":
-                path = await self.client.reconcile_download(request.identity, str(request.operation_id))
-                return ActivityResult(**fields, outcome="success", artifact_path=select_media_input(path))
+                first_attempt = await self.pool.fetchval(
+                    "SELECT count(*)=1 FROM activity_attempts WHERE operation_id=$1", request.operation_id
+                )
+                observation = await self.client.check_download(
+                    request.identity, str(request.operation_id), allow_add=first_attempt is True
+                )
+                if observation.artifact_path is None:
+                    return ActivityResult(**fields, outcome="pending", download=observation)
+                return ActivityResult(
+                    **fields,
+                    outcome="success",
+                    download=observation,
+                    artifact_path=select_media_input(observation.artifact_path),
+                )
             if not request.input_path:
                 raise RemuxError("missing downloaded artifact")
             output = str(Path(self.output_dir) / str(request.operation_id) / "prepared.mp4")
             artifact = await prepare_media(request.input_path, output, self.remuxer)
+            artifact = await prepare_segments(
+                artifact,
+                Path(output).parent / "segments",
+                request.operation_id,
+                target_bytes=self.segment_target_bytes,
+            )
             return ActivityResult(**fields, outcome="success", prepared=artifact)
         except SourceUnavailableError:
             return ActivityResult(**fields, outcome="source_unavailable", error_code="SOURCE_UNAVAILABLE")

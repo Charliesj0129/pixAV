@@ -13,7 +13,11 @@ from datetime import timedelta
 from pathlib import Path
 
 import asyncpg
+from pydantic import ValidationError
 
+from pixav.library_projection.repository import RECONCILE_LOCK
+from pixav.library_projection.writer import publication_is_complete
+from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
 from pixav.shared.enums import TaskState
 from pixav.shared.metrics import record_cleanup_rejection
 
@@ -191,10 +195,12 @@ class LocalFileJanitor:
         *,
         download_dir: str,
         batch_size: int = 100,
+        library_root: str | None = None,
         apply_deletions: bool = False,
     ) -> None:
         self._pool = pool
         self._download_dir = download_dir
+        self._library_root = Path(library_root) if library_root else None
         self._batch_size = max(1, batch_size)
         # Deleting is opt-in for the whole deployment, not a per-call accident.
         self._apply_deletions = apply_deletions
@@ -207,28 +213,40 @@ class LocalFileJanitor:
     async def _publication_available(self, conn: asyncpg.Connection) -> bool:
         """Whether playback projection facts exist to be checked at all.
 
-        While LibraryProjection has not landed, no artifact can be shown to have
-        a complete projection, so cleanup refuses everything. That refusal is
-        correct: an unverified projection is exactly the case BDD-005 forbids.
+        On a schema that predates LibraryProjection no artifact can be shown to
+        have a complete projection, so cleanup refuses everything. That refusal
+        is correct: an unverified projection is exactly the case BDD-005 forbids.
         """
         return await self._table_available(conn, "library_publications")
 
     async def _verified_playback(self, conn: asyncpg.Connection, video_id) -> bool:
         """Whether playback was actually verified from the remote copy.
 
-        PlaybackResolver owns ``playable_assets``; it has not landed, so this
-        table does not exist and the condition is False for every artifact in
-        production. That is the blocking dependency, named -- the point of
-        naming it is that a refusal can say which producer is missing instead
-        of reporting a constant nobody can act on.
+        READY alone says the object was prepared; it does not say anyone ever
+        streamed it through the stable URL. Only a recorded end-to-end check of
+        a READY object whose remote asset is still DURABLE counts, so a copy
+        withdrawn after the check stops counting immediately. On a schema that
+        predates PlaybackResolver the table is absent and the gate stays shut,
+        naming the missing producer rather than reporting a constant.
         """
         if not await self._table_available(conn, "playable_assets"):
             return False
-        return bool(
-            await conn.fetchval(
-                "SELECT EXISTS(SELECT FROM playable_assets WHERE video_id=$1 AND state='READY')", video_id
-            )
+        row = await conn.fetchrow(
+            """SELECT p.*, now() AS checked_at FROM playable_assets p JOIN remote_assets r ON r.id=p.remote_asset_id
+                WHERE p.video_id=$1 AND p.state='READY' AND p.playback_verified_at IS NOT NULL
+                AND r.state='DURABLE'""",
+            video_id,
         )
+        if row is None:
+            return False
+        try:
+            evidence = row["playback_evidence"]
+            if isinstance(evidence, str):
+                evidence = json.loads(evidence)
+            client = ClientPlaybackEvidence.model_validate(evidence.get("client_playback"))
+            return client.matches(dict(row)) and row["ready_at"] <= client.observed_at <= row["checked_at"]
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            return False
 
     async def _authorized_target(self, conn: asyncpg.Connection, video_id, path: str) -> bool:
         """Whether one unexpired authorization names exactly these bytes.
@@ -245,6 +263,7 @@ class LocalFileJanitor:
         row = await conn.fetchrow(
             """SELECT a.artifact_sha256, a.size_bytes FROM cleanup_authorizations a
             JOIN remote_assets r ON r.id = a.remote_asset_id
+            JOIN playable_assets p ON p.remote_asset_id=r.id AND p.video_id=a.video_id AND p.state='READY'
             WHERE a.video_id=$1 AND a.path=$2 AND a.expires_at > now()
               AND r.video_id = a.video_id AND r.state='DURABLE'
             ORDER BY a.created_at DESC LIMIT 1""",
@@ -264,14 +283,23 @@ class LocalFileJanitor:
     async def _evaluate(self, conn: asyncpg.Connection, video_id, path: str) -> dict[str, bool]:
         """Recompute every gate condition for one artifact, on the DB clock."""
         published = False
-        if await self._publication_available(conn):
-            published = bool(
-                await conn.fetchval(
-                    """SELECT EXISTS(SELECT FROM library_publications
-                    WHERE video_id=$1 AND state='PUBLISHED')""",
-                    video_id,
-                )
+        if self._library_root is not None and await self._publication_available(conn):
+            publication = await conn.fetchrow(
+                """SELECT l.active_version, l.active_digest FROM library_publications l
+                JOIN playable_assets p ON p.id=l.playable_asset_id
+                JOIN remote_assets r ON r.id=p.remote_asset_id
+                WHERE l.video_id=$1 AND p.video_id=l.video_id AND l.state='PUBLISHED'
+                  AND p.state='READY' AND r.state='DURABLE'""",
+                video_id,
             )
+            if publication and publication["active_version"] and publication["active_digest"]:
+                published = await asyncio.to_thread(
+                    publication_is_complete,
+                    self._library_root,
+                    video_id,
+                    publication["active_version"],
+                    publication["active_digest"],
+                )
         row = await conn.fetchrow(
             """SELECT
                 EXISTS(SELECT FROM remote_assets WHERE video_id=$1 AND state='DURABLE') AS durable,
@@ -285,11 +313,10 @@ class LocalFileJanitor:
             path,
         )
         observed = {
-            # Two separate producers, so a refusal can say which one is absent.
-            # Neither is satisfiable today: Component D has not landed, so there
-            # is no verified playback to point at and no honest authorization
-            # anyone could write. Deletion stays closed, by contract rather than
-            # by a constant.
+            # Two separate producers, so a refusal can say which one is absent:
+            # a stream check recorded by PlaybackResolver, and an operator's
+            # exact-target authorization that cites that check. Without both,
+            # deletion stays closed by contract rather than by a constant.
             "verified_playback_evidence": await self._verified_playback(conn, video_id),
             "exact_target_backup_authorization": await self._authorized_target(conn, video_id, path),
             "durable_remote_asset": bool(row["durable"]),
@@ -338,6 +365,8 @@ class LocalFileJanitor:
                 # Hold the row for the whole decision so nothing can start
                 # reading, or open an execution, between the check and the unlink.
                 await conn.execute("SELECT id FROM videos WHERE id=$1 FOR UPDATE", video_id)
+                # Serialize with publication swap/withdrawal through the unlink.
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", RECONCILE_LOCK)
                 gates = await self._evaluate(conn, video_id, path)
                 if not all(gates.values()):
                     counts["rejected"] += 1

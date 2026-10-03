@@ -2,17 +2,25 @@
 
 Staging deletion is the one irreversible step in the pipeline, so these tests
 are written from the refusals inward: every guarantee is removed in turn and the
-artifact must survive. A stand-in publication table cannot authorize deletion:
-verified playback and exact-target backup authorization are not integrated yet.
+artifact must survive. Publication, playable objects and stream checks are real
+rows, written the way LibraryProjection and PlaybackResolver write them; only
+the last tests hold every guarantee at once, and only then is a file removed.
 """
 
 import hashlib
+import json
 import uuid
 from pathlib import Path
 
 import pytest
 
+from pixav.library_projection.artwork import ArtworkStore
+from pixav.library_projection.metadata import EffectiveMetadata
+from pixav.library_projection.render import render_projection
+from pixav.library_projection.repository import ArtworkRecord
+from pixav.library_projection.writer import ProjectionWriter
 from pixav.maxwell_core.gc import LocalFileJanitor
+from pixav.shared.remote_assets import RemoteAssetRepository
 
 pytestmark = pytest.mark.integration
 
@@ -73,22 +81,47 @@ async def artifact(db, tmp_path, *, durable=True, due=True):
 
 
 async def publish(db, video):
-    """Stand in for LibraryProjection so the approval path can be exercised."""
-    await db.execute("""CREATE TABLE IF NOT EXISTS library_publications (
-            video_id uuid PRIMARY KEY REFERENCES videos(id), state text NOT NULL)""")
+    """A complete projection of the video's READY object, as LibraryProjection records it.
+
+    A video with no remote copy has nothing that could be READY, so nothing is
+    published for it and the refusal names every guarantee that is missing.
+    """
+    playable = await playback_ready(db, video, verified=False)
+    if playable is None:
+        return
+    root = Path(await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video)).parent / "library"
+    store = ArtworkStore(root / "artwork")
+    root.mkdir(parents=True, exist_ok=True)
+    poster = root / "fixture.png"
+    poster.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic")
+    sha, size, mime = store.import_file(poster)
+    artwork = ArtworkRecord(
+        id=uuid.uuid4(), video_id=video, kind="poster", sha256=sha, size_bytes=size, media_type=mime
+    )
+    spec = render_projection(
+        video, EffectiveMetadata(title="Synthetic"), [artwork], resolver_base_url="http://resolver"
+    )
+    digest = spec.digest
+    ProjectionWriter(root, store).publish(spec, 1)
     await db.execute(
-        """INSERT INTO library_publications(video_id,state) VALUES($1,'PUBLISHED')
-        ON CONFLICT (video_id) DO UPDATE SET state='PUBLISHED'""",
+        """INSERT INTO library_publications(video_id,playable_asset_id,state,layout_version,projection_version,
+        desired_digest,active_digest,active_version,published_at)
+        VALUES($1,$2,'PUBLISHED','jellyfin-movie-v1',1,$3,$3,$4,now())""",
         video,
+        playable,
+        digest,
+        f"1-{digest[:12]}",
     )
 
 
 def janitor(db, tmp_path, *, apply=True):
-    return LocalFileJanitor(db, download_dir=str(tmp_path), apply_deletions=apply)
+    return LocalFileJanitor(
+        db, download_dir=str(tmp_path), library_root=str(tmp_path / "library"), apply_deletions=apply
+    )
 
 
 async def test_projection_absent_always_rejects_bdd_005_131(db, tmp_path):
-    """Component D/E have not landed, so nothing is cleanup-eligible yet."""
+    """Without a projection or a playable object, nothing is cleanup-eligible."""
     _, media = await artifact(db, tmp_path)
 
     stats = await janitor(db, tmp_path).cleanup()
@@ -296,15 +329,54 @@ async def test_eligibility_is_recomputed_rather_than_remembered_bdd_114(db, tmp_
 # ── The two named producers cleanup is waiting on ───────────────────────────
 
 
+async def playback_ready(db, video, *, verified):
+    """The video's READY playable object on its remote copy, stream-checked or not."""
+    remote = await db.fetchval("SELECT id FROM remote_assets WHERE video_id=$1", video)
+    if remote is None:
+        return None
+    playable = await db.fetchval("SELECT id FROM playable_assets WHERE video_id=$1 AND state='READY'", video)
+    if playable is None:
+        playable = uuid.uuid4()
+        await db.execute(
+            """INSERT INTO playable_assets(id,video_id,remote_asset_id,preparation_version,state,size_bytes,sha256,
+            ready_at,materialized_at) VALUES($1,$2,$3,'photos-playback-v1','READY',19,$4,now(),now())""",
+            playable,
+            video,
+            remote,
+            "d" * 64,
+        )
+    if verified:
+        observed = await db.fetchval("SELECT now()")
+        client = {
+            "method": "jellyfin-client-v1",
+            "video_id": str(video),
+            "playable_asset_id": str(playable),
+            "remote_asset_id": str(remote),
+            "preparation_version": "photos-playback-v1",
+            "sha256": "d" * 64,
+            "size": 19,
+            "observed_at": observed.isoformat(),
+            "client_version": "synthetic-client",
+            "server_version": "synthetic-server",
+            "operator": "test",
+            "recording_sha256": "e" * 64,
+            "beginning_audio_video": "PASS",
+            "middle_audio_video": "PASS",
+            "end_audio_video": "PASS",
+            "seek": "PASS",
+            "resume": "PASS",
+        }
+        await db.execute(
+            "UPDATE playable_assets SET playback_verified_at=now(),playback_evidence=$2::jsonb WHERE id=$1",
+            playable,
+            json.dumps({"client_playback": client}),
+        )
+    return playable
+
+
 async def playback_verified(db, video):
-    """Stand in for PlaybackResolver so the other half can be exercised alone."""
-    await db.execute("""CREATE TABLE IF NOT EXISTS playable_assets (
-            video_id uuid PRIMARY KEY REFERENCES videos(id), state text NOT NULL)""")
-    await db.execute(
-        """INSERT INTO playable_assets(video_id,state) VALUES($1,'READY')
-        ON CONFLICT (video_id) DO UPDATE SET state='READY'""",
-        video,
-    )
+    """PlaybackResolver's end-to-end stream check, so the other half can be exercised alone."""
+    await playback_ready(db, video, verified=True)
 
 
 async def authorize(db, video, media, **overrides):
@@ -358,6 +430,34 @@ async def test_verified_playback_alone_does_not_authorize_deletion_bdd_058(db, t
     assert stats["deleted"] == 0 and stats["rejected"] == 1
     assert media.exists()
     assert '"exact_target_backup_authorization": false' in await reasons_for(db)
+
+
+async def test_ready_without_a_stream_check_is_not_playback_evidence_bdd_058(db, tmp_path):
+    """Prepared is not played: only a recorded check through the stable URL counts."""
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_ready(db, video, verified=False)
+
+    await janitor(db, tmp_path).cleanup()
+
+    assert '"verified_playback_evidence": false' in await reasons_for(db)
+    assert media.read_bytes() == b"the only local copy"
+
+
+async def test_withdrawn_remote_copy_withdraws_playback_evidence_bdd_058_084(db, tmp_path):
+    """Invalidating the remote asset takes every playable object built on it along."""
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    remote = await db.fetchval("SELECT id FROM remote_assets WHERE video_id=$1", video)
+
+    await RemoteAssetRepository(db).invalidate(remote, "READBACK_FAILED")
+
+    playable = await db.fetchrow("SELECT state, invalidated_reason FROM playable_assets WHERE video_id=$1", video)
+    assert playable["state"] == "INVALID" and playable["invalidated_reason"] == "REMOTE_ASSET_INVALID"
+    await janitor(db, tmp_path).cleanup()
+    assert '"verified_playback_evidence": false' in await reasons_for(db)
+    assert media.read_bytes() == b"the only local copy"
 
 
 async def test_an_authorization_for_a_neighbouring_path_authorizes_nothing_bdd_058(db, tmp_path):
@@ -423,3 +523,60 @@ async def test_an_authorization_loses_its_footing_when_the_asset_does_bdd_058(db
     reasons = await reasons_for(db)
     assert '"durable_remote_asset": false' in reasons
     assert '"exact_target_backup_authorization": false' in reasons
+
+
+# ── Every guarantee at once ─────────────────────────────────────────────────
+
+
+async def test_every_guarantee_together_removes_exactly_the_approved_target_bdd_058_063_134(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    neighbour = tmp_path / "unrelated.mp4"
+    neighbour.write_bytes(b"not approved")
+
+    preview = await janitor(db, tmp_path, apply=False).cleanup()
+    assert preview["eligible"] == 1 and preview["deleted"] == 0 and media.exists()
+    assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 0
+
+    stats = await janitor(db, tmp_path).cleanup()
+
+    assert stats["deleted"] == 1 and stats["rejected"] == 0
+    assert not media.exists() and neighbour.read_bytes() == b"not approved"
+    decision = await db.fetchrow("SELECT * FROM cleanup_audit")
+    assert decision["decision"] == "deleted" and decision["applied"] is True and decision["path"] == str(media)
+    assert all(json.loads(decision["reasons"]).values())
+    # The domain no longer treats the local file as authoritative; the remote
+    # copy and the playable object it backs are untouched.
+    assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
+    assert await db.fetchval("SELECT state FROM remote_assets WHERE video_id=$1", video) == "DURABLE"
+    assert await db.fetchval("SELECT state FROM playable_assets WHERE video_id=$1", video) == "READY"
+
+
+async def test_publication_of_a_superseded_object_is_not_complete_bdd_005_131(db, tmp_path):
+    """The library must stream the object that is READY now, not one it replaced."""
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    old = await db.fetchval("SELECT id FROM playable_assets WHERE video_id=$1", video)
+    await db.execute("UPDATE playable_assets SET state='STALE' WHERE id=$1", old)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+
+    stats = await janitor(db, tmp_path).cleanup()
+
+    assert stats["deleted"] == 0 and stats["rejected"] == 1
+    assert media.read_bytes() == b"the only local copy"
+    reasons = await reasons_for(db)
+    assert '"complete_publication": false' in reasons and '"verified_playback_evidence": true' in reasons
+
+
+async def test_deleted_poster_blocks_cleanup_even_with_published_row(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    poster = tmp_path / "library" / "library" / f"pixav-{video}" / "poster.png"
+    poster.unlink()
+    async with db.acquire() as conn:
+        gates = await janitor(db, tmp_path)._evaluate(conn, video, str(media))
+    assert gates["complete_publication"] is False
+    assert media.exists()

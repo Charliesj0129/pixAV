@@ -11,11 +11,12 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, Response, StreamingResponse
 
 from pixav.shared.exceptions import ResolveError
-from pixav.shared.metrics import get_metrics_output
+from pixav.shared.metrics import get_metrics_output, record_playback_request
 from pixav.strm_resolver.cache import CdnCache
+from pixav.strm_resolver.playback import parse_byte_range, resolve_eligibility, serve_managed
 
 router = APIRouter()
 
@@ -71,31 +72,6 @@ def _local_share_scheme(request: Request) -> str:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return "pixav-local://"
-
-
-def _parse_byte_range(value: str, size: int) -> tuple[int, int]:
-    """Parse one RFC 7233 byte range, rejecting multipart/invalid requests."""
-    if not value.startswith("bytes=") or "," in value:
-        raise ValueError("unsupported byte range")
-    spec = value.removeprefix("bytes=").strip()
-    if "-" not in spec:
-        raise ValueError("invalid byte range")
-    start_raw, end_raw = spec.split("-", 1)
-    try:
-        if not start_raw:
-            suffix = int(end_raw)
-            if suffix <= 0 or size <= 0:
-                raise ValueError("invalid suffix range")
-            start = max(0, size - suffix)
-            end = size - 1
-        else:
-            start = int(start_raw)
-            end = size - 1 if not end_raw else min(int(end_raw), size - 1)
-            if start < 0 or start >= size or end < start:
-                raise ValueError("unsatisfiable byte range")
-    except ValueError as exc:
-        raise ValueError("invalid byte range") from exc
-    return start, end
 
 
 async def _stream_file(path: str, *, start: int, end: int) -> AsyncIterator[bytes]:
@@ -188,14 +164,33 @@ async def _resolve_cdn(request: Request, video_id: str) -> tuple[str, str]:
 
 @router.get("/resolve/{video_id}")
 async def resolve_video(video_id: str, request: Request) -> dict[str, str]:
-    """Resolve video share URL to CDN URL."""
+    """Resolve video share URL to CDN URL; a managed video only has its stable URL."""
+    parsed_video_id = _parse_uuid(video_id)
+    eligibility = await resolve_eligibility(_get_db_pool(request), parsed_video_id)
+    if eligibility is not None:
+        # No provider URL for a managed video ever leaves pixAV (BDD-064, 065).
+        return {
+            "video_id": video_id,
+            "stream_url": f"{str(request.base_url).rstrip('/')}/stream/{video_id}",
+            "source": "managed",
+            "state": "READY" if eligibility.playable_asset_id is not None else "INCOMPLETE",
+        }
     cdn_url, source = await _resolve_cdn(request, video_id)
     return {"video_id": video_id, "cdn_url": cdn_url, "source": source}
 
 
-@router.get("/stream/{video_id}")
-async def stream_video(video_id: str, request: Request) -> RedirectResponse:
-    """Resolve then redirect to CDN URL."""
+@router.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
+async def stream_video(video_id: str, request: Request) -> Response:
+    """Serve a managed video from the verified cache; redirect a legacy one to its CDN URL."""
+    parsed_video_id = _parse_uuid(video_id)
+    db_pool = _get_db_pool(request)
+    eligibility = await resolve_eligibility(db_pool, parsed_video_id)
+    if eligibility is not None:
+        return await serve_managed(request, db_pool, eligibility)
+    if request.method == "HEAD":
+        # The legacy path answers GET only; a HEAD must not start a provider resolution.
+        raise HTTPException(status_code=405, detail="Method Not Allowed", headers={"Allow": "GET"})
+    record_playback_request("legacy")
     cdn_url, _source = await _resolve_cdn(request, video_id)
     return RedirectResponse(url=cdn_url, status_code=302)
 
@@ -256,7 +251,7 @@ async def local_video(video_id: str, request: Request) -> StreamingResponse:
     headers = {"Accept-Ranges": "bytes"}
     if range_header:
         try:
-            start, end = _parse_byte_range(range_header, size)
+            start, end = parse_byte_range(range_header, size)
         except ValueError as exc:
             raise HTTPException(
                 status_code=416,

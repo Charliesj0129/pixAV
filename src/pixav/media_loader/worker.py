@@ -183,19 +183,37 @@ async def run_loop(  # noqa: C901
             from pixav.shared.workflow import MANAGED_QUEUE, require_workflow_role
 
             await require_workflow_role(pool, "pixav_activity_worker")
-            activity_worker = MediaActivityWorker(pool, client, remuxer, output_dir=settings.remux_dir)
+            activity_worker = MediaActivityWorker(
+                pool,
+                client,
+                remuxer,
+                output_dir=settings.remux_dir,
+                segment_target_bytes=settings.media_segment_target_bytes,
+            )
             activity_queue = TaskQueue(redis=redis, queue_name=MANAGED_QUEUE)
             await activity_queue.requeue_inflight()
-            while True:
-                if is_paused_value(await redis.get(settings.system_pause_key)):
-                    await asyncio.sleep(5)
-                    continue
-                disk_status = await disk_guard.check_and_latch()
-                try:
-                    await activity_worker.run_one(activity_queue, download_paused=disk_status.paused)
-                except Exception:
-                    logger.warning("managed activity dependency unavailable; authority retains recovery ownership")
-                await asyncio.sleep(1)
+
+            async def consume_media() -> None:
+                while True:
+                    if is_paused_value(await redis.get(settings.system_pause_key)):
+                        await asyncio.sleep(5)
+                        continue
+                    disk_status = await disk_guard.check_and_latch()
+                    try:
+                        await activity_worker.run_one(activity_queue, download_paused=disk_status.paused)
+                    except Exception:
+                        logger.warning("managed activity dependency unavailable; authority retains recovery ownership")
+                    await asyncio.sleep(1)
+
+            # Maxwell still permits exactly one activity per stage. Two consumers
+            # let its bounded download check run while its one prepare uses CPU.
+            consumers = [asyncio.create_task(consume_media()) for _ in range(2)]
+            try:
+                await asyncio.gather(*consumers)
+            finally:
+                for consumer in consumers:
+                    consumer.cancel()
+                await asyncio.gather(*consumers, return_exceptions=True)
 
         logger.info("media-loader worker started, listening on %s", download_queue.name)
         try:
