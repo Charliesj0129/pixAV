@@ -6,6 +6,18 @@ pixAV 將外部媒體來源可靠地轉換成「已驗證、可長期從 Google 
 
 Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發環境windows-android-emulator--docker-runner)。操作者回報 redroid 自訂 WSL kernel 造成 Docker／WSL 相容性問題；本專案不再要求為 Android 修改 `.wslconfig` kernel。新開發入口與既有 redroid managed 上傳的遷移分開驗收。
 
+## 設計 checkpoint 與重跑起點
+
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。軟體檢查為 1,852 passed／8 skipped，完整 coverage 約 82.56%；Ruff／Black／isort／mypy 與兩份工具／CI Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。Docker 資料磁碟搬移以當次成功收據為準。
+
+2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
+
+保留 PostgreSQL、roles／ledger／queue checkpoint、guest／ownership、認證及未知上傳 operation。舊 DB、publication、驗證收據與 JSON manifest 僅供 reconciliation；已刪除的本地媒體與錄影不得被當作仍存在或有效的驗收。舊 execution 不自動 resume／replay，未知遠端結果先 reconciliation，不能換新 operation 盲目重傳同一筆媒體。
+
+repository 只保留 [Windows Android 工具入口](docker-compose.android-runner.yml) 與 [CI PostgreSQL／Redis 入口](docker-compose.integration.yml)。舊 base／prod／direct／playback／first-4k／indexer Compose 和啟動 shell 已退休，舊單片 CLI 僅保留唯讀 status。業務模組、歷史 Git checkpoint、操作守衛與 BDD 保留；這不表示 Windows managed upload adapter 或新的應用部署已完成。下一個 agent 先完成指定上傳環境的 adapter／execution ownership 與可回復部署，再從新的隔離 cohort 跑通 Golden Path。
+
+備份及還原工作目錄必須實際位於 D 槽，且在部署 data、staging、cache 與 cleanup 掃描範圍之外；Ubuntu 的 C 槽 LocalState 是指向 D 槽的 junction，不能遞迴刪除。加密保留資料須完整還原驗證；Docker 資料磁碟另做一致離線備份、還原與原 daemon／volume 身分核對。離機備份、整機恢復與 production promotion 保持 OPEN。私有 exact-target manifest、刪除 audit 與備份收據留在 `.verify/` 及專案外私有 vault，不放進 Git。
+
 ## 完成標準
 
 同一個 `video_id` 必須走完：來源選擇 → qBittorrent 下載 → ffprobe 檢查與必要 FFmpeg 準備 → 指定 Pixel-compatible environment 上傳 → 全新 cold path 回載與完整性驗證 → `RemoteAsset.DURABLE` → `PlayableAsset.READY` → `.strm + .nfo + artwork` 發布 → Jellyfin 實播及 seek → 安全刪除 staging → 清空可重建播放 cache 後，再由 Photos 恢復播放及 seek。
@@ -14,29 +26,23 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 五個核心邊界
 
-### 本次階段 3–5 隔離驗收契約
+### 新一輪隔離驗收契約
 
-操作者已授權本輪以固定版本 Restic 的本機加密完整備份、`check --read-data` 與同機空白環境的完整還原，替代 cleanup 前的離機目的地要求。repository 必須位於部署 data、staging、cache 及 cleanup 掃描範圍之外；保留 100 GiB／10% disk latch，先盤點 guest、volumes、完整還原空間與底層實體磁碟。備份包含 DB／roles／ledger、upload／usage／execution／queue checkpoint、runtime journal／guest、正確 staging／錯誤副本、Jellyfin config／觀看紀錄、publication／完整影音 evidence，以及 source／設定／映像／secrets；一致快照禁止直接複製正在變動的 DB 或 Jellyfin 資料檔。還原不得覆寫現有實例，guest 外連须封鎖並實測，worker 不得自動取得 execution ownership。此為授權契約，尚非已完成的 backup／restore 收據；離機備份、整機故障恢復與 production promotion 保持 OPEN。
+合成媒體與真實媒體各自驗證，不把過去人工確認、舊 cohort 或已刪錄影升級成新證據。cold 回載只接受全新 session、空白工作目錄及必要認證；不掛 staging／guest／播放 cache。challenge 交人工處理，原件尚未可用時等待 provider 或 reconciliation，不重傳。
 
-階段 3 的登入原帳號下載須在獨立瀏覽器完成，僅匯出必要認證資料，不匯出 profile 或媒體 cache；登入與回載環境不得掛 staging、guest、播放 cache、備份、DB credential 或 Docker socket。同帳號／owner 沿用 UI 互斥，失聯停止。storage verification 與 playback rebuild 必須共用下載 adapter、各次全新 browser context／空白工作目錄；認證模式、帳號／item／session 綁定、原件 digest 與隔離條件以版本化收據驗證，秘密不入收據。登入模式未完成 live contract 前不得宣告已可正常恢復。登入後至多兩輪、每輪三十分鐘查證，原件傳輸沿用 cold timeout；challenge 或 session 過期交人工，不重送帳密或重傳媒體。只有 exact 原件完整性通過，才走原 operation 的 dry-run review／Maxwell apply；四筆成功 operation 與四筆 marker 必須一一對應。
-
-階段 4 須三片 DURABLE／READY／完整 publication、完整 HTTP 與新的第三片 Jellyfin 影音／seek／resume／所有交界證據及操作者覆核；前兩片有效 v2 證據保留。全部上傳結果確定且無 UI writer 後才開始有效容量採樣，每五分鐘一次，gap 超過九百秒重新起算，不補造中斷樣本；連續二十四小時及帳戶外部活動歸因缺一不可。階段 5 只在上述關卡、完整備份還原及 retention 全通過後，依 exact-target manifest／既有 journal、reader 與 path 守衛逐片 cleanup，清 cache 後透過正常 Photos 流程重建，重新錄影並人工覆核；失敗停止下一片清理。登入取不到原件停階段 3，人工／容量證據不足停階段 4，備份／空間／retention／守衛不足停在刪除前（BDD-078、119、122、125、143）。
+至少三個媒體、至少一個分段，全部片段須通過版本化完整性政策。之後完成 Jellyfin 影音／seek／resume／交界與人工確認，再取得沒有採樣缺口的二十四小時 quota 證據。正式 cleanup 仍依 exact-target、完整備份還原、retention、reader 與 operation 守衛；本次人工丟棄測試影片的例外不可套用到未來 production（BDD-078、119、122、125、143）。
 
 原帳號下載的工作區實作使用 `PIXAV_PHOTOS_COLD_AUTH_SECRET` 指向 worker 可讀的私有 cookie-only JSON（檔案 0600、所在目錄 0700）；空值維持匿名模式。[認證 adapter](src/pixav/pixel_injector/photos_auth.py) 核對 DB 帳號、retained guest owner 與瀏覽器帳號 digest；只將驗證後的 cookies 經記憶體 stdin 傳入新 browser context，不把 secret、profile 或媒體 cache 掛進 child。storage verification 與 playback rebuild 共用 [download_original](src/pixav/pixel_injector/parts_download.py)，登入模式拒絕預填媒體，要求唯一 exact item、完整檔名、full hash／size、影音探測及全片解碼。[`photos-cold-account-v1`](src/pixav/shared/cold_receipts.py) 收據綁定帳號、owner、session、item／filename digest 與原件 digest；upload review、durability、playback 及使用同一 policy 的 observer 都重驗此收據。匿名歷史收據保持原義，缺少或錯誤的新版本欄位不降級接受。challenge／session 過期使 storage 或 playback execution 進 `USER_ACTION_REQUIRED`，不以匿名、staging 或重傳 fallback。
 
 登入 cold child 只掛該次 `/work:rw`、2 CPU／4 GiB；沿用 [storage-tools](docker/storage-tools.Dockerfile)／[Photos tools](docker/photos-canary.Dockerfile) 的 Playwright 1.55.0（Apache-2.0）、Chromium 與 FFmpeg，依固定映像保留其版本與授權資訊，不增服務或 migration。頁面導覽六十秒、元素三十秒、download event 六百秒，storage activity 上限六小時，playback 依段數乘六小時；FFmpeg 全片解碼也受 activity deadline 限制。隔離 cold 基底實測為 FFmpeg 6.1.1-3ubuntu5（GPL build）；解碼保留輸入原生 time base，避免有效 VFR 影格在名目幀率網格碰撞，仍拒絕非零退出或任何 error 診斷。UI 鎖失聯先停止並移除該 exact child 才結束擁有權；服務 health／metrics 沿用 storage／playback worker，人工處理原因為 `PHOTOS_ACCOUNT_SESSION_REQUIRED`。secret 與必要收據納入私有加密備份，不能以瀏覽器 profile 取代 secret。部署前須固定 source／build context／image digest，成對更新相容的 authority／worker；回退也必須能理解登入收據與人工處理結果，不能交給會忽略新契約的舊 process。上述是工作區實作，尚非新版部署或完整 live／production 驗收。
 
-登入 adapter 修改後的完整檢查為 1,859 passed／8 skipped、coverage 82.49%，包含核對身分的真 PostgreSQL／Redis integration；新真實 FFmpeg 合成回歸另行通過，Ruff／Black／isort／mypy 與兩份 Compose 檢查通過。後續依賴精簡另行驗證，不沿用上述結果。固定 cold 映像已建置，未部署至 live 服務。登入正向控制已取回原件，完整 hash／size／codec／duration 通過；保留原生 time base 後的全片解碼仍產生兩筆非單調輸出 DTS 診斷，即使 exit 0 仍維持 FAIL，不能推定原件損壞或解碼契約通過。第三片第二段本輪原帳號查證未啟動；容量與正向控制解碼皆為阻塞，沒有 apply／重傳／媒體 cleanup。
+目前保留的是登入 adapter 與契約實作；舊軟體檢查和 live 收據不代表本次 checkpoint 或新 cohort 已驗收。完整解碼、原 operation reconciliation、Windows 指定上傳環境及人工實播需重新取得當次證據。
 
 ### Docker 資料磁碟搬移前置
 
-操作者已明確授權立即搬移 Docker 資料並在守衛通過後釋放舊 C 槽副本，同時減少 D 槽占用及精簡專案。2026-10-10 盤點：Docker Desktop 4.30.0 使用 WSL2 的 `docker-desktop-data`，資料 VHD 約 135.07 GiB；2026-10-11 搬移 preflight 的 C／D 實體餘額約 12.96／320.83 GiB。Ubuntu 工作資料已在 D 槽。保留 59 個 volumes、195 個映像、原 operation、staging、認證 secret 與證據，停止的其他專案保持停止。數字僅為時點盤點，不能取代執行前的實體容量守衛。
+當前 Windows Docker Desktop 使用 `wsl/disk/docker_data.vhdx`，不能沿用已不存在的 `docker-desktop-data` registration 或舊 `wsl/data/ext4.vhdx` 搬移腳本。保留所有專案的 volumes、映像與停機政策；其他專案不得隨 daemon 恢復自動啟動。
 
-搬移前重新核對原 daemon、DB identifier／ledger、帳號／owner／guest／映像、三筆成功上傳／三筆 usage 及唯一 Maxwell；當時全部 bind 的實際 device／inode／內容一致，包含 Jellyfin `/media` 與 `/cache`。以自身 pause token 停寫，保存完整 DB custom dump、roles、逐表 digest、ledger 與 queue checkpoint，記錄 exact 容器及原 restart policies，全部服務與 Desktop 已停止。這些 sidecar 不能代替完整 VHD 備份還原或階段 5 完整應用還原。
-
-固定 [Restic 0.19.1](https://github.com/restic/restic/releases/tag/v0.19.1) 的官方簽章與 SHA-256 已核實，但完整備份尚未建立：兩個 Docker distro 停止後，WSL 仍持有資料 VHD，官方 [export VHD](https://learn.microsoft.com/en-us/windows/wsl/basic-commands#export-a-distribution) 亦回報 sharing violation。操作者於 2026-10-11 接續指示搬移，已授權先前說明的全 WSL 釋鎖中斷範圍。重新核對全部 15 個原容器自一致 checkpoint 後未啟動，原映像與掛載欄位不變，28 個 bind 的 host 路徑／inode／內容已記錄；Desktop 已再次停止。Windows 背景作業的語法、SHA-256 與 dry-run 通過，串接完整加密備份、實際全碟還原、精確演練暫存清除、受支援搬移及原實例核對；未有成功收據的步驟仍未完成。Docker 要求 [VHD 備份前完全停止 Desktop](https://docs.docker.com/desktop/settings-and-maintenance/backup-and-restore/)。
-
-釋鎖後先以本機加密 repository 備份、`check --read-data`，再實際還原至新空白目錄並核對 full hash。容量預算同時保留完整 135.07 GiB 還原、100 GiB／10% reserve 及額外餘裕，repository 上限 80 GiB；壓縮不足即停止，不先刪原件。WSL 2.6.3 實機 help 已核對 `--manage ... --move`，可維持原 registration 搬至新空白 `D:\DockerDesktopData`；先精確清除已驗證的演練暫存，保留加密備份及還原收據，避免第三份大副本。重新啟動後仍須核對原 daemon、完整集合、DB／queue、實際 mounts 與唯一 Maxwell，再只解除自身 pause。VHD compact 另驗正確 filesystem、卸載條件與實體配置量。原 C 資料尚未刪除或搬移，離機、整機恢復、階段 5 與 production 關卡保持 OPEN。
+搬移前核對當前 daemon、原容器／volume 集合、DB identifier／ledger、queue checkpoint 與實際 bind 身分；一致離線加密備份和獨立完整還原通過後，才改變資料位置並精確清除原 C 副本。目的地、備份、還原及 staging 均核對底層實體磁碟，保留 100 GiB／10% reserve。全 WSL 釋鎖若新增其他專案中斷範圍，須取得當次授權。搬移成功、刪檔與 Windows 實體容量釋放各自以收據判定。
 
 ### 架構邊界
 
@@ -230,7 +236,7 @@ flowchart LR
 
 新入口重用 [Photos tools Dockerfile](docker/photos-canary.Dockerfile)，Maestro 2.10.0（Apache-2.0）與 Playwright 1.55.0（Apache-2.0）沿用既有版本；ADB、OpenJDK 21、FFmpeg 與基底的實際版本／license 清單依固定映像記錄，不把 apt 套件當作已固定的 SDK 版本。Windows Emulator、Platform-Tools、system image package／revision、Photos／Play 版本與 AVD 設定 digest 也必須記錄，SDK／system image 遵循 [Android SDK 授權](https://developer.android.com/studio/terms)。runner 要指定已存在的 immutable image ID 或 digest，`pull_policy: never` 防止開發時拉取另一版本；Compose 的必填檢查不會替代 image identity 驗證。
 
-AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 AVD；這是 guest 配置，host RAM／GPU 開銷須另量測，開機與 UI timeout 也須實測。runner 的 `/tmp`、`/root`、`/work` 都是有限 tmpfs，CLI 狀態與報告不持久化；要保存 evidence 時另由操作者寫入私有 0700／0600 目錄。Windows AVD、WSL／Docker VHD 與 staging 所在實體分區各自檢查容量，不以 WSL `df` 代替 Windows 實體餘額。
+AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 AVD；這是 guest 配置，host RAM／GPU 開銷須另量測，開機與 UI timeout 也須實測。runner 的 `/tmp`、`/root`、`/work` 都是有限 tmpfs，CLI 狀態與報告不持久化；要保存 evidence 時另由操作者寫入私有 0700／0600 目錄。Windows SDK／新 AVD 與備份設在 D 槽；SDK 已搬到 `D:\Android\Sdk`，原 C 路徑僅為相容 junction。Windows AVD、WSL／Docker VHD 與 staging 所在實體分區各自檢查容量，不以 WSL `df` 代替 Windows 實體餘額。
 
 ### Docker Runner 開發入口
 
@@ -239,7 +245,7 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 先在 Windows 安裝 Android SDK／Emulator、啟用 WHPX，透過 Device Manager 建立專用 AVD；依 host 架構選 system image，需 Photos／Play 的映像另驗登入及指定上傳能力。以下 PowerShell 的 SDK 路徑與 AVD 名稱是範例，使用前核對實際位置與版本：
 
 ```powershell
-$pixavSdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk'
+$pixavSdk = 'D:\Android\Sdk'
 $pixavAdb = Join-Path $pixavSdk 'platform-tools\adb.exe'
 $pixavEmulator = Join-Path $pixavSdk 'emulator\emulator.exe'
 & $pixavEmulator -accel-check
@@ -258,7 +264,7 @@ Windows 是唯一 ADB server owner。先核對 5037 listener 與 Windows Firewal
 已有 server 時先核對 owner／版本／listen address，不直接 `taskkill` 或 `kill-server`。另一個 PowerShell 視窗使用相同 SDK 路徑啟動已核對的 AVD；`5554` 被占用就停止查證，不接到另一裝置。禁用 Quick Boot snapshot 載入／保存，保留 userdata；不使用 `-wipe-data`。
 
 ```powershell
-$pixavSdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk'
+$pixavSdk = 'D:\Android\Sdk'
 $pixavEmulator = Join-Path $pixavSdk 'emulator\emulator.exe'
 $pixavAdb = Join-Path $pixavSdk 'platform-tools\adb.exe'
 & $pixavEmulator -avd pixav-dev -port 5554 -cores 2 -memory 4096 -no-snapshot-load -no-snapshot-save
@@ -315,93 +321,20 @@ AVD userdata、system image／SDK rebuild manifest、設定、ADB keys、runtime
 
 ## 部署與資料操作
 
-僅啟動當前階段必要的服務，先核對並重用既有容器，不整組啟動未需要的服務或建立重複部署。臨時驗證容器逐一執行、完成即移除；錯誤或已被取代的部署以 exact container ID 移除，保留資料 volumes、staging 與證據，不使用 prune。階段 3／4 不需要重新啟動已完成的來源、下載、媒體準備或 migration 服務。
+目前的兩份 Compose 各自獨立使用，不啟動舊 application executor：
 
-目前 repository 使用 Python 3.10+、uv、FastAPI、PostgreSQL、Redis 與 Docker Compose。先按 [.env.example](.env.example) 建立私有 `.env`、配置所選入口需要的設定。Windows 開發使用前述獨立 Android runner；以下 base／prod／direct 為**既有尚未遷移的 worker 部署**，不是新 Emulator 上傳入口。程式的 `PIXAV_PIXEL_INJECTOR_MODE` 仍預設 `redroid`，managed 上傳只在 `redroid` 且 `PIXAV_MANAGED_MEDIA_WORKFLOW=true` 時啟動；本機不得為它啟用已知不相容 kernel。明確設 `local` 才是 local finalize，該模式保留本地媒體，不滿足遠端 durability。legacy 的 `PIXAV_STORAGE_STAGING_DIR` 是 tools 唯讀 staging root，`PIXAV_STORAGE_GUEST_DATA_DIR` 是 guest 的 `/data`，兩者都不得指向下載目錄或播放 cache。
+- `docker-compose.android-runner.yml`：Windows Emulator 的 ADB／Maestro 工具，設定及合成媒體守衛見前文。
+- `docker-compose.integration.yml`：固定映像的專用 PostgreSQL／Redis，loopback ports、資源限制及 tmpfs 資料。只供本機測試／CI，結束以 exact container ID 清除，不碰既有 volumes。
 
-正式部署只保留兩組：VPN 使用 base＋prod；non-VPN 使用 base＋prod＋direct。integration／first-4k Compose 僅供隔離測試。入口 [start_workers.sh](scripts/start_workers.sh) 必填 `--mode vpn|direct`、`--context`、`--project` 與 Compose command，只啟動容器，不再建立 tmux workers。以下 `default` 是 context 名稱範例，必須先確認它指向預期 Docker Desktop daemon；專案名稱必須沿用既有 volume ownership。
+CI 先依序建立 PostgreSQL、Redis，從 exact container 取得 DB identifier／Redis run ID，再啟用 `PIXAV_RUN_INTEGRATION=1`。本機完整檢查依 [AGENTS.md](AGENTS.md#驗證)。新 application 部署尚待依目前設計補齊，不能由 CI 或 Android runner 健康推定 Photos 上傳／quota 契約通過。
 
-```bash
-uv sync
-docker context ls
-docker --context default info --format 'daemon={{.Name}} id={{.ID}}'
-scripts/start_workers.sh --mode direct --context default --project pixav config -q
-scripts/start_workers.sh --mode vpn --context default --project pixav config -q
-scripts/start_workers.sh --mode direct --context default --project pixav ps -a
-scripts/start_workers.sh --mode direct --context default --project pixav exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT system_identifier, current_database() FROM pg_control_system();"'
-scripts/start_workers.sh --mode direct --context default --project pixav exec -T redis redis-cli INFO server
-```
-
-以上 identity 查詢不構成 apply 授權。既有環境先確認 Docker daemon/context、DB identifier/database、Redis run ID、container labels 與 volumes，不能建立空白環境代替原資料。所有操作沿用同一 context/project；不要繼承 `COMPOSE_PROFILES`。`config` 不加 `-q` 可能輸出解析後的 credential，不可存入公開 evidence。
-
-以下建置／切換命令保留供已驗證相容的既有部署使用；受影響的 Windows host 在 managed adapter 遷移前不得啟動 redroid 上傳 worker。legacy runtime 的 immutable Pixel-compatible image、binder、ADB／Maestro 與登入需求不能透過改本機全域 kernel 滿足。新 Windows AVD 使用獨立 system-image／AVD manifest，不套用 [redroid profile](config/android_profiles.yml) 的 image／`ro.*` container arguments。VPN 模式的 TUN、host bind 與指定上傳能力在各自環境實測；缺任一項保持阻擋。依 [.env.example](.env.example) 設 managed 的獨立 DB 角色、固定 `PIXAV_STORAGE_WORKER_OWNER` 與 `PIXAV_HOST_PROJECT_ROOT`。`data` 必須在 loader／storage／resolver 看到相同路徑；guest staging、guest `/data` 與 cold read-back 分開。相容的既有部署先建置 [storage-tools](docker/storage-tools.Dockerfile) 與 [Maestro tools](docker/photos-canary.Dockerfile)，確認 profile 指定映像已存在，再建置 Compose workers：
-
-```bash
-docker --context default build -f docker/storage-tools.Dockerfile -t pixav-storage-tools:1 .
-scripts/start_workers.sh --mode direct --context default --project pixav build
-# 完成下述 migration／ownership／副作用守衛後才 up：
-scripts/start_workers.sh --mode direct --context default --project pixav up -d
-```
-
-切換模式前先以目前模式停止 admission／authority 與 activity workers（`sht_probe maxwell_core media_loader storage_worker pixel_injector`），核對 active attempt、guest、operation intent 與未知上傳結果，完成 reconciliation；不可把未知結果當失敗重傳。確認沒有 host/tmux 重複 executor，managed execution 只能由 Maxwell authority 推進，upload concurrency 固定 1。接著以舊模式 `stop qbittorrent`；VPN → direct 還需以 VPN 組合 `stop vpn_sentinel gluetun`，profile 排除不會停止既有容器。重新檢查新模式 `config -q` 後，以新模式 `up -d`。direct 透過 `qbittorrent` 連線且關閉 loader egress monitor；VPN 透過 `gluetun` 並等待 tunnel healthy，不可失敗後自動切 direct。
-
-rollback 也先停止派送、核對 ownership／外部副作用，再使用相容映像與同一 mode/context/project；需要資料回復時使用已驗證的同實例備份。保留 guest、媒體與 volumes，不使用 `down -v`，不把 managed execution 交回 legacy worker。完整 Phase 0 前保留 fallback。
-
-[migrate](docker/migrate.Dockerfile) 會執行 pending migration，worker 以其成功作啟動依賴。008 新增來源候選、009 移除 CDN 欄位、010／011 新增分段與 heartbeat、012 建立 managed execution 與其資料庫角色、013 建立 RemoteAsset、account lease、reader lease 與 cleanup audit；014 補上失聯恢復記錄、自訂 lease 與舊 task 的 ownership 守衛；015 把上傳 guest 的建立記成 journal，crash 後由人工判定而非重建；016 只補上 activity worker 實際執行的 accounts 讀取；017 加上 `remote_assets.reverified_at` 與到期索引，並把每段都已冷回載卻停在 CREATED 的資產推進到 VERIFIED（只依資料庫既有事實，不新增判斷）；018 建立 `cleanup_authorizations`，授權對象是一個 exact target 而非 glob，且只授予 execution authority 讀取權；019 建立 `playable_assets`（每 video 至多一個 READY，每個 remote asset 與準備版本至多一個 PREPARING 或 READY）、衍生的 `playback_cache_requests` demand 訊號、`executions.stage` 的 `playback`，以及只能讀播放資格與寫 demand 的 `pixav_playback_reader` group role，RemoteAsset invalidate 會在同一交易把其 PlayableAsset 轉 INVALID；020 建立 `library_publications`（四態，PUBLISHED 必須記錄 active digest／version 與所串流的 PlayableAsset）、`video_metadata_overrides`（依欄位檢查 JSON 型別）與 `video_artwork`（每 video／kind 至多一個 retained 原件），authority 只能寫 publication、只讀 override 與 artwork。升級前停會推進狀態的 worker，核對相容性、同實例 full backup／sidecar 與 restore；舊 process 不可跨不相容 schema 繼續執行。完成必要驗收後才部署，rollback 使用已驗證 restore 與相容映像，不手寫反向 SQL、不在正式環境 `down -v`。
-
-[base Compose](docker-compose.yml) 的 qBittorrent 共用 gluetun network namespace，VPN kill switch 必須以 tunnel failure 實測阻流。`vpn_sentinel` 與 loader 使用相同 `PIXAV_VPN_EGRESS_ECHO_URL`，出口 IP 比對只告警，過期為 unknown。WebUI 預設 8085、indexer 9117、browser helper 8191、resolver 8000、worker health 8001–8005 與 8007（`storage_worker` 為 8005，`playback_worker` 為 8007）；`stash`、`monitoring` 為 optional profiles。production override 的存在不代表版本/license、資源限制或安全 gate 全部已合格。
-
-migration runner 以 PostgreSQL session advisory lock 序列化 ledger 讀取與套用；每份 SQL 與 `_migrations` 記錄在同一交易提交，連線關閉釋放鎖。managed storage／playback cold worker 使用 storage-tools 映像內程式，不以工作區 source bind 覆蓋；須重建並固定映像後才能建立新版 live evidence。歷史 cold reconciliation 仍接受既有只讀 source＋work 契約，新 worker 僅允許 work mount。HTTP 重驗保留同一 READY 物件且身分、hash、size 與觀察時間均有效的既有版本化 client 證據；v2 另重核當前完整 manifest、prepared source digest 與所有交界；不符者不沿用。以上為目前實作契約，完整新版本 Golden Path 與正式切換仍未驗收。
-
-Cookie 用 `PIXAV_CRAWL_COOKIE_FILE` 指向私有檔案；`.env`、`secrets/`、`backups/` 不進版控。`PIXAV_ARTWORK_ROOT` 保存 artwork 原件，與 PostgreSQL 一起納入備份；`PIXAV_LIBRARY_ROOT` 與 playback cache 是衍生資料，不需備份。備份目錄 0700、檔案建立即 0600，離機加密保存；dump 可能含 credential。備份須核對 identity sidecar、`pg_restore --list`，並定期隔離 restore；execution 更換時另保留 Redis volume snapshot 及恢復契約。
-
-來源 adapter 選擇目前以解析後的 HTTP scheme、明確 hostname 與預設 port 判定，拒絕 userinfo、冒充網域與 URL 路徑／query 中的網域字串。正常 worker 使用 [SourceSession](src/pixav/sht_probe/source_session.py)，Netscape export 保留 domain、path、Secure、expiry 與 `#HttpOnly_`；raw header 綁定 seed 的 exact host。目的地只允許已配置 seed origins，每次 redirect 在送出下一個請求前檢查，最多十次；HTTP timeout 沿用 generic 30 秒／retained adapter 60 秒。檔案內容、cookie 與外部錯誤 payload 不寫入解析例外。未帶 scope 的舊 parser 仍供其他既有 callers 使用，不能用它取代正常 worker 的 session 邊界。
-
-帶登入 session 的 FlareSolverr fallback 尚無瀏覽器 redirect 隔離證據，因此停止並回報 `USER_ACTION_REQUIRED`。來源 401／403、challenge 或不能確認登入的 retained source page 也停止自動 crawl；狀態存於 `PIXAV_CRAWL_EMPTY_CYCLES_KEY` 加上 `:session_status`，操作者更新 session 並驗證後重啟 source worker。已登入頁缺少預期 thread／post 結構屬 parser failure，不能當成空列表。這些行為已有合成 HTTP 契約測試，但 authenticated live discovery 仍為 OPEN；實際 cookie、TLS、登入／空列表 DOM 與跨站防護必須另外取得 live evidence。對應 BDD-007–035、BDD-120。
-
-`PIXAV_CRAWL_USER_AGENT` 可指定匯出 session 時的瀏覽器 User-Agent，兩個正常 crawler 都使用此設定，設定驗證拒絕 header 控制字元；raw cookie header 不出現在 Settings repr。只有 cookie 檔案存在、scope 相符或 User-Agent 已設定，都不能證明 Cloudflare clearance 與網站登入有效。
-
-來源 session 判定拒絕 `cf-mitigated: challenge`、challenge form／options 及 CAPTCHA 標記；正常已登入列表附帶的背景 JavaScript Detections 路徑不單獨視為 challenge，仍須同時核對登出入口與預期文章結構。文章宣告的容量由 extractor 傳入原生 observation，authority 依正常 size hard gate 評估；宣告值不是下載後的實際媒體測量。
-
-隔離 Compose 的 `acceptance-native-source` profile 使用同一固定應用映像，以 `sht_probe --once` 重新 discovery 私有 cohort；session／cohort 僅以唯讀目錄掛入，正常 threshold 固定 0。來源 host／IP、seed 範圍與 User-Agent 由私有設定記錄；指定 IP 仍保留 hostname、SNI 與 TLS 驗證。來源 timeout 沿用 adapter，health／metrics 沿用 worker 的 8004；one-shot exit 與原生 observation 另行核對，不把容器退出視為完整下載通過。來源容器限制為 1 CPU／1 GiB，不掛下載資料或 Docker socket；更新 session 後由操作者重啟，不自動處理 challenge。來源設定及 persistent cohort 屬私有還原資料，回退維持目前 schema／facts，不重建已成功的副作用。
-
-`PIXAV_CRAWL_COHORT_FILE` 是可選的私有範圍控制，檔案 0600、父目錄 0700，使用 `SourceCohort` v1：`schema_version=1`、`policy_version=source-policy-v1`、`min_score=0`，以及三個 `items`（`slot`、`page_url`、`info_hash`）。slot 恰為 `direct / remux / segmented`，文章與候選 hash 必須各自不同，文章 origin 必須屬於配置的 seed origins。它只允許 managed workflow，拒絕 query discovery 與不同正常 threshold；正常 crawler 重新發現文章後，只有文章／hash 同時符合凍結範圍才發布原生 observation。SourcePolicy hard rejection、排名、cooldown 與 Maxwell admission 均維持原契約，不直接建立 upload-ready task。slot 是待驗證的選片要求，不同 info hash 不代表已完成媒體去重；實際 ffprobe、download／prepare、來源 live 選片與 evidence 仍須另外驗收。對應 BDD-007–035、BDD-109–118。
-
-隔離下載期限由私有 `PIXAV_ACCEPTANCE_DOWNLOAD_TIMEOUT_SECONDS` 設定，本輪依外部 swarm 的實際速度採有限 24 小時；既有 operation 的起算時間保留，逾時停在 reconciliation，不自動換 operation 或重置時鐘。準備 worker 的本輪資源上限為 4 CPU／4 GiB，以容納完整 4K 解碼；固定映像、設定 digest 與變更前後的 operation 集合另存私有收據。
-
-本輪三片來源驗收以 MP4 為主，第二片也接受符合正常媒體政策的 MP4；至少一片仍必須實際分段。v1 manifest 保留 `remux` slot 名稱作範圍身分，實際 prepare 結果以下載後的 container／streams 判定，只有需要改容器時才無損 remux；不為填滿 slot 改寫媒體。非 MP4 的 remux 契約另以受控合成媒體驗證，不算指定來源的實片。
-
-managed storage worker 的容量 baseline 現在由同一 PostgreSQL pool 的 `clock_timestamp()` 包住 UI 讀取，保存 `observation_started_at`、`observed_at`、account／owner／指定 profile binding 與實際顯示精度；時間無時區或倒退會拒絕。既有不提供 DB clock 的 callers 不會自動補造時間，也不能承接本輪新 cohort 的 baseline 驗收。獨立 observer 的 guest／lease 互斥、逐項容量／品質歸因與連續 24 小時 live 證據仍為 OPEN；baseline 欄位存在不代表 quota 或儲存效果已驗收。對應 BDD-036–063、BDD-109–118。
-
-| 操作入口 | 必要守衛 |
-| --- | --- |
-| [backup_postgres](scripts/backup_postgres.py) | 預設 container 是 `pixav-postgres`，必須另核對 instance；`--output` 指向本次私有備份 |
-| [manage_system_pause](scripts/manage_system_pause.py) | `status/pause/resume`；只以自己的 `--token` 解除 pause，不覆寫他人的 ownership |
-| [manage_download_pause](scripts/manage_download_pause.py) | 在正確 network 操作；resume 重查 100 GiB／10% disk latch，不直接刪 key |
-| [phase0_backlog](scripts/phase0_backlog.py) | `status/backup-one/run-one/upload-one`；先停會產生或 claim 工作的 worker，核對 full／selected-row／queue backup、exact task/video/head/count |
-| [phase0_cohort](scripts/phase0_cohort.py) | `snapshot/sample/mark/report`；`snapshot --task-id UUID` 可重複指定固定 cohort；managed 模式以唯讀 repeatable-read 採樣 execution／attempt／operation、RemoteAsset／segment 與帳號用量（不含 credential／checkpoint／share URL）。Redis restart 後重核 run ID 與副作用，缺 span 不算通過 |
-| [cleanup](scripts/cleanup_watermark_garbage.py)、[replay](scripts/replay_task.py) | 資料清理先 dry-run、exact target/count、可恢復備份；replay 指定 task 並保留操作者、原因及有限 retry cycle audit |
-| [manage_execution](scripts/manage_execution.py) | managed execution 專用 `list/inspect/replay/cancel/resume/retry-now/reopen`，另有 `invalidate-asset`（對象是 RemoteAsset，不是 execution）；寫入前印出 DB identity，`--db-identity` 不符即中止。除 `list/inspect` 外全部必填 `--operator` 與 `--reason`，只輸出 Execution／ExecutionAttempt 的分類與識別碼，不印 checkpoint 或任何 credential。`resume` 只能清除 credential guard，記錄遠端效果的 recovery fact 一律拒絕；`invalidate-asset` 用於操作者自己確認遠端副本已消失，share URL 解析失敗不是這件事 |
-| [canary_upload](scripts/canary_upload.py) | 把操作者手上的檔案以 `operator-supplied` provenance 送進受管 pipeline（`admit`）並觀察（`status`）；download stage 只接受 40-hex info_hash，這是唯一合法入口。重新計算 hash 不採信宣告值，輸出不含 credential、share location 或本機路徑 |
-| [provision_workflow_roles](scripts/provision_workflow_roles.py) | 建立／授予 `pixav_execution_authority` 與 `pixav_activity_worker` 的登入角色；credential 只從環境取得，不寫入 SQL 或 evidence。可選的 resolver 登入（僅隸屬 `pixav_playback_reader`）尚未納入此腳本 |
-| [manage_playback](scripts/manage_playback.py) | `status` 列出 PlayableAsset 狀態與待處理 demand；`verify <video_id>` 對執行中的 resolver 跑穩定 URL 驗收（HEAD、完整 GET 對 READY 記錄的 size／SHA-256、首／中／suffix Range 與 416），全部通過才寫 `playback_verified_at`，必填 `--operator`／`--reason`，`--db-identity` 不符即中止；不印 evidence、share location 或本機路徑 |
-| [manage_library](scripts/manage_library.py) | `status`（單一 video 另列 override 與 artwork）、`override set/clear`（performers／tags 以 JSON array 傳入）、`artwork import`（只收 JPEG／PNG／WebP，依 SHA-256 保存）、`reconcile`（預設 dry-run，`--apply` 才執行一輪，與 tick 共用 advisory lock）；寫入必填 `--operator`／`--reason`，並先印 DB identity |
-
-完整參數從專案根目錄使用 `uv run python -m scripts.<name> --help`，例如 `uv run python -m scripts.phase0_cohort --help`；模組入口可正確載入 script 間的共用程式。`run-one --apply` 要求 full 模式且尚無 local_path；下載完成只 route task。`upload-one --mode local --apply` 要重新取得 upload stage 的 full／selected backup，不沿用 download 快照；它仍不能驗證 Photos。解除 owned pause 的操作必須有失敗恢復 pause 的保護，resume 失敗就停止。
+所有資料修改仍核對 daemon／DB／Redis 身分並先 dry-run；秘密只用私有 reference。保留 `manage_execution`、`manage_playback`、`manage_library`、migration、backup／reconciliation 工具及業務模組，執行前遵循各 CLI 的身分／ownership 守衛。禁止為了恢復舊影片自動解除 pause、replay DLQ 或重做未知上傳。
 
 ### 本次 Photos 驗收範圍
 
-至少三個不同媒體必須從既有來源流程下載，至少一個分段，全部以 `photos-original-v2` 驗證每段 size／duration／codec／hash 與 manifest。全新 session 的 cold read-back 不掛原始 staging；舊 v1 DURABLE、local finalize 或單段成功不抵此門檻。自 admission 採樣直到最後一筆成功上傳後至少 24 小時，並以私有 evidence 關聯 revision／image／daemon／DB／Redis 身分及時間。cohort 的本地 quota 數字不代替 Photos quota 證據，report 不自動 promotion。
+本 checkpoint 是設計與隔離資料重置，新 Golden Path 保持 OPEN。舊錄影、reference 媒體與回載副本丟棄後，歷史 PASS 不再充當可重算的當前 evidence。新 agent 必須從來源流程取得新 cohort，記錄當次 revision／image／daemon／DB／Redis、manifest 與 verifier policy，逐項重跑全部 BDD promotion gate。
 
-需完成一次受控 worker 重啟，核對同 operation 接續、全部片段與用量僅提交一次（BDD-113、127、141–142）。VPN gate 必須用已證明可達的受控 TCP／UDP peer 實測無 tunnel 阻流；成功 tunnel 的中斷恢復另驗。本輪範圍包含 Jellyfin、完整 publication、安全刪 staging、清 cache 後由 Photos 恢復，以及多段與至少 24 小時 quota 觀察；BDD-109–112、134、138–143 在取得本輪證據前保持 OPEN。本地媒體保留，cleanup 繼續拒絕不合格目標。
-
-目前驗證限制：2026-09-19 Docker Desktop API 可回應，既有 non-VPN 容器仍運行；指定 guest 的 Pixel profile 與工具可查，但尚無本次三媒體 v2 cold read-back／24 小時 quota 驗收。隔離 VPN probe 的受控 TCP／UDP peer 直連可達，gluetun 在建立 `conntrack` firewall 規則時失敗退出，故 namespace 阻流及 tunnel recovery 均 OPEN；需先補齊 Docker daemon 所在核心的 netfilter 能力。新版 direct monitor 設定需依前述 execution／reconciliation 守衛部署，不能把工作區修改當作已生效。
-
-未被 runtime caller 使用的 `first_4k` CLI／MovieFlow 拆分副本已移除；隔離單片入口仍是 `scripts/first_4k_movie.py`。保留被 supervisor、adapter 或實際操作入口使用的 guards、contracts、recovery 與 evidence；既有 fallback 的退休仍依 Phase 0 驗收。coverage 持續計入所有保留的 `src/pixav` 程式並產生完整報告，不設全域百分比門檻；CI 以保留的行為測試與核對實例身分的 PostgreSQL／Redis 核心整合測試為門檻。 CI 只依序啟動 `docker-compose.integration.yml` 的 PostgreSQL／Redis，從 exact container 取得 DB identifier／Redis run ID，再由測試 fixture 核對；完整報告作為 artifact 保留。重啟演練、torrent contract 與 live E2E 仍需各自 opt-in，未執行不算通過。
-
-已移除舊 pipeline／搜尋 demo、一次性 Redis／ADB 探針與無 caller 的 embedding backfill／repository 搜尋方法；worker 的 embedding 寫入、資料 schema、現用 CLI 與 first-4k supervisor／recovery 保留。測試保留核心行為、immutable model、trace identity 與 secret redaction。2026-10-10 精簡移除五個無 caller 的 dependency 及未使用 Maxwell Protocol 模組，lock 由 119 減至 106 packages；其他版本、metadata 與 embeddings group 不變。ADB／FFmpeg 仍用現有 CLI，`lxml`／`numpy` 與現用 adapter 保留。本機 pytest／coverage 為 1,639 passed／228 skipped、74.12%；Ruff／Black／isort／mypy、lock、兩份 Compose、文件連結與 143 個 BDD ID 通過。真 PostgreSQL／Redis 驗證待 Docker 恢復，不能宣稱本次完整軟體驗證通過。
-
-歷史產物清理只處理可重建的 kernel 來源／中間產物與分析暫存，保留原路徑 kernel 映像、設定、checksum 與重建入口。本輪依 exact hash／size／inode／count 清除 6,914 個可重建檔案，保留 kernel 及設定 hash；編譯中間檔約 528 MiB，工具 cache 可在驗證時再生。預設 `.venv` 實測由約 250.6 降至 219.2 MiB，保留 optional embeddings lock。上述是檔案清理證據，尚未證明 Windows VHD 已釋放實體容量。私有影音候選缺完整備份／還原收據，failed split 的 execution 守衛亦未結案，因此有效 stage2 證據、staging、guest 與播放 cache 保留；目前停機狀態不代表 Golden Path、live 或 production 通過。
+工作區保留 Photos cookie-only 認證、upload outcome review、cleanup journal、immutable models、來源 provenance 與 DB-clock retry／quota 等實作。軟體檢查、live contract、人工實播、backup／restore、capacity 與 production 各自判定，不沿用舊測試數字。
 
 ### SourcePolicy → MediaWorkflow 的 managed 接口
 
@@ -508,56 +441,9 @@ managed authority 在 DURABLE 提交交易中，以 `durable_at + PIXAV_LOCAL_CL
 
 ### 獨立 managed 隔離部署
 
-[acceptance Compose](docker-compose.acceptance.yml) 是獨立的 direct-mode 部署，不與正式 Compose 合併。所有映像必須指定 immutable ID／digest；應用程式服務使用同一映像，cold worker 使用映像內程式。專用 PostgreSQL／Redis／qBittorrent volumes 與所有 bind mount 位於獨立 project／私有 root；公開連接埠只綁 loopback，Docker socket 僅交給 storage／playback workers。預設保留指定 Pixel profile、單一 Maxwell service，並關閉 cleanup apply。Compose 的單一 service 本身不等於唯一 execution ownership；managed Maxwell 啟動另取得同一 PostgreSQL database 的 session advisory lock，第二個 authority 拒絕啟動，持鎖連線中斷取消排程 task。此守衛不取代既有 attempt lease／fencing，也不等於完整 Golden Path 通過。
+repository 已退休舊隔離 Compose 模板。新的 managed deployment 必須重新驗證 Windows 指定上傳環境、唯一 authority、固定映像、最小 secret／volume 範圍、資源限制、private playback、backup／restore 與 rollback。既有 stopped 容器及 guest 僅供保留狀態／reconciliation，不當作新部署入口。
 
-`migrate` 在任何 DDL 前核對新 PostgreSQL system identifier，migration SQL 與 ledger 同交易提交，整輪以 advisory lock 串行化。`provision` 建立 authority／activity／reader 三種登入並排除高權限及混合 runtime group；resolver 啟用 `PIXAV_RESOLVER_REQUIRE_READER_ROLE`，啟動時不符合 reader 權限即退出，且只掛 playback cache 與認證 token。
-
-[manage_acceptance](scripts/manage_acceptance.py) 目前提供唯讀 `preflight`／`report`，要求明確 Docker context／daemon ID、project、私有 root、0600 env file 與證據輸出路徑。它核對固定映像、bind／volume ownership、DB identity、Redis run ID，僅在記憶體解析含秘密的 Compose 設定，輸出設定 hash 與身分。deployment contract 通過仍將 runtime、Golden Path 與 production promotion 保持 OPEN；`run`／`resume` 與完整正常來源協調尚未提供；自動影音 capture 由下述獨立腳本執行。此部署尚未完成當次 24 小時容量觀察、離機 restore 與 staging 刪除後回播驗收。
-
-隔離 Compose 的 `acceptance-source` profile 提供獨立 `source_seed`／`source_http` fixture。seeder 使用固定 qBittorrent 映像及原生 embedded tracker，1 CPU／1 GiB，`/config` 為暫存，僅唯讀掛載 seeder 原檔；HTTP 入口使用固定 capture 映像中的 Python `http.server`，0.5 CPU／256 MiB，僅唯讀掛載合成來源頁。兩者均無 host port，workflow network 的 DNS alias 為 `source-seed`／`source-http`。torrent 由 mktorrent 1.1（GPL-2.0）產生；qBittorrent（GPL-2.0-or-later）及 Python（PSF license）版本／image ID 隨私有 manifest 記錄。WebUI credential 僅留在私有設定／記憶體；API timeout 15 秒，crawler timeout 30 秒，健康與 peer bytes 以實際 API／HTTP 採樣，服務啟動不代表下載或 Photos 通過。
-
-`PIXAV_ACCEPTANCE_DOWNLOAD_TIMEOUT_SECONDS` 設定隔離下載的有限期限，預設 3,600 秒；期限仍從原 operation 的 DB 起算時間計算，重啟不重設期限。正常 hard eligibility、磁碟守衛及 timeout／stall 分類維持原契約。
-
-`PIXAV_ACCEPTANCE_QBIT_EXTRA_TRACKERS` 設定受控 tracker；managed adapter 核對 exact operation tag 後，才重新套用 tracker，使 metadata download 可在 worker 重啟後接續。`PIXAV_ACCEPTANCE_SEGMENT_TARGET_BYTES` 可固定合成媒體的 transport target，預設仍為 9.5 GB，不改 SourcePolicy eligibility／scoring 或磁碟守衛。fixture 原檔、recipe／媒體 hash、來源頁與 peer 傳輸證據保留於私有 root；它們不掛入 leecher、cold read-back 或 client capture。停止 fixture 即可撤回測試來源，保留既有 execution／operation 與原檔；有 timeout 或結果不明的 execution 不清 queue、不盲目 replay。離機備份及 restore 仍是後續真實 cleanup 的前置條件。
-
-本輪隔離驗收已完成三支不同的受控合成媒體：完整 MP4、無損 remux 與實際兩段媒體。三支均經正常來源 crawler／SourcePolicy／managed admission、獨立 leecher 下載及指定 Pixel／Photos 上傳；四個上傳片段均以獨立 cold session 通過 size／hash 完整性，三支達到 DURABLE、READY 與完整 publication。當次真 Jellyfin Web 錄影及獨立重算通過片頭、中段、片尾、全部分段交界、seek 與續播；靜音、凍結、錯誤音調、seek 不移動及錯誤續播均被實際影音分析拒絕。成功 upload operation 與計帳片段各四筆，client 驗收未增加上傳或計帳；原 staging 保留。這是受控來源的隔離主流程證據，外部來源 parity、本輪下載／prepare 中斷恢復、24 小時 Google 容量觀察、離機 restore、staging 刪除後清 cache 再回播與 production promotion 仍 OPEN。私有報告依當前 asset／manifest、錄影 hash 與實際映像身分核對，不把舊實驗或預置下載成品當本輪證據。
-
-新的外部來源三片 cohort 已在另建的空白 DB／Redis／download location 完成 authenticated discovery、正常 threshold 0 的 SourcePolicy 判定與原生 observation admission；未使用 operator-supplied 入口。初始三筆 download intent 在 media worker、authority 設定更新與 qBittorrent 正常重啟後保留相同 operation／torrent tag。其後低速候選由唯一 authority 取消，torrent 停止且資料／候選歷史保留；替換項目依正常排名重新 discovery／admission，另兩筆既有 operation 接續。
-
-2026-10-07 隔離驗收：三片均完成外部 swarm 下載、正常 prepare、獨立完整 SHA-256／streams／duration 及全片解碼驗證。大型媒體依既有 9,500,000,000 bytes target 實際分段，完整合併影音 fingerprint 及各段獨立解碼均通過。實片在完整 receipt fsync 後、activity 回報前中斷 media worker，由唯一 authority 恢復同一 operation，核對原輸出 inode／hash 重用。最後保留檔案的完整 hash 與檔案身分另行核對。階段 2 PASS；新 cohort 的 Photos 上傳、cold read-back、Jellyfin 影音與整體 Golden Path 仍 OPEN。新版完整檢查為 1,713 passed、7 skipped、coverage 82.56%；來源 live E2E、Redis restart、disposable qBittorrent 及四項媒體 opt-in 的 skip 分別列示，新增 fractional-clock 媒體測試另以真 FFmpeg 通過，其他 critical gates 依各自證據判定。前版固定映像已完成受控合成 remux、4K 分段／完整合併／輸出重用與損壞拒絕，以及 completed-receipt 重啟測試；合成結果不計為三片實片。重啟造成的 qBittorrent 空掛載已在停止 exact torrents 後修復，保留原 config volume、檔案身分、operation tags 與傳輸計數，三片重新檢查完成後維持 stopped。新 cohort 的指定 Pixel 預檢已通過，單一 storage worker 由 Maxwell 推進；完整逐段 Photos 驗收仍 OPEN，staging 保留，備份及其後 cleanup／promotion 關卡暫緩。
-
-指定 storage profile 的自有 guest、persistent owner 與 account 已完成隔離預檢；Android 初始設定 provider 的崩潰在同一 guest 修正並保存可撤回設定的收據，映像及 profile 未替換。首次 Google 額外身分驗證由操作者完成，原 credential intent 與 challenge 歷史保留，未自動重送帳密。人工操作沿用本機已安裝的 scrcpy 4.1（Apache-2.0），只連 loopback ADB、不錄影、不自動同步剪貼簿，六小時上限與 uploader 互斥；視窗已關閉並核對指定帳號加入裝置。後續預檢不讀密碼檔，已確認 Original 品質及上傳前 DB-clock 容量 baseline，才啟用 account 與單一正常 storage worker，由 Maxwell 推進 upload／verify。2026-10-07 在同一 guest 的逐項 UI 核對中，兩個完整 MP4 均顯示 Backed up、Original quality 與不占帳戶空間；其 canonical filename、segment hash binding 及 4K 尺寸符合保留的 manifest。兩筆先前停止的 execution 已透過既有 Maxwell 恢復介面接續，未清除傳入、發布、備份或 credential intent；受控 ownership 交接核對 operation／attempt 歷史與 migration ledger 不變，正常 authority 與單一 storage worker 已恢復。第三片已完成實際兩段 prepare、同 operation 重啟接續及完整獨立影音驗證。正常流程已提交兩筆成功上傳及兩筆唯一用量 marker，沿用各自原 upload operation，未再次傳入或發布這兩段媒體。UI 備份及 upload 收據仍須逐段 cold read-back 才能通過 DURABLE；本輪共四段，完整階段 3 與最後成功上傳後的連續 24 小時容量觀察仍 OPEN，staging 保留。當時的只讀容量 observer 等待全部三片 DURABLE、四段 cold 驗證完成、無 active upload／account lease 且來源 admission 服務停止後，才讀取同一 guest 的帳戶容量；每五分鐘採樣、超過 900 秒缺樣重新起算，並在有效 24 小時窗口後重讀全部四段的 Original／不占容量資訊。時間、精度、項目綁定與拒絕 credential／upload 操作的控制檢查已通過，這些控制結果不算 live 容量驗收。
-
-2026-10-07 階段 0–4 更新：已核對當前隔離 Docker／PostgreSQL／Redis identity、單一 account／guest／authority 與磁碟保留空間，沒有新增 migration。首筆新資產的獨立 Photos 原件通過完整 hash／媒體驗證並達到 DURABLE；播放 prepare 重用該 cold session 的已驗原件，已由正常 Maxwell 促成 READY 及完整原子 publication。快速排程漏傳 playback transport 的問題已修正，缺 transport 時不領取 execution；一次 exact preparation 恢復保留 operation／attempt、quota markers 與重試計數。原 Pixel、storage worker、帳號與 staging 保留；公開 Docker 建置補上程式可讀權限，另以實際 UID 1000 核對固定映像啟動。client gateway 部署改動後，已修正仍向原服務注入 port 的舊測試，另加入三項繞過邊界的拒絕案例；錄影器啟動同步修正前的完整 Python 檢查為 1,752 passed、7 skipped、coverage 82.22%。修正後新增四項啟動／fresh PTS 拒絕測試，capture 控制共 15 passed，格式、import 與型別檢查全部通過；容器中斷後重新核對同一隔離實例及新的 Redis run ID，當前完整檢查為 1,756 passed、7 skipped、coverage 82.22%。完成檢查即移除兩個隔離測試容器並保留其 volumes。PostgreSQL 派送／恢復合約另為 145 passed；skip 仍是來源、Redis restart、disposable torrent 與四項媒體 opt-in，控制結果不代替實片驗收。首片的完整 GET／hash、HEAD／Range／416 通過；Jellyfin 掃描範圍限於 active library，恰有一個對應 item。gateway 改以 Docker DNS 重解析 resolver，實際 Jellyfin network 的原件 ffprobe 通過；真 UI 跳到片頭與 30% 位置的排程觀測在兩秒內，但仍須錄影內容與聲音證據。原服務的匿名 static stream 實測曾回傳媒體 bytes，已以 nginx client gateway 收斂存取邊界：未登入及已撤銷裝置的新請求均拒絕，六種原生 token／cookie 傳遞方式以各自全新 client 驗證授權／撤銷，測試通過，錄影網路不能直接連到原服務。第二筆資產已由正常 retry 完成獨立 Photos 原件回載並促成 DURABLE、READY 與 publication；第三筆首段已完成唯一上傳／記帳，第二段的 guest 暫存原件 hash 正確但相機目錄副本 hash 不符，MediaStore 大小仍為 NULL，保持 USER_ACTION_REQUIRED 並核對未知結果，不重傳或清除原 intent。 原生 VIEW／About 的只讀檢查仍顯示前一段檔名，不能把該頁的 Backed up 當作第二段證據，既有不一致副本保留。三片獨立全片／分段影音 fingerprint 及保留檔案檢查已完成，另以當前 DB facts、operation 與檔案身分重新核對，階段 2 PASS；階段 3 仍 OPEN。首片曾實際呈現 4K 畫面；前兩片的完整錄影及分析已產生，仍需人工覆核，不能把 CAPTURED 當作影音 PASS。錄影器新增 bounded 啟動同步，要求活著的 encoder 及 fresh FFmpeg PTS 才安排窗口；native Jellyfin encoding threads 固定為四，隔離資源仍為原有 8 CPU／4 GiB。錄影 client 經原生 Playback 設定將允許的轉碼解析度上限設為 1080p，保存後重讀確認；prepared media 與 Photos 原件品質不變，這不證明正式環境的 4K client 契約。前兩片均已完成包含片頭、中段、片尾、真 UI seek／resume 的完整 capture 與獨立參照分析，結果為 CAPTURED／REVIEW_REQUIRED；第一片片尾、第二片中段的自動內容位置仍需人工比對。第三片的完整 capture、全部分段交界、影音／seek／resume 人工覆核及有效 24 小時 Photos 容量觀察仍 OPEN。本輪容器中斷後已核對原 PostgreSQL／migration ledger、兩筆既有成功上傳與記帳、guest ownership 及 Jellyfin item，再恢復階段 3／4 必要的 11 個常駐容器。已移除 19 個舊／錯誤部署及已完成的一次性容器，所有資料 volumes、staging、映像與證據保留；來源、下載與 prepare 服務保持停止。臨時 client／離線分析容器逐一執行、完成即移除。中斷時間不能算入連續 24 小時容量窗口。備份、真實 cleanup、清 cache 後恢復、正式切換與 production canary 繼續延後，整體 Golden Path 保持 OPEN。
-
-2026-10-08 階段 3／4 後續：軟體新增 `review-upload-outcome`，預設 dry-run；`--apply` 僅登錄原 execution／segment 的覆核請求，由唯一 Maxwell 驗證 instance、account、owner、operation、generation、recovery／artifact digest 及一小時內的 evidence。接受後沿用原 operation，storage activity 跳過 push／publish，重新執行 provider-only cold 驗證，成功結果與用量由既有交易提交一次；保留原 intents，不新增 migration。`upload-outcome-review-v1` 接受有可用分享位置及完整 cold proof 的既有原件；新增 `upload-outcome-review-v2`／`EXISTING_ITEM_REQUIRES_COLD`，供操作者已確認同帳號、完整檔名、已備份及原始畫質，但尚無分享位置的既有項目。v2 只授權原 operation 的 exact-item 核對、分享與 cold 驗證，不表示遠端結果已確認；本地發布替換及完整備份還原 executor 尚未完成。固定錯誤碼區分 staging、發布副本、錯 item 與未知遠端結果；新增同 account／owner 的 PostgreSQL UI 互斥及失聯停止保護。這些程式尚未更新至 live application 映像，不能視為部署驗收。
-
-隔離查證已完成兩輪有界 Photos 原生 UI 調查：三個正向控制可開啟 exact-item 資訊，但目標搜尋內容與輸入不一致，最近新增列表未完整讀取，沒有目標原件或 operation-bound 未建立證明。結果明確為 `REMOTE_OUTCOME_UNKNOWN`，維持 `USER_ACTION_REQUIRED`；最後可核對快照仍為三筆成功 operation／三筆 marker、兩片 DURABLE／READY／PUBLISHED，沒有重傳。下一步須同帳號 Photos 網頁核查 exact item 與發布時間範圍；搜尋未命中、本地壞副本或缺 marker 都不是遠端不存在證據。
-
-影音工具新增相容舊 trace 的 `supplemental_seconds`、完整必要窗口與連續交界檢查、seek／resume 操作時間映射及私有短片覆核包。前兩片已由 hash 驗證的 reference 選出補充位置，舊錄影／分析與衍生覆核包保留；補充窗口須重新完整錄製，不能拼接舊 trace。恢復前的兩次補錄未產生合格新錄影，失敗畫面包括 Jellyfin `Server Unavailable`。主機恢復後前兩片均已各自完成新的一份完整錄影，包含全部必要及補充窗口、真 UI seek／resume、獨立 reference／重算分析及操作前後短片；不同片的完整證據分開保存，沒有拼接錄影或 trace。近片尾補充窗口改安排於中段 seek 之前，使 Resume 接續可保存的中段位置；已有合成資料回歸測試。已核對兩份 bundle 與十二份瀏覽器 reference 預覽的 digest、私有權限及全部本機連結。預覽僅為衍生物，原 reference 不變。自動分析仍有一片中段、另一片片頭／片尾的位置不明確，未放寬門檻；所有短片維持 `REVIEW_REQUIRED`，未完成操作者實看實聽；第三片及全部交界仍待 DURABLE 後驗收，僅沿用 1080p client 契約。
-
-容量判定新增 `WAITING_UPLOAD_RECONCILIATION`、`WAITING_UI_OWNERSHIP`、`OBSERVING`、`GAP_RESTARTED`、`CAPACITY_REVIEW_REQUIRED`、`COMPLETE`。新版私有 collector 的單次檢查停在上傳對帳等待，沒有開始有效採樣；所有結果確定且 UI 無 writer 才能讀取，cold／DURABLE 仍是最終通過條件。起點不早於最後結果確認與最新連續區間，每五分鐘採樣，gap 超過 900 秒重新起算；保留原 baseline，外部帳戶／Drive 活動未獨立歸因不能通過。尚無有效 24 小時證據。
-
-主機在 13:33（Asia/Taipei）曾因核心 iptables `addrtype` 問題無法啟動 Docker；操作者恢復後已重新核對原 daemon、PostgreSQL identifier／database、變更後的 Redis run ID、migration ledger、account／guest 映像及唯一 Maxwell ownership，重用原有十一個必要常駐服務，來源／下載／prepare 保持停止。原成功 operation、provider 與 usage 集合未變。最終新版完整 PostgreSQL／Redis 檢查為 1,819 passed、7 skipped、coverage 82.52%；Ruff、Black、isort、mypy、兩份 Compose config 與 diff whitespace 檢查通過。先前 daemon 停止時的離線結果為 1,604 passed／221 skipped、coverage 73.92%，當時未達門檻；不以該次結果或被程式修改中斷的測試宣告通過。完成後兩個整合測試容器以 exact ID 移除，volumes 保留。新 client 透過原生設定同時保存 1080p 轉碼上限與 supported-resolution 限制，並選擇原生 8 Mbps 品質；重新載入核對設定及每個窗口的實際畫面尺寸，避免 direct play 原件繞過解析度上限。Photos 原件、完整性政策及分析門檻不變。補錄、人工確認與 24 小時觀察分開驗收；中斷時間不計入容量窗口。離機備份目的地仍未配置，沒有資料替換、cleanup、清 cache 或 production 切換。
-
-2026-10-08 後續只讀核對：再次重啟後 Redis run ID 改變，已按原 daemon、容器 ID、資料 volumes、PostgreSQL／database、ledger、account、guest 映像與唯一 Maxwell ownership 重新綁定。核對時僅 PostgreSQL、Redis、Maxwell、Jellyfin 四個容器運行；兩個 gateway、resolver、playback worker、storage worker、guest／tools 停止，沒有為等待人工證據而自動啟動。held execution 的 generation／intents 及三筆成功 operation／三筆 usage marker 不變，兩片 DURABLE／READY 的 domain 狀態保留；這不代表目前停止的播放路徑可實播。兩份完整錄影、bundle 與十二份 reference 預覽重新核對 hash 一致，確認欄仍空白，指定證據目錄未收到 Photos 網頁結果。私有交接清單補上精確帳號、三個正向控制及空白觀察模板；它不授權重傳或提交成功覆核。現在分別等待同帳號網頁 exact-item 證據與操作者實看實聽，容量維持 WAITING_UPLOAD_RECONCILIATION。程式未變，沿用前次完整軟體檢查，僅驗證本次文件連結、BDD 保留與差異範圍。
-
-
-同日手機查證續接：操作者已確認同驗收帳號的兩段完整檔名、可播放、約定長度、已備份、原始畫質與 3840 × 2160；像素數不當作檔案大小，這些人工資訊也不代替 full hash 或 Jellyfin 覆核。v2 由 Maxwell 驗證綁定後才安排原 operation，storage activity 只取回同帳號、同 owner 的已記錄 guest；拒絕重新 provision、切換帳號、login、push 或 publish。受控 guest 必須已顯示唯一 exact filename、Backed up、Original quality 及預期尺寸，錯 item、不完整頁面、多帳號或 challenge 均保持人工處理。先保存項目觀察及 share／link intents；中斷後重用既有連結或只讀 clipboard，不能重建連結。恢復期間只允許分享 journal 增長，原 push／publish／backup facts 不可改變。分享後仍須全新 provider-only 回載並驗證完整 hash、size、codec、duration，才交既有成功交易一次記帳；此路徑不依賴可能損壞的本地 MediaStore URI，也不自動重跑已用完的兩輪搜尋。
-
-本次實例只讀核對仍為三筆成功 operation／三筆 usage marker、兩片 DURABLE；candidate review dry-run 拒絕了已超過一小時的手機觀察，原始時間未刷新、checkpoint／recovery 未改、未 apply。受控端 exact-item 定位與新觀察、分享及 cold read-back 仍未完成；手機回報不能宣告階段 3 PASS。程式與映像準備、實際部署、遠端恢復、人工實播及連續 24 小時容量證據分別記錄。本次新版完整 pytest（含真 PostgreSQL／Redis integration）為 1,843 passed、7 skipped、coverage 82.56%；Ruff、Black、isort、mypy 與兩份 Compose 檢查通過。新 application 映像尚未部署，不能把軟體檢查當作 live 恢復成功。
-
-
-後續取得操作者提供的既有分享位置後，新的匿名瀏覽器已確認相簿只有一個影片，資訊頁完整檔名符合未確認的第二段；定位缺口已解除，連結僅保存於私有 evidence。獨立 cold session 未取得原件，另一個全新隔離 session 的有界診斷明確看到 Google 顯示 `Video is still processing & can be downloaded later`，沒有 download event 或媒體 bytes。現況為 `WAITING_PROVIDER_ORIGINAL_PROCESSING`：候選項目存在，但完整 hash／size／codec／duration 尚未驗證，不能宣告正確原件、DURABLE 或階段 3 PASS。兩個臨時容器已移除，診斷與原始觀察保留；不重傳、不建立新連結、不 apply 覆核，也未部署 application 新版。原三筆成功 operation／三筆 marker、兩片 DURABLE 及四個運行服務保持不變。原件可下載後，先完成新的獨立完整回載，再走 v1 正向覆核與原 operation 的 Maxwell 恢復；手機報告與此次定位資訊不代替 cold proof。容量仍為 WAITING_UPLOAD_RECONCILIATION；人工實播及有效 24 小時觀察仍 OPEN。
-
-
-2026-10-09 續查：重新核對原 daemon、PostgreSQL／database、Redis run ID、account／guest ownership 與唯一 Maxwell。新的匿名隔離 session 首次資訊頁未載入完整檔名，記為證據不足，未判成錯誤原件；另一次有界刷新等待 exact filename 可見後，確認仍是單一目標影片，Google 仍顯示原件處理中、稍後才可下載，沒有 download event 或媒體 bytes。兩個新臨時容器均已移除，仍為原四個服務、三筆成功 operation／三筆 marker及兩片 DURABLE，held generation／intents 不變，沒有 apply、重傳或新版部署。當前阻塞維持 WAITING_PROVIDER_ORIGINAL_PROCESSING；原件可下載後才重做獨立完整回載及 v1 正向覆核。程式／測試／設定 hash 與 1,843 passed 的版本一致，因此僅檢查本次私有 evidence binding、文件連結與差異範圍，不重跑完整測試。該次 provider 查證未改變影音驗收；後續人工確認及登錄結果如下，第三片及有效 24 小時容量驗收仍 OPEN。
-
-
-同日人工覆核完成：操作者確認前兩片影音、播放及三處待判定窗口與 reference 對齊。兩份完整錄影重新分析均與原 analysis 完全一致，原自動辨識的不確定結果保留，人工對齊確認另行綁定；沒有改門檻或宣稱操作者提供了數值量測。全部十二個必要／補充窗口、原生 seek／resume、錄影／trace／reference／manifest digest 與當前 DB 資產重新核對，完整 GET／hash、HEAD、Range、suffix、416、Jellyfin 唯一 item 與未授權存取拒絕通過後，兩片正式登錄 `jellyfin-client-v2`。第三片及其分段交界尚未驗收，不能把前兩片結果升級為整輪 PASS。
-
-當次 live 核對另發現 Maxwell 與 Jellyfin 在主機恢復後看到空的 bind mount，導致兩片 publication 變成 `PROJECTION_WRITE_FAILED`，主機檔案仍完整。保留診斷後重啟同一 Maxwell、以原映像及原 config volume 重建唯一 Jellyfin，重新核對 host／container 的 device、inode 與目錄內容；由唯一 Maxwell 正常收斂回 PUBLISHED，未替換媒體或手動改 publication。原 client gateway 埠被主機拒絕綁定，保持原映像與認證設定改為本機 `127.0.0.1:18096`，只恢復必要 resolver／gateway。目前七個必要服務 healthy，上傳 worker／guest 仍停止，三筆成功 operation／三筆 marker、兩片 DURABLE／READY／PUBLISHED 不變。十四項報告分別記錄前兩片 v2 已完成、第三片 `WAITING_PROVIDER_ORIGINAL_PROCESSING` 與容量 `WAITING_UPLOAD_RECONCILIATION`；沒有 cleanup、清 cache、資料替換或 production 切換。程式碼未變，沿用 1,843 passed 的軟體檢查，本次另外完成上述 live 驗證與文件檢查。
-
+[`manage_acceptance preflight`](scripts/manage_acceptance.py) 保留 legacy manifest 的唯讀契約檢查，必須由操作者提供位於私有 root 內的 `--compose-file`、`--env-file`、context、daemon ID 與 dedicated project；不提供預設舊模板，不啟動容器，也不 promotion。它仍檢查 legacy Pixel／redroid 契約，不能用來宣告新的 Windows managed adapter 合格；移植時需依新 adapter 的 live contract 更新此檢查。
 
 ### 自動 Jellyfin 影音 capture
 
@@ -579,19 +465,9 @@ managed authority 在 DURABLE 提交交易中，以 `durable_at + PIXAV_LOCAL_CL
 
 ### 私有 Jellyfin 部署
 
-[playback Compose overlay](docker-compose.playback.yml) 加在已選定的 base／prod／網路模式之後，不能另起第二套 authority。它使用固定 digest 的 Jellyfin 12.1 與 nginx 映像；client gateway 只對 host loopback 的 8096 開放，Jellyfin 原服務沒有公開 port，不接錄影用 client network。library root 整體唯讀掛為 `/media`，掃描 `/media/library`，保留 publication 的相對 symlink。服務仍須通過當次實播，不因容器 healthy 就 promotion。[官方容器說明](https://jellyfin.org/docs/general/installation/container/)不支援 Windows／macOS Docker 部署；Docker Desktop 上的本機環境只作隔離驗收，硬體轉碼與正式部署不能據此宣告通過。
+目前沒有 repository 內的 Jellyfin 部署 Compose；新隔離部署只向認證 gateway 開放 loopback，Jellyfin origin 不對外發布，錄影 client 不得直連 origin 或讀 staging。library root 整體唯讀掛載，保留 publication 相對 symlink，設定與觀看紀錄納入加密備份。
 
-[client gateway 設定](docker/playback-gateway/jellyfin-auth.conf) 使用 nginx [`auth_request`](https://nginx.org/en/docs/http/ngx_http_auth_request_module.html)，每個非公開 bootstrap 請求都向 Jellyfin 的受保護 `/Users/Me` 驗證原生 client token；不快取授權。相容 Authorization、X-Emby-Authorization、X-Emby-Token 與 Jellyfin Web 自己的 `api_key`／`ApiKey`，上游仍由 Jellyfin 決定身分及權限；沒有 provider credential，也不引入 pixAV 的帳號服務。固定 Web／登入 bootstrap routes 以完整路徑相容大小寫，其餘包含原始 stream、HLS、音訊與 API 都經認證。Web 的 image 請求不帶原生 header，gateway 只在原生認證成功後將同一裝置 token 映入 host-only、HttpOnly、SameSite=Strict 的 session cookie；每次使用仍向 Jellyfin 驗證，logout 後舊 cookie 也拒絕。cookie 不另存 identity 或 session SSOT。當前 listener 僅為 loopback／internal HTTP；正式對外入口的 TLS 仍須另過部署關卡。access／request error logs 關閉，避免 client URL token 落入 log。必須實測正常播放、未登入、已撤銷裝置及繞過 gateway 連原服務的拒絕；只有 API 資料頁拒絕不足以通過（BDD-119、122）。gateway 的 Docker DNS 有十秒有效期；connect timeout 十秒，串流 read／send timeout 三百秒，health 使用原服務 `/health`。兩個 nginx instance 各為 0.5 CPU／128 MiB、採相同固定映像（BSD-2-Clause）；只掛唯讀設定，沒有新增持久 volume 或 secret。設定可由 release manifest 重建；回退保留 client 認證邊界及原 Jellyfin config，不能重新公開匿名媒體端點。離機備份與完整 restore 仍依既有備份關卡，不以 gateway 可重建代替。
-
-Jellyfin 經只在 `playback_private` internal network 存在的 nginx gateway 取得媒體；gateway 沒有公開 port，也不接受 provider URL。`.strm` 使用 `http://playback-gateway:8080/stream/{video_id}`；設定 Jellyfin 播放者的 `ForceRemoteSourceTranscoding=true`，讓媒體由 server 取得，再分別驗證播放器、重封裝／轉碼及 seek。此設定需經 live playback 驗證，不是已完成的 client 相容性承諾。短合成片驗續播時，另核對 Jellyfin 的 `MinResumeDurationSeconds`；預設 300 秒會排除短片，可在隔離驗收環境明確調整，不能據此宣稱已實播續播。
-
-resolver 啟用 `PIXAV_RESOLVER_AUTH_REQUIRED` 後，`/stream/`、`/resolve/`、`/local/` 都需要 Authorization bearer。`PIXAV_RESOLVER_TOKEN_HOST_FILE` 指向私有 0600 一般檔，內容為 43–128 個 URL-safe 字元；gateway 的啟動程式從同檔產生 0600 nginx 設定，不把 token 放在命令參數、STRM 或公開 env 範本。resolver 每個新請求重讀 token，遺失／格式錯誤／權限錯誤時拒絕服務。輪替時原地更新私有檔並重啟 gateway，另驗證舊 token 被拒絕；若以 rename 替換 host 檔，需重建兩個容器的單檔 bind mount。Jellyfin 的裝置撤銷由 Jellyfin 自己驗證，不能以服務 token 輪替代替。CLI HTTP 驗證使用 `--token-file PRIVATE_FILE`，禁止 query-string token。未啟用認證的 legacy 部署不能稱為 private playback。
-
-| 元件 | 執行與恢復契約 |
-| --- | --- |
-| Jellyfin（GPL-2.0） | image digest 固定於 overlay；2 CPU／2 GiB；`/health` 每 30 秒檢查、timeout 5 秒；config／cache 分別存 `data/jellyfin/config`、`data/jellyfin/cache`。config 含使用者及個人觀看狀態，需停寫後私有加密備份並驗 restore；cache 可重建。回退須使用相容版本及其 config 備份，不能把新版 DB 直接交給舊映像。 |
-| nginx gateway（BSD-2-Clause） | image digest 固定於 overlay；0.5 CPU／128 MiB；連線 timeout 10 秒、讀寫 timeout 300 秒；`/health` 每 30 秒檢查、timeout 5 秒；access log 關閉、容器錯誤 log 有限輪替。沒有 domain state；保存版本化 template 與私有 token 即可重建。 |
-| resolver／playback worker | resolver 的 `/health`、`/metrics` 與既有 reader／cache 守衛繼續使用；Docker socket 及 host project mapping 由 `playback_worker` 提供，resolver 不需要 socket。部署 019／020 前先驗同實例備份、隔離 restore、唯一 execution ownership 及相容 rollback。 |
+Jellyfin 只取得 pixAV 穩定 URL，不取得 provider URL、cookie 或 token。未授權 client 與撤銷裝置必須實測拒絕；多段、seek、resume 及全部交界須有新錄影與人工確認。[官方容器說明](https://jellyfin.org/docs/general/installation/container/)的部署限制與當次 live contract 仍適用，工具或容器健康不代表 production promotion。
 
 ### Library projection
 
@@ -632,26 +508,9 @@ Maxwell 每 `PIXAV_LIBRARY_RECONCILE_SECONDS`（預設 300，0 停用）跑一�
 
 ### 隔離 Photos 與分段驗證
 
-[單片 CLI](scripts/first_4k_movie.py) 使用 [first-4k Compose](docker-compose.first-4k.yml) 的專用 DB／Redis 與 `.verify/first-4k/`。需備妥指定 Android profile／映像、media 工具、Maestro、專用帳號與私有 secret／cookie。該 Compose 的 qBittorrent 直連，不能用作 VPN gate 證據。
+舊 [單片 CLI](scripts/first_4k_movie.py) 的部署／上傳入口已退休，非 status 命令在接觸 Docker、帳號或資料前拒絕；其 recovery／選片／operation 契約測試與必要業務模組保留。新一輪使用 managed SourcePolicy → MediaWorkflow → GooglePhotosStorage，不重新啟動舊 first-4k stack。
 
-```bash
-uv run python scripts/first_4k_movie.py --help
-uv run python scripts/first_4k_movie.py status
-```
-
-`status` 唯讀；`preflight` 會寫 evidence 並核對 instance、mount、image、disk；`boards` 探索來源，`run` 啟動隔離單片，來源資訊只透過私有參數提供。其後沿用原 `--run-id`：
-
-| 命令 | 行為與限制 |
-| --- | --- |
-| `resume` | 依 PostgreSQL checkpoint 與原設定／映像接續；`--max-parts 1` 限本次新增確認一段，0 不限段數 |
-| `prepare-playback` | 全新 Photos cold 回載、逐段 size／hash／codec 驗證、合併及隔離 resolver；不得借用原始下載／上傳片段 |
-| `verify` | movie、automation、24 小時 quota 各自判定；未到期保持 OPEN，不把 CLI 成功當 promotion |
-| `recovery-drill` | 僅 upload_paused、恰好第一段確認、其餘未動、原 guest/tools running 且 ownership/image/mount 吻合；會重啟容器，已有 drill 不重試 |
-| `reset` | 退休隔離 run，可能停止 owned runtime；先核對副作用，不用於繞過恢復守衛 |
-
-完整來源驗證先提交 PostgreSQL 的 `source_validation` checkpoint；resume 重算完整來源 SHA-256 並核對 size、codec signature、duration 及 verification version。已驗證來源可省略重複解碼，但各段與合併物件仍需驗證；未提交的分段不可直接當成已完成 manifest。JSON 只是 evidence，DB 才是 checkpoint 事實。
-
-QUOTA_WAIT 依 DB 時間恢復；STALE 先核 heartbeat、ownership 與外部副作用；USER_ACTION_REQUIRED 停止重送帳密。保留 guest/checkpoint 供恢復。HTTP 驗收完整 GET/hash、HEAD、首／中／suffix Range、416；headless VLC 的 `--no-audio` 只能證明畫面。實際播放器須驗片頭、中段、片尾、分段交界前後的畫面、聲音與 seek，私有 evidence 記版本及 artifact hash。這套隔離 CLI 尚不能取代完整 Jellyfin、cleanup 後清 cache 再播的 Golden Path。
+cold verifier 與分段完整性政策仍需完整 manifest、全部交界、size／duration／codec／hash 及全片解碼；沒有 staging 或已刪除的 reference 不降低政策。未知 operation 沿原 identity reconciliation，新的 cohort 不可冒充它的成功收據。
 
 ### 監控
 

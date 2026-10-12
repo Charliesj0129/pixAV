@@ -294,7 +294,10 @@ async def test_rebuild_that_cannot_reproduce_the_object_makes_it_stale(workflow)
     assert [r["state"] for r in await playable(workflow, video)] == ["STALE"]
     # A stale object is replaced by a fresh preparation of the same remote asset.
     await workflow.playback.open_due()
-    assert [r["state"] for r in await playable(workflow, video)] == ["STALE", "PREPARING"]
+    rows = await playable(workflow, video)
+    assert next(r["state"] for r in rows if r["id"] == row["id"]) == "STALE"
+    replacements = [r for r in rows if r["id"] != row["id"]]
+    assert len(replacements) == 1 and replacements[0]["state"] == "PREPARING"
 
 
 async def test_failed_rebuild_waits_for_new_demand(workflow):
@@ -361,7 +364,7 @@ async def test_newer_durable_asset_supersedes_the_ready_object(workflow):
     await report(workflow, request, evidence=receipt())
 
     rows = await playable(workflow, video)
-    assert [(r["remote_asset_id"], r["state"]) for r in rows] == [(first, "STALE"), (second, "READY")]
+    assert {r["remote_asset_id"]: r["state"] for r in rows} == {first: "STALE", second: "READY"}
     # The older copy is not prepared again just because its object went stale.
     assert await workflow.playback.open_due() == []
 

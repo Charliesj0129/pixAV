@@ -1,0 +1,39 @@
+# Disposable CI instances only; never merge with an application deployment.
+name: pixav-integration
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    environment:
+      POSTGRES_USER: pixav_test
+      POSTGRES_PASSWORD: integration-only
+      POSTGRES_DB: pixav_integration
+    command: ["postgres", "-c", "max_wal_size=128MB", "-c", "min_wal_size=32MB", "-c", "checkpoint_timeout=60s"]
+    ports:
+      - "127.0.0.1:15432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data:rw,nosuid,nodev,size=2g
+    restart: "no"
+    cpus: 2.0
+    mem_limit: 3g
+    memswap_limit: 3g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pixav_test -d pixav_integration"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    tmpfs:
+      - /data:rw,nosuid,nodev,size=128m
+    restart: "no"
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

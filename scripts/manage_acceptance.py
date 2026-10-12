@@ -18,7 +18,6 @@ from pathlib import Path
 
 from pixav.shared.backup_files import create_backup_file
 
-COMPOSE = Path(__file__).resolve().parents[1] / "docker-compose.acceptance.yml"
 APP_SERVICES = {
     "migrate",
     "provision",
@@ -145,6 +144,9 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- explicit ident
         raise ValueError("an explicit dedicated acceptance project is required")
     env_file = args.env_file.absolute()
     root = args.root.absolute()
+    compose_file = args.compose_file.absolute()
+    if not compose_file.is_file() or compose_file.resolve() != compose_file or not compose_file.is_relative_to(root):
+        raise ValueError("an explicit private Compose manifest without symlinks is required")
     if root.resolve() != root or env_file.resolve() != env_file or not env_file.is_relative_to(root):
         raise ValueError("env file and root must be contained without symlinks")
     if stat.S_IMODE(env_file.stat().st_mode) != 0o600 or stat.S_IMODE(env_file.parent.stat().st_mode) != 0o700:
@@ -160,7 +162,7 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- explicit ident
         "--env-file",
         str(env_file),
         "-f",
-        str(COMPOSE),
+        str(compose_file),
         "--profile",
         "acceptance-source",
         "--profile",
@@ -186,7 +188,7 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- explicit ident
         if labels.get("com.docker.compose.project") != args.project:
             raise ValueError("container project ownership mismatch")
         files = labels.get("com.docker.compose.project.config_files", "").split(",")
-        if files != [str(COMPOSE)]:
+        if files != [str(compose_file)]:
             raise ValueError("container was created by another Compose manifest")
         service = row["Service"]
         if service not in config["services"] or service in observed_services:
@@ -233,7 +235,7 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- explicit ident
         "project": args.project,
         "docker_context": args.context,
         "docker_daemon_id": args.daemon_id,
-        "compose_sha256": hashlib.sha256(COMPOSE.read_bytes()).hexdigest(),
+        "compose_sha256": hashlib.sha256(compose_file.read_bytes()).hexdigest(),
         "resolved_config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
         "support_configuration_sha256": configuration_hashes(root),
         "images": images,
@@ -255,6 +257,7 @@ def main() -> None:
     check.add_argument("--project", required=True)
     check.add_argument("--root", required=True, type=Path)
     check.add_argument("--env-file", required=True, type=Path)
+    check.add_argument("--compose-file", required=True, type=Path)
     check.add_argument("--output", required=True, type=Path)
     report = commands.add_parser("report")
     report.add_argument("receipt", type=Path)

@@ -1,69 +1,90 @@
-"""Render the actual isolated Compose and reject unsafe deployment changes."""
+"""Validate synthetic legacy deployment contracts supplied by the operator."""
 
 import argparse
 import copy
 import json
-import os
-import shutil
-import subprocess
 
 import pytest
 
 from pixav.shared.backup_files import create_backup_file
-from scripts.manage_acceptance import COMPOSE, _containers, configuration_hashes, preflight, validate_config
+from scripts.manage_acceptance import _containers, configuration_hashes, preflight, validate_config
 
 
 @pytest.fixture
 def deployment(tmp_path):
-    if shutil.which("docker") is None:
-        pytest.skip("Docker Compose is required for deployment contract rendering")
     private = tmp_path / "secrets"
     private.mkdir(mode=0o700)
     env = private / "deployment.env"
-    values = {
-        "PIXAV_ACCEPTANCE_ROOT": str(tmp_path),
-        "PIXAV_ACCEPTANCE_APP_IMAGE": "sha256:" + "1" * 64,
-        "PIXAV_ACCEPTANCE_COLD_IMAGE": "sha256:" + "2" * 64,
-        "PIXAV_ACCEPTANCE_UPLOAD_TOOLS_IMAGE": "sha256:" + "7" * 64,
-        "PIXAV_ACCEPTANCE_CAPTURE_IMAGE": "sha256:" + "6" * 64,
-        "PIXAV_ACCEPTANCE_POSTGRES_IMAGE": "sha256:" + "3" * 64,
-        "PIXAV_ACCEPTANCE_REDIS_IMAGE": "sha256:" + "4" * 64,
-        "PIXAV_ACCEPTANCE_QBIT_IMAGE": "sha256:" + "5" * 64,
-        "PIXAV_ACCEPTANCE_DB_IDENTITY": "synthetic-instance",
-        "PIXAV_ACCEPTANCE_ADMIN_PASSWORD": "synthetic-password",
-        "PIXAV_AUTHORITY_ROLE_PASSWORD": "synthetic-password",
-        "PIXAV_WORKER_ROLE_PASSWORD": "synthetic-password",
-        "PIXAV_READER_ROLE_PASSWORD": "synthetic-password",
-        "PIXAV_ACCEPTANCE_QBIT_PASSWORD": "synthetic-password",
-        "PIXAV_ACCEPTANCE_STORAGE_OWNER": "synthetic-owner",
-        "PIXAV_ACCEPTANCE_DOCKER_GID": "1000",
-    }
     with create_backup_file(env) as handle:
-        handle.write("\n".join(f"{key}={value}" for key, value in values.items()))
-    command = [
-        "docker",
-        "compose",
-        "-p",
-        "pixav-acceptance-contract",
-        "--env-file",
-        str(env),
-        "-f",
-        str(COMPOSE),
-        "--profile",
-        "acceptance-source",
-        "--profile",
-        "acceptance-av",
-        "--profile",
-        "acceptance-native-source",
-        "config",
-        "--format",
-        "json",
-    ]
-    configured = dict(os.environ)
-    configured.update(values)
-    config = json.loads(
-        subprocess.check_output(command, env=configured)  # noqa: S603 -- fixed read-only Compose command
+        handle.write("PIXAV_ACCEPTANCE_ADMIN_PASSWORD=synthetic-password\n")
+    common = {
+        "PIXAV_LOCAL_CLEANUP_APPLY": "false",
+        "PIXAV_MANAGED_MEDIA_WORKFLOW": "true",
+        "PIXAV_PIXEL_INJECTOR_MODE": "redroid",
+        "PIXAV_REDROID_PROFILE": "gphotos_pixel_xl_v1",
+        "PIXAV_STORAGE_READBACK_IMAGE": "sha256:" + "2" * 64,
+        "PIXAV_STORAGE_UPLOAD_TOOLS_IMAGE": "sha256:" + "7" * 64,
+    }
+    application = (
+        "migrate",
+        "provision",
+        "maxwell_core",
+        "media_loader",
+        "storage_worker",
+        "playback_worker",
+        "strm_resolver",
+        "sht_probe",
     )
+    services = {name: {"image": "sha256:" + "1" * 64, "environment": dict(common)} for name in application}
+    for name, digit in (
+        ("postgres", "3"),
+        ("redis", "4"),
+        ("qbittorrent", "5"),
+        ("playback-gateway", "8"),
+        ("jellyfin", "9"),
+        ("jellyfin-client-gateway", "8"),
+        ("av_capture", "6"),
+    ):
+        services[name] = {"image": "sha256:" + digit * 64}
+    services["media_loader"]["environment"]["PIXAV_QBIT_URL"] = "http://qbittorrent:8080"
+    services["playback_worker"]["depends_on"] = {"provision": {"condition": "service_completed_successfully"}}
+    services["sht_probe"].update(
+        restart="no",
+        command=["source", "--once"],
+        volumes=[
+            {"type": "bind", "source": str(private / "source"), "target": "/run/secrets/source", "read_only": True}
+        ],
+    )
+    services["sht_probe"]["environment"].update(
+        PIXAV_SOURCE_MIN_QUALITY_SCORE="0",
+        PIXAV_CRAWL_QUERIES="",
+        PIXAV_CRAWL_COHORT_FILE="/run/secrets/source/cohort.json",
+    )
+    services["strm_resolver"]["environment"].update(
+        PIXAV_RESOLVER_REQUIRE_READER_ROLE="true", PIXAV_RESOLVER_AUTH_REQUIRED="true"
+    )
+    services["strm_resolver"]["volumes"] = [
+        {"type": "bind", "source": str(tmp_path / "data/playback-cache"), "target": "/app/data/playback-cache"},
+        {"type": "bind", "source": str(private / "resolver_token"), "target": "/run/secrets/resolver_token"},
+    ]
+    services["jellyfin"]["networks"] = {"playback": {}}
+    services["jellyfin-client-gateway"].update(
+        networks={"playback": {}, "client_capture": {}}, ports=[{"host_ip": "127.0.0.1", "published": "18096"}]
+    )
+    services["av_capture"].update(
+        networks={"client_capture": {}},
+        volumes=[
+            {"type": "bind", "source": str(tmp_path / "evidence/client-capture"), "target": "/work"},
+            {
+                "type": "bind",
+                "source": str(private / "capture-config.json"),
+                "target": "/run/secrets/capture-config.json",
+            },
+        ],
+    )
+    config = {"services": services, "networks": {"playback": {}, "client_capture": {"internal": True}}}
+    with create_backup_file(tmp_path / "compose.json") as handle:
+        json.dump(config, handle)
     return tmp_path, env, config
 
 
@@ -182,6 +203,7 @@ def test_preflight_receipt_has_no_resolved_credentials_or_fake_runtime_pass(depl
         argparse.Namespace(
             project="pixav-acceptance-contract",
             env_file=env,
+            compose_file=root / "compose.json",
             root=root,
             context="default",
             daemon_id="synthetic-daemon",
@@ -222,7 +244,7 @@ def test_preflight_rejects_runtime_drift(deployment, monkeypatch, violation):
         "Config": {
             "Labels": {
                 "com.docker.compose.project": "pixav-acceptance-contract",
-                "com.docker.compose.project.config_files": str(COMPOSE),
+                "com.docker.compose.project.config_files": str(root / "compose.json"),
             }
         },
         "Mounts": [],
@@ -253,6 +275,7 @@ def test_preflight_rejects_runtime_drift(deployment, monkeypatch, violation):
             argparse.Namespace(
                 project="pixav-acceptance-contract",
                 env_file=env,
+                compose_file=root / "compose.json",
                 root=root,
                 context="default",
                 daemon_id="synthetic-daemon",

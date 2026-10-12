@@ -6,6 +6,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 
 - 開始前讀相關 `.agent/skills/`、`.agent/workflows/` 與 `user_rules.md`；不存在時記錄並繼續，不虛構 workflow。
 - 核對 worktree，先讀實際 repository、callers、測試、migration、Compose 與可核實 runtime evidence；保留既有程式修改。區分目標契約、目前實作、隔離證據與 production 驗收。
+- 舊 application Compose／start_workers 與 first-4k 啟動入口已退休；只保留獨立 Android runner 與 CI integration Compose。新 managed deployment／Windows upload adapter 另行驗收，不復活舊 executor 或重播舊 queue。
 - Windows 開發環境採 Windows Android Emulator + Docker Runner，WSL／Docker Desktop 使用 Microsoft 提供的 WSL kernel。操作者已回報 `bzImage-6.6.87.2-pixav-redroid` 的 `.wslconfig` kernel override 造成相容性問題；不得把修改全域 kernel、載入 binder 或 privileged redroid guest 作為開發前置。設定範圍、ADB／Maestro 與遷移守衛見 README。
 - 維持 README、AGENTS、CLAUDE 三份核心文件，不新增 roadmap、CODEMAPS、ADR、實驗流水帳、archive 或轉址頁。外來規格整合進 README 並保留情境對應；文件刪改直接進行，不建立文件備份，同步修正引用。
 - 文件採中性用語與合成媒體，不放來源名稱、連結、作品識別資料或相關圖片；實際程式路徑、參數、設定鍵保留原名。私有 evidence 不變成公開文件或 fixture。
@@ -33,6 +34,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - 本次階段 3–5 隔離驗收依操作者授權，允許本機加密完整備份加同機獨立完整還原，作為本輪 cleanup 的備份前置例外；仍須通過一致快照、roles／ledger／queue／guest／觀看紀錄及精確刪除守衛。例外不代表離機備份、整機故障恢復或 production promotion 通過。
 - `.env`、`secrets/`、`backups/` 不進版控；credential 不進 log、model repr、metrics、fixture、projection 或 Maestro YAML。private playback 必須驗收未授權 client 與撤銷裝置被拒絕。
 - 新 cohort 的真實影音採版本化 evidence，完整 manifest／reference／錄影與全部交界須可重算；自動 capture 不能代替操作者實看實聽，舊版人工證據不自動升級。
+- 2026-10-12 操作者授權設計 checkpoint 重置：舊隔離影片／分段／回載／播放 cache／影音錄影可依 exact-target manifest 人工丟棄且不備份影片本體。先保留並驗證 D 槽的程式／設定／DB／roles／ledger／queue／guest／未知上傳紀錄與認證；此為一次性人工重置，不記 Golden Path PASS，不放寬正式 cleanup 或未知副作用 reconciliation。舊 cohort 的已刪媒體與錄影不抵新驗收，下一輪用新 cohort 重跑全部 gate。
 - staging cleanup 必須同時滿足遠端 DURABLE、有效完整性證據、播放 READY 且實播驗證完成、完整 publication、retention 到期、無 active execution/reader、path/ownership 與操作守衛通過。資格檢查到 unlink 之間防止競態；cleanup crash 後核對 filesystem 並留下 audit。
 - 磁碟餘額須同時核對 WSL／Docker VHD 所在實體分區；虛擬檔案系統餘額不代替實體容量。Docker 資料磁碟搬移須先完整盤點、獨立備份還原與容量守衛，再取得明確搬移授權；停止的其他專案不得隨 daemon 恢復而自動啟動。
 - 本輪 Docker 搬移及精確舊 C 副本清除已獲授權，備份還原守衛仍適用；全 WSL 重啟涉及其他專案工作的新增中斷範圍，須依當次確認執行；2026-10-11 接續搬移指示已授權本次已說明的釋鎖重啟，後續新增中斷範圍仍須各自核對。可重建 build／工具 cache 的清理須逐筆核對 manifest，保留映像、設定與重建入口；不可藉精簡清除媒體、guest、intents 或驗收 evidence，未核實 VHD 實體餘額前不宣稱已騰出 Windows 空間。
@@ -51,8 +53,9 @@ uv run ruff check src tests scripts
 uv run black --check src tests scripts
 uv run isort --check-only src tests scripts
 uv run mypy src
-docker compose config -q
-docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q
+docker compose -f docker-compose.integration.yml config -q
+# Set PIXAV_ANDROID_RUNNER_IMAGE, PIXAV_ANDROID_SERIAL and PIXAV_ANDROID_RUNNER_STAGING_DIR first.
+docker compose -f docker-compose.android-runner.yml --profile android-dev config -q
 ```
 
 外部整合優先 live contract、真實 fixture、真 PostgreSQL repository/migration 與 opt-in E2E；mock 依已驗證契約。BDD 情境 ID 對應測試與私有 evidence；尚未引入的 pytest-bdd／marker／測試目錄不可寫成已可執行功能。CI 必須啟用專用 PostgreSQL／Redis 核心整合測試並核對 instance identity；coverage 保留完整報告，不設全域百分比門檻。Coverage 不代表 production 可用，既有失敗另行記錄，不接管未核對的正式資料或服務。

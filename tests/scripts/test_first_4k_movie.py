@@ -454,3 +454,15 @@ async def test_verify_only_requires_movie_quota_automation(
     assert state["gates"]["quota"] == quota
     assert state["gates"]["vpn"] == "OPEN"
     assert state["gates"]["production_promotion"] == "NOT_REQUESTED"
+
+
+@pytest.mark.parametrize("command", ["preflight", "run", "resume", "reset", "prepare-playback"])
+def test_retired_entry_blocks_before_any_docker_or_account_access(monkeypatch, capsys, command):
+    monkeypatch.setattr("sys.argv", ["first_4k_movie", command])
+
+    def unexpected_docker():
+        raise AssertionError("retired entry must not access Docker")
+
+    monkeypatch.setattr(flow_module.docker, "from_env", unexpected_docker)
+    assert flow_module.main() == 2
+    assert json.loads(capsys.readouterr().out) == {"status": "BLOCKED", "reason": "LEGACY_DEPLOYMENT_RETIRED"}

@@ -1080,19 +1080,6 @@ async def dispatch(flow: MovieFlow) -> dict:  # noqa: C901 - explicit command an
     await flow.playback()
     if flow.heartbeat:
         flow.heartbeat.check()
-    process = await asyncio.create_subprocess_exec(
-        "docker",
-        "compose",
-        "-f",
-        str(ROOT / "docker-compose.first-4k.yml"),
-        "up",
-        "-d",
-        "resolver",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    if await asyncio.wait_for(process.wait(), 120):
-        raise CanaryBlockedError("isolated resolver failed to start")
     return await flow.verify()
 
 
@@ -1238,6 +1225,9 @@ def main() -> int:
     # Cloudflare interstitial. Extra trackers reach the same swarms.
     parser.add_argument("--fetch-attachments", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
+    if args.command != "status":
+        print(json.dumps({"status": "BLOCKED", "reason": "LEGACY_DEPLOYMENT_RETIRED"}))
+        return 2
     logging.disable(logging.CRITICAL)
     os.umask(0o077)
     try:
