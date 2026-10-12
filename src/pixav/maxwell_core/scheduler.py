@@ -15,8 +15,6 @@ logger = logging.getLogger(__name__)
 class LruAccountScheduler:
     """Select the next Google account using least-recently-used policy.
 
-    Implements the ``TaskScheduler`` protocol.
-
     Queries the ``accounts`` table for active accounts ordered by
     ``last_used_at`` ascending (oldest first = least recently used).
     """

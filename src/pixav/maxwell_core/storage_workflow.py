@@ -20,6 +20,7 @@ import asyncpg
 
 from pixav.media_loader.preparation import PreparedArtifact, segment_plan
 from pixav.shared.enums import AccountStatus
+from pixav.shared.instance import database_identity
 from pixav.shared.metrics import (
     record_remote_asset_durable,
     record_remote_asset_invalidated,
@@ -28,6 +29,7 @@ from pixav.shared.metrics import (
 )
 from pixav.shared.remote_assets import RemoteAssetRepository, expectation, segment_from_row
 from pixav.shared.storage_models import IntegrityError, ProviderSegmentIdentity, current_policy, policy_for
+from pixav.shared.upload_outcome_review import ExistingItemShareReview, UploadOutcomeReview, parse_upload_review
 from pixav.shared.workflow import ActivityResult
 
 logger = logging.getLogger(__name__)
@@ -164,9 +166,12 @@ class StorageWorkflow:
         Eligibility is decided entirely by the database clock, so a worker's
         wall clock cannot make an exhausted or cooling account look usable.
         """
+        recovery = json.loads(segment["recovery"]) if isinstance(segment["recovery"], str) else segment["recovery"]
+        pinned_account = segment["account_id"] if recovery.get("upload_outcome_review") else None
         row = await conn.fetchrow(
             """SELECT a.id FROM accounts a
             WHERE a.status=$1
+              AND ($3::uuid IS NULL OR a.id=$3)
               AND (a.cooldown_until IS NULL OR a.cooldown_until <= now())
               AND (CASE WHEN a.quota_reset_at <= now() THEN 0 ELSE a.daily_uploaded_bytes END) + $2
                   <= a.daily_quota_bytes
@@ -175,6 +180,7 @@ class StorageWorkflow:
             FOR UPDATE SKIP LOCKED LIMIT 1""",
             AccountStatus.ACTIVE.value,
             segment["size_bytes"],
+            pinned_account,
         )
         if row is None:
             return None
@@ -284,6 +290,153 @@ class StorageWorkflow:
     # be an instruction to redo an external side effect blindly.
     RESUMABLE_RECOVERY = ("user_action", "email_submitted", "password_submitted")
     RESUMABLE_OPERATIONS = ("credential_email", "credential_password")
+
+    async def review_upload_outcome(
+        self,
+        execution_id: uuid.UUID,
+        segment_index: int,
+        evidence: dict,
+        *,
+        operator: str,
+        reason: str,
+        apply: bool = False,
+    ) -> bool:
+        """Queue an exact review only. Maxwell alone releases the held upload."""
+        if not operator.strip() or not reason.strip():
+            raise ValueError("upload outcome review requires operator and reason")
+        review = parse_upload_review(evidence)
+        async with self.pool.acquire() as conn, conn.transaction():
+            execution = await conn.fetchrow("SELECT * FROM executions WHERE id=$1 FOR UPDATE", execution_id)
+            if execution is None:
+                raise ValueError("unknown execution")
+            checkpoint = json.loads(execution["checkpoint"])
+            payload = review.model_dump(mode="json")
+            previous = checkpoint.get("upload_outcome_review")
+            if (
+                previous
+                and previous["evidence"] == payload
+                and previous["operator"] == operator
+                and previous["reason"] == reason
+            ):
+                if previous["status"] == "PENDING":
+                    await self._validate_upload_review(conn, execution, segment_index, review)
+                elif previous["status"] == "REJECTED":
+                    raise ValueError("upload outcome review was rejected; supply new evidence")
+                return False
+            if previous and previous["status"] != "REJECTED":
+                raise ValueError("another upload outcome review already exists")
+            await self._validate_upload_review(conn, execution, segment_index, review)
+            if not apply:
+                return True
+            if previous:
+                checkpoint.setdefault("upload_outcome_review_history", []).append(previous)
+            checkpoint["upload_outcome_review"] = {
+                "status": "PENDING",
+                "evidence": payload,
+                "operator": operator,
+                "reason": reason,
+                "requested_at": (await conn.fetchval("SELECT clock_timestamp()")).isoformat(),
+            }
+            await conn.execute(
+                "UPDATE executions SET checkpoint=$2::jsonb,updated_at=now() WHERE id=$1",
+                execution_id,
+                json.dumps(checkpoint),
+            )
+            return True
+
+    async def _validate_upload_review(
+        self, conn, execution, segment_index: int, review: UploadOutcomeReview | ExistingItemShareReview
+    ):
+        if execution["state"] != "USER_ACTION_REQUIRED" or execution["stage"] != "upload":
+            raise ValueError("only a held upload can be reviewed")
+        checkpoint = json.loads(execution["checkpoint"])
+        asset_id = uuid.UUID(checkpoint["asset_id"])
+        row = await conn.fetchrow(
+            "SELECT * FROM remote_asset_segments WHERE asset_id=$1 AND segment_index=$2 FOR UPDATE",
+            asset_id,
+            segment_index,
+        )
+        if row is None:
+            raise ValueError("unknown review segment")
+        segment = segment_from_row(row)
+        if segment.state != "user_action_required" or segment.usage_counted_at is not None:
+            raise ValueError("only an unconfirmed held segment can be reviewed")
+        operation = await conn.fetchval(
+            "SELECT id FROM operation_intents WHERE execution_id=$1 AND stage='upload' AND identity=$2",
+            execution["id"],
+            f"upload:{asset_id}:{segment_index}",
+        )
+        now = await conn.fetchval("SELECT clock_timestamp()")
+        review.validate_current(
+            execution,
+            segment,
+            operation_id=operation,
+            instance=await database_identity(conn),
+            database=await conn.fetchval("SELECT current_database()"),
+            now=now,
+        )
+        runtimes = await conn.fetch(
+            "SELECT owner,profile,state FROM guest_runtimes WHERE account_id=$1", segment.account_id
+        )
+        if (
+            len(runtimes) != 1
+            or str(runtimes[0]["owner"]) != review.guest_owner
+            or runtimes[0]["profile"] != review.profile
+            or runtimes[0]["state"] != "READY"
+        ):
+            raise ValueError("upload outcome guest ownership changed")
+        asset = await conn.fetchrow("SELECT * FROM remote_assets WHERE id=$1", asset_id)
+        if isinstance(review, ExistingItemShareReview):
+            if review.filename != segment.filename:
+                raise ValueError("existing item filename does not match segment")
+            return segment
+        candidate = segment.model_copy(update={"share_url": review.share_url, "verification": review.backup_evidence})
+        self.policy.validate_share_location(review.share_url)
+        self._validate_cold_proof(candidate, segment, asset, review.cold_readback, now)
+        return segment
+
+    async def consume_upload_reviews(self) -> int:
+        """Called by Maxwell under its existing process ownership."""
+        count = 0
+        async with self.pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch("""SELECT * FROM executions WHERE state='USER_ACTION_REQUIRED' AND stage='upload'
+                AND checkpoint->'upload_outcome_review'->>'status'='PENDING' FOR UPDATE SKIP LOCKED""")
+            for execution in rows:
+                checkpoint = json.loads(execution["checkpoint"])
+                request = checkpoint["upload_outcome_review"]
+                try:
+                    review = parse_upload_review(request["evidence"])
+                    segment = await self._validate_upload_review(conn, execution, review.segment_index, review)
+                except ValueError:
+                    request["status"] = "REJECTED"
+                    request["error_code"] = "UPLOAD_REVIEW_STALE_OR_INVALID"
+                    await conn.execute(
+                        "UPDATE executions SET checkpoint=$2::jsonb,updated_at=now() WHERE id=$1",
+                        execution["id"],
+                        json.dumps(checkpoint),
+                    )
+                    continue
+                request["status"] = "ACCEPTED"
+                request["confirmed_at"] = (await conn.fetchval("SELECT clock_timestamp()")).isoformat()
+                if isinstance(review, ExistingItemShareReview):
+                    request["recovery_before"] = segment.recovery
+                recovery = {**segment.recovery, "upload_outcome_review": request}
+                await conn.execute(
+                    """UPDATE remote_asset_segments SET recovery=$3::jsonb,state='prepared',updated_at=now()
+                    WHERE asset_id=$1 AND segment_index=$2""",
+                    segment.asset_id,
+                    segment.segment_index,
+                    json.dumps(recovery),
+                )
+                await conn.execute(
+                    """UPDATE executions SET checkpoint=$2::jsonb,state='READY',due_at=now(),owner=NULL,lease_until=NULL,
+                    blocked_reason=NULL,error_code=NULL,failure_class=NULL,updated_at=now() WHERE id=$1""",
+                    execution["id"],
+                    json.dumps(checkpoint),
+                )
+                await self.release_lease(conn, execution["id"])
+                count += 1
+        return count
 
     async def reconcile_existing_segment(
         self,
@@ -417,7 +570,7 @@ class StorageWorkflow:
             or evidence.get("provider_segment_index") != source.segment_index
             or evidence.get("provider_share_sha256") != hashlib.sha256((source.share_url or "").encode()).hexdigest()
             or evidence.get("cold_inputs") != "provider-only"
-            or sorted(evidence.get("cold_mounts", [])) != ["/app/src:ro", "/work:rw"]
+            or sorted(evidence.get("cold_mounts", [])) not in (["/work:rw"], ["/app/src:ro", "/work:rw"])
         ):
             raise IntegrityError("cold evidence is not bound to the exact source")
         at = datetime.fromisoformat(evidence.get("at", ""))
@@ -513,6 +666,8 @@ class StorageWorkflow:
             execution = await conn.fetchrow("SELECT * FROM executions WHERE id=$1 FOR UPDATE", execution_id)
             if execution is None or execution["state"] != "USER_ACTION_REQUIRED":
                 raise ValueError("only an execution held for user action may be resumed")
+            if execution["stage"] not in {"upload", "verify"}:
+                raise ValueError("storage resume cannot release another execution stage")
             asset_id = json.loads(execution["checkpoint"]).get("asset_id")
             if asset_id is not None:
                 await self._clear_segment_guards(conn, uuid.UUID(str(asset_id)), cleared)

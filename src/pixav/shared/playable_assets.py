@@ -12,8 +12,9 @@ import uuid
 from typing import Any
 
 import asyncpg
+from pydantic import ValidationError
 
-from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
+from pixav.shared.client_playback_evidence import client_matches_current_manifest, parse_client_playback_evidence
 from pixav.shared.playback_models import PREPARATION_VERSION, PlayableAsset
 
 
@@ -157,9 +158,20 @@ class PlayableAssetRepository:
             if row is None or evidence.get("size") != row["size_bytes"] or evidence.get("sha256") != row["sha256"]:
                 return False
             if "client_playback" in evidence:
-                client = ClientPlaybackEvidence.model_validate(evidence["client_playback"])
-                if not client.matches(dict(row)) or not row["ready_at"] <= client.observed_at <= row["checked_at"]:
+                client = parse_client_playback_evidence(evidence["client_playback"])
+                if not await client_matches_current_manifest(client, dict(row), conn):
                     return False
+            else:
+                previous = row["playback_evidence"]
+                if isinstance(previous, str):
+                    previous = json.loads(previous)
+                try:
+                    client = parse_client_playback_evidence((previous or {}).get("client_playback"))
+                except ValidationError:
+                    pass
+                else:
+                    if await client_matches_current_manifest(client, dict(row), conn):
+                        evidence = {**evidence, "client_playback": previous["client_playback"]}
             await conn.execute(
                 """UPDATE playable_assets SET playback_verified_at=now(),playback_evidence=$2::jsonb,updated_at=now()
                 WHERE id=$1""",

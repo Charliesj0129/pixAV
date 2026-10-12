@@ -1,0 +1,6 @@
+# Connectivity smoke only: no account login, media push, upload or data clearing.
+appId: com.android.settings
+---
+- launchApp:
+    clearState: false
+- pressKey: Home

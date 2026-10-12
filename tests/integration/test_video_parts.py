@@ -231,10 +231,16 @@ async def test_parts_dump_restores_with_parent_and_account(integration_db, tmp_p
             check=True,
             timeout=60,
         )  # noqa: S603,S607
-        restored = await asyncpg.connect(
-            host="127.0.0.1", port=15432, user="pixav_test", password="integration-only", database=target
+        endpoint = urlsplit(
+            os.getenv(
+                "PIXAV_E2E_ADMIN_DSN", "postgresql://pixav_test:integration-only@127.0.0.1:15432/pixav_integration"
+            )
         )
+        restored = await asyncpg.connect(urlunsplit(endpoint._replace(path=f"/{target}")))
         try:
+            from scripts.instance_guard import database_identity
+
+            assert await database_identity(restored) == await database_identity(admin)
             assert await restored.fetchval("SELECT count(*) FROM video_parts WHERE video_id=$1", video) == 2
             assert await restored.fetchval("SELECT expected_part_count FROM videos WHERE id=$1", video) == 2
         finally:

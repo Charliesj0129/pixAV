@@ -227,64 +227,6 @@ class VideoRepository:
         )
         return int(val)
 
-    async def update_embedding(self, video_id: uuid.UUID, embedding: list[float]) -> None:
-        """Update the embedding vector for a video."""
-        await self._pool.execute(
-            "UPDATE videos SET embedding = $1 WHERE id = $2",
-            embedding,
-            video_id,
-        )
-
-    async def find_missing_embeddings(self, limit: int = 100) -> list[Video]:
-        """Find videos that do not have an embedding yet."""
-        rows = await self._pool.fetch(
-            "SELECT * FROM videos WHERE embedding IS NULL ORDER BY created_at DESC LIMIT $1",
-            limit,
-        )
-        return [_video_from_row(row) for row in rows]
-
-    async def search(self, query: str, query_embedding: list[float], limit: int = 20) -> list[Video]:
-        """Hybrid search using RRF (Reciprocal Rank Fusion) of Semantic + Keyword search.
-
-        Args:
-            query: The raw text query for keyword matching.
-            query_embedding: The embedding vector of the query for semantic matching.
-            limit: Max results to return.
-        """
-        rows = await self._pool.fetch(
-            """
-            WITH semantic AS (
-                SELECT id, RANK() OVER (ORDER BY embedding <=> $2) as rank_vector
-                FROM videos
-                WHERE status = 'available'
-                ORDER BY embedding <=> $2
-                LIMIT 100
-            ),
-            keyword AS (
-                SELECT id, RANK() OVER (ORDER BY ts_rank_cd(search_text, websearch_to_tsquery('simple', $1)) DESC) as rank_keyword
-                FROM videos
-                WHERE status = 'available'
-                  AND search_text @@ websearch_to_tsquery('simple', $1)
-                ORDER BY ts_rank_cd(search_text, websearch_to_tsquery('simple', $1)) DESC
-                LIMIT 100
-            )
-            SELECT v.*,
-                   COALESCE(1.0 / (60 + s.rank_vector), 0.0) +
-                   COALESCE(1.0 / (60 + k.rank_keyword), 0.0) AS rrf_score
-            FROM videos v
-            LEFT JOIN semantic s ON v.id = s.id
-            LEFT JOIN keyword k ON v.id = k.id
-            WHERE s.id IS NOT NULL OR k.id IS NOT NULL
-            ORDER BY rrf_score DESC
-            LIMIT $3
-            """,
-            query,
-            query_embedding,
-            limit,
-        )
-        # rrf_score is ignored by model_validate (extra fields)
-        return [_video_from_row(row) for row in rows]
-
 
 class SourceCandidateRepository:
     """CRUD operations for the ``source_candidates`` table.

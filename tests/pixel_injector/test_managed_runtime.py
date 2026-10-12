@@ -337,3 +337,28 @@ async def test_guest_and_tools_receive_separate_resource_limits(tmp_path, monkey
     assert guest["mem_limit"] == guest["memswap_limit"] == 3072 * 1024**2
     assert tools["nano_cpus"] == 500_000_000
     assert tools["mem_limit"] == tools["memswap_limit"] == 1536 * 1024**2
+
+
+@pytest.mark.parametrize("defect", [None, "missing", "account", "state", "container"])
+async def test_existing_item_runtime_never_provisions_or_retires(tmp_path, monkeypatch, defect):
+    import copy
+
+    pool, client = Pool(), Client()
+    subject = runtime(pool, client, tmp_path, monkeypatch)
+    if defect != "missing":
+        await subject.acquire(ACCOUNT)
+    if defect == "account":
+        pool.row["account_id"] = str(OTHER_ACCOUNT)
+    if defect == "state":
+        pool.row["state"] = "INTENT"
+    if defect == "container":
+        client.items.pop(pool.row["tools_id"])
+    before, created = copy.deepcopy(pool.row), len(client.created)
+    if defect:
+        with pytest.raises(CanaryBlockedError):
+            await subject.acquire_existing(ACCOUNT)
+    else:
+        guest, tools = await subject.acquire_existing(ACCOUNT)
+        assert {guest.id, tools.id} == set(client.items)
+    assert pool.row == before and len(client.created) == created
+    assert not any(c.stopped or c.removed for c in client.items.values())

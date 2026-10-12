@@ -11,6 +11,7 @@ class MagnetCandidate:
     uri: str
     title: str
     source_url: str
+    size_bytes: int = 0
 
 
 class CrawlResult(list[str]):

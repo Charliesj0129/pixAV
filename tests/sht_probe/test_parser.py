@@ -13,6 +13,15 @@ def extractor() -> BeautifulSoupExtractor:
 
 
 class TestBeautifulSoupExtractor:
+    async def test_escaped_href_keeps_title_and_one_candidate(self, extractor: BeautifulSoupExtractor) -> None:
+        uri = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Synthetic+2160p.mp4&tr=http://tracker/announce"
+        html = '<a href="' + uri.replace("&", "&amp;") + '">Download</a>'
+        candidates = await extractor.extract_candidates(html, "http://source/item")
+        assert len(candidates) == 1
+        assert candidates[0].uri == uri
+        assert candidates[0].title == "Synthetic 2160p.mp4"
+        assert candidates[0].source_url == "http://source/item"
+
     async def test_extract_from_a_tags(self, extractor: BeautifulSoupExtractor) -> None:
         html = """
         <html><body>

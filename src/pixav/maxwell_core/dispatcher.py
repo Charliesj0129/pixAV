@@ -14,8 +14,6 @@ logger = logging.getLogger(__name__)
 class RedisTaskDispatcher:
     """Dispatch tasks to the appropriate Redis queue.
 
-    Implements the ``TaskDispatcher`` protocol.
-
     Looks up the task in DB, determines the target queue based on state,
     serialises the payload, and pushes to the queue.
     """

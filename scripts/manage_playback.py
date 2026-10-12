@@ -30,7 +30,7 @@ from typing import Any
 import httpx
 
 from pixav.config import get_settings
-from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
+from pixav.shared.client_playback_evidence import ClientPlaybackEvidenceV2, parse_client_playback_evidence
 from pixav.shared.db import create_pool
 from pixav.shared.instance import database_identity
 from pixav.shared.playable_assets import PlayableAssetRepository
@@ -99,6 +99,13 @@ async def _verify(args: argparse.Namespace, repository: PlayableAssetRepository)
     if client_path:
         try:
             evidence["client_playback"] = _client_report(client_path, recording, asset.model_dump(), args.operator)
+            if evidence["client_playback"]["method"] == "jellyfin-client-v2":
+                from scripts.review_jellyfin_av import validate_review
+
+                paths = [getattr(args, k, None) for k in ("trace", "reference", "analysis")]
+                if not all(paths):
+                    raise ValueError("v2 requires trace/reference/analysis and independent recomputation")
+                validate_review(evidence["client_playback"], recording, *paths)
         except (ValueError, OSError):
             print("refused: client evidence or recording does not match; nothing recorded")
             return 2
@@ -112,7 +119,11 @@ async def _verify(args: argparse.Namespace, repository: PlayableAssetRepository)
 
 
 def _client_report(client_path: Path, recording: Path, asset: dict, operator: str) -> dict:
-    client = ClientPlaybackEvidence.model_validate_json(Path(client_path).read_text())
+    client = parse_client_playback_evidence(json.loads(Path(client_path).read_text()))
+    if isinstance(client, ClientPlaybackEvidenceV2) and (
+        client_path.is_symlink() or client_path.stat().st_mode & 0o077
+    ):
+        raise ValueError("v2 review must be private")
     digest = hashlib.sha256()
     with Path(recording).open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
@@ -138,8 +149,12 @@ def main() -> None:
     verify.add_argument("--base-url", default=get_settings().resolver_base_url, help="the resolver players use")
     verify.add_argument("--operator", required=True, help="who ran the verification")
     verify.add_argument("--reason", required=True, help="why, recorded with the evidence")
-    verify.add_argument("--client-evidence", type=Path, help="private jellyfin-client-v1 operator attestation JSON")
+    verify.add_argument("--client-evidence", type=Path, help="private jellyfin-client-v1/v2 operator attestation JSON")
     verify.add_argument("--recording", type=Path, help="private audiovisual recording matching the attestation digest")
+    for option in ("trace", "reference", "analysis"):
+        verify.add_argument(
+            "--" + option, type=Path, help="v2 private artifact; analysis is recomputed before registration"
+        )
     verify.add_argument("--token-file", type=Path, help="private resolver service token (never placed in the URL)")
 
     raise SystemExit(asyncio.run(_run(parser.parse_args())))

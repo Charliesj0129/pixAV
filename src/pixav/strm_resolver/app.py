@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from redis import asyncio as aioredis
 
 from pixav.config import get_settings
+from pixav.shared.workflow import require_workflow_role
 from pixav.strm_resolver.cache_janitor import PlaybackCacheJanitor, run_janitor
 from pixav.strm_resolver.middleware import PlaybackAuthMiddleware, RateLimitMiddleware, setup_cors
 from pixav.strm_resolver.playback import PlaybackCache
@@ -33,6 +34,16 @@ async def _open_database(dsn: str, redis_client: aioredis.Redis | None) -> async
         # Let the container restart policy retry initialization. Serving with no
         # pool would leave playback broken after PostgreSQL recovered.
         raise RuntimeError("PostgreSQL is required for configured playback") from None
+
+
+async def _require_reader(db_pool: asyncpg.Pool, redis_client: aioredis.Redis | None) -> None:
+    try:
+        await require_workflow_role(db_pool, "pixav_playback_reader")
+    except Exception:
+        await db_pool.close()
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise
 
 
 def _start_janitor(app: FastAPI, db_pool: asyncpg.Pool | None) -> asyncio.Task[None] | None:
@@ -68,6 +79,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     if db_dsn:
         db_pool = await _open_database(db_dsn, redis_client)
+        if app.state.require_reader_role:
+            await _require_reader(db_pool, redis_client)
         app.state.db_pool = db_pool
 
     # Start resolver client
@@ -107,6 +120,7 @@ def create_app(
     app.state.db_dsn = db_dsn
     app.state.redis = None
     app.state.db_pool = None
+    app.state.require_reader_role = settings.resolver_require_reader_role
     app.state.local_share_scheme = settings.pixel_injector_local_share_scheme
     app.state.playback_cache = PlaybackCache(Path(settings.playback_cache_dir))
     app.state.playback_cold_wait_seconds = settings.playback_cold_wait_seconds

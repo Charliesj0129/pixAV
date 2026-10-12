@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # The only outcomes a playback worker reports. Anything else is a malformed
 # report, never something to reinterpret.
-PLAYBACK_OUTCOMES = ("success", "infrastructure", "verification_failed")
+PLAYBACK_OUTCOMES = ("success", "infrastructure", "verification_failed", "user_action")
 
 # A rebuild produced other bytes than the READY record from correct segments:
 # the recipe no longer reproduces the object, so the object is STALE.
@@ -44,6 +45,77 @@ class PlaybackWorkflow:
         self.pool = pool
         self.preparation_version = preparation_version
         self.playable = PlayableAssetRepository(pool)
+
+    async def resume_unclaimed_preparation(
+        self,
+        execution_id: uuid.UUID,
+        *,
+        generation: int,
+        operator: str,
+        reason: str,
+        review_sha256: str,
+    ) -> bool:
+        """Resume a reviewed transport failure without replaying storage.
+
+        Call only while holding the sole execution authority. The review binds
+        the deployment, repaired transport and absence of a published cache
+        effect. Claimed unfinished attempts and pending reports need separate
+        reconciliation; this entry cannot release them or reset retry counts.
+        """
+        if not operator.strip() or not reason.strip() or not re.fullmatch(r"[a-f0-9]{64}", review_sha256):
+            raise ValueError("resume requires operator, reason and review digest")
+        async with self.pool.acquire() as conn, conn.transaction():
+            execution = await conn.fetchrow("SELECT * FROM executions WHERE id=$1 FOR UPDATE", execution_id)
+            if (
+                execution is None
+                or execution["state"] != "USER_ACTION_REQUIRED"
+                or execution["stage"] != "playback"
+                or execution["error_code"] != "ACTIVITY_LEASE_EXPIRED"
+                or execution["generation"] != generation
+            ):
+                raise ValueError("only the reviewed held playback generation may be resumed")
+            checkpoint = json.loads(execution["checkpoint"])
+            if checkpoint.get("purpose") != "prepare":
+                raise ValueError("cache rebuild needs effect reconciliation")
+            valid = await conn.fetchval(
+                """SELECT EXISTS(SELECT FROM playable_assets p JOIN remote_assets a ON a.id=p.remote_asset_id
+                WHERE p.id=$1 AND p.state='PREPARING' AND p.ready_at IS NULL AND p.materialized_at IS NULL
+                  AND a.id=$2 AND a.state='DURABLE'
+                  AND (SELECT count(*) FROM remote_asset_segments s WHERE s.asset_id=a.id)=a.segment_count
+                  AND NOT EXISTS(SELECT FROM remote_asset_segments s WHERE s.asset_id=a.id AND s.state<>'verified'))""",
+                uuid.UUID(checkpoint["playable_asset_id"]),
+                uuid.UUID(checkpoint["remote_asset_id"]),
+            )
+            unresolved = await conn.fetchval(
+                """SELECT EXISTS(SELECT FROM activity_attempts a WHERE a.execution_id=$1 AND
+                  ((a.worker_token IS NOT NULL AND a.completed_at IS NULL)
+                   OR EXISTS(SELECT FROM activity_results r WHERE r.attempt_id=a.id AND r.consumed_at IS NULL)))
+                   OR EXISTS(SELECT FROM executions e WHERE e.task_id=$2 AND e.id<>$1
+                             AND e.state NOT IN ('SUCCEEDED','FAILED','CANCELLED'))""",
+                execution_id,
+                execution["task_id"],
+            )
+            if not valid or unresolved:
+                raise ValueError("preparation has unresolved effects or is no longer eligible")
+            history = checkpoint.setdefault("transport_resumes", [])
+            clock = await conn.fetchval("SELECT now()")
+            history.append(
+                {
+                    "operator": operator,
+                    "reason": reason,
+                    "review_sha256": review_sha256,
+                    "generation": generation,
+                    "observed_at": clock.isoformat(),
+                }
+            )
+            await conn.execute(
+                """UPDATE executions SET state='READY',blocked_reason=NULL,error_code=NULL,failure_class=NULL,
+                owner=NULL,lease_until=NULL,due_at=now(),generation=generation+1,checkpoint=$2::jsonb,updated_at=now()
+                WHERE id=$1""",
+                execution_id,
+                json.dumps(checkpoint),
+            )
+            return True
 
     async def open_due(self, *, limit: int = 5, max_retries: int = 2) -> list[uuid.UUID]:
         """Open executions for durable assets not yet playable and for unmet demand.
@@ -152,10 +224,8 @@ class PlaybackWorkflow:
         if result.outcome == "infrastructure":
             record_playback_materialization(purpose, "infrastructure")
             return False
-        if result.outcome == "verification_failed":
-            await self._refuse(
-                conn, execution, playable_id, purpose, result.error_code or "PLAYBACK_INTEGRITY_MISMATCH"
-            )
+        if result.outcome in {"verification_failed", "user_action"}:
+            await self._apply_refusal(conn, execution, playable_id, purpose, result)
             return True
         playable = await conn.fetchrow("SELECT * FROM playable_assets WHERE id=$1 FOR UPDATE", playable_id)
         asset = await conn.fetchrow("SELECT * FROM remote_assets WHERE id=$1", playable["remote_asset_id"])
@@ -189,6 +259,14 @@ class PlaybackWorkflow:
         await self._close(conn, execution["id"], "SUCCEEDED", None)
         record_playback_materialization(purpose, "success")
         return True
+
+    async def _apply_refusal(self, conn, execution, playable_id, purpose, result) -> None:
+        if result.outcome == "user_action":
+            await self._close(conn, execution["id"], "USER_ACTION_REQUIRED", "PHOTOS_ACCOUNT_SESSION_REQUIRED")
+        else:
+            await self._refuse(
+                conn, execution, playable_id, purpose, result.error_code or "PLAYBACK_INTEGRITY_MISMATCH"
+            )
 
     async def _refuse(self, conn, execution, playable_id: uuid.UUID, purpose: str, code: str) -> None:
         """A materialization that is not the film never becomes, or stays, playable.

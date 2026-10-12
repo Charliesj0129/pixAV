@@ -66,6 +66,14 @@ class TestParseCookieHeader:
 
 
 class TestParseCookieFile:
+    def test_http_only_rows_are_cookies(self, tmp_path: pathlib.Path) -> None:
+        cookie_file = tmp_path / "cookies.txt"
+        cookie_file.write_text(
+            "# Netscape HTTP Cookie File\n" "#HttpOnly_example.test\tFALSE\t/\tTRUE\t0\tsession\tsynthetic\n",
+            encoding="utf-8",
+        )
+        assert parse_cookie_file(cookie_file) == {"session": "synthetic"}
+
     def test_netscape_format(self, tmp_path: pathlib.Path) -> None:
         content = "\n".join(
             [

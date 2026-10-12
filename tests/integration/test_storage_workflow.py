@@ -5,8 +5,11 @@ represented by reported activity results; nothing here demonstrates that a real
 Google Photos upload or cold read-back succeeded.
 """
 
+import asyncio
+import hashlib
 import json
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -79,6 +82,222 @@ async def add_account(workflow, *, email=None, **columns):
             value,
         )
     return account_id
+
+
+@pytest.fixture
+async def held_upload_review(workflow):
+    from pixav.shared.remote_assets import segment_from_row
+    from pixav.shared.upload_outcome_review import recovery_digest
+
+    await reach_upload(workflow)
+    account = await add_account(workflow)
+    upload = await workflow.next_activity()
+    recovery = {"push_intent": True, "publish_intent": True}
+    await workflow.pool.execute(
+        "UPDATE remote_asset_segments SET recovery=$2::jsonb WHERE asset_id=$1", upload.asset_id, json.dumps(recovery)
+    )
+    await submit(workflow, report(upload, "user_action", error_code="PUBLISHED_COPY_HASH_MISMATCH"))
+    await workflow.consume_results()
+    owner = uuid.uuid4()
+    await workflow.pool.execute(
+        """INSERT INTO guest_runtimes(owner,state,account_id,profile,guest_image,tools_image,guest_id,tools_id,staging_root)
+        VALUES($1,'READY',$2,'gphotos_pixel_xl_v1','synthetic-guest-image','synthetic-tools-image','guest','tools','/synthetic')""",
+        owner,
+        account,
+    )
+    now = await workflow.pool.fetchval("SELECT clock_timestamp()")
+    execution = await workflow.pool.fetchrow("SELECT * FROM executions WHERE id=$1", upload.execution_id)
+    segment = segment_from_row(
+        await workflow.pool.fetchrow("SELECT * FROM remote_asset_segments WHERE asset_id=$1", upload.asset_id)
+    )
+    evidence = {
+        "version": "upload-outcome-review-v1",
+        "outcome": "EXISTING_ORIGINAL",
+        "database_identity": str(await workflow.pool.fetchval("SELECT system_identifier FROM pg_control_system()")),
+        "database": await workflow.pool.fetchval("SELECT current_database()"),
+        "account_id": str(account),
+        "guest_owner": str(owner),
+        "profile": "gphotos_pixel_xl_v1",
+        "execution_id": str(upload.execution_id),
+        "operation_id": str(upload.operation_id),
+        "asset_id": str(upload.asset_id),
+        "segment_index": 0,
+        "generation": execution["generation"],
+        "segment_sha256": DIGEST,
+        "recovery_sha256": recovery_digest(segment.recovery),
+        "artifact_sha256": "f" * 64,
+        "observed_at": now.isoformat(),
+        "provider_completed_after": (now - timedelta(minutes=10)).isoformat(),
+        "provider_completed_before": now.isoformat(),
+        "share_url": SHARE,
+        "backup_evidence": BACKUP,
+        "cold_readback": cold_receipt(
+            provider_asset_id=str(upload.asset_id),
+            provider_segment_index=0,
+            provider_share_sha256=hashlib.sha256(SHARE.encode()).hexdigest(),
+            cold_mounts=["/work:rw"],
+            at=now.isoformat(),
+        ),
+    }
+    return upload, account, evidence, recovery
+
+
+async def test_original_upload_review_queues_only_then_authority_preserves_operation_and_usage(
+    workflow, held_upload_review
+):
+    upload, account, evidence, recovery = held_upload_review
+    audit = {"operator": "fixture", "reason": "exact original independently recovered"}
+    before = await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", upload.execution_id)
+    assert await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit)
+    assert await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", upload.execution_id) == before
+    assert await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit, apply=True)
+    assert not await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit, apply=True)
+    assert (
+        await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", upload.execution_id)
+        == "USER_ACTION_REQUIRED"
+    )
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == 0
+    assert await workflow.storage.consume_upload_reviews() == 1
+    assert await workflow.storage.consume_upload_reviews() == 0
+    next_request = await workflow.next_activity()
+    assert next_request.operation_id == upload.operation_id
+    assert next_request.account_id == account
+    saved = json.loads(
+        await workflow.pool.fetchval("SELECT recovery FROM remote_asset_segments WHERE asset_id=$1", upload.asset_id)
+    )
+    assert all(saved[k] == v for k, v in recovery.items())
+    result = report(next_request, share_url=SHARE, evidence=BACKUP)
+    assert await submit(workflow, result)
+    assert await workflow.consume_results() == 1
+    assert await workflow.consume_results() == 0
+    assert not await submit(workflow, result)
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == SIZE
+    assert not await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit, apply=True)
+    assert await workflow.pool.fetchval("SELECT count(*) FROM operation_intents WHERE stage='upload'") == 1
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "account_id",
+        "operation_id",
+        "asset_id",
+        "segment_sha256",
+        "recovery_sha256",
+        "generation",
+        "stale",
+        "hash",
+        "mounts",
+        "guest_owner",
+        "database",
+    ],
+)
+async def test_original_upload_review_refuses_changed_or_unproven_evidence(workflow, held_upload_review, defect):
+    upload, account, evidence, _ = held_upload_review
+    if defect in ("account_id", "operation_id", "asset_id", "guest_owner"):
+        evidence[defect] = str(uuid.uuid4())
+    elif defect in ("segment_sha256", "recovery_sha256"):
+        evidence[defect] = "0" * 64
+    elif defect == "generation":
+        evidence[defect] -= 1
+    elif defect == "stale":
+        evidence["observed_at"] = (
+            await workflow.pool.fetchval("SELECT clock_timestamp()") - timedelta(hours=2)
+        ).isoformat()
+        evidence["provider_completed_before"] = evidence["observed_at"]
+        evidence["provider_completed_after"] = evidence["observed_at"]
+    elif defect == "hash":
+        evidence["cold_readback"]["sha256"] = "0" * 64
+    elif defect == "mounts":
+        evidence["cold_readback"]["cold_mounts"].append("/staging:ro")
+    elif defect == "database":
+        evidence["database"] = "wrong-database"
+    with pytest.raises(ValueError):
+        await workflow.storage.review_upload_outcome(
+            upload.execution_id, 0, evidence, operator="fixture", reason="review", apply=True
+        )
+    assert (
+        await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", upload.execution_id)
+        == "USER_ACTION_REQUIRED"
+    )
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == 0
+
+
+async def test_pending_review_cannot_release_changed_recovery(workflow, held_upload_review):
+    upload, _, evidence, recovery = held_upload_review
+    await workflow.storage.review_upload_outcome(
+        upload.execution_id, 0, evidence, operator="fixture", reason="review", apply=True
+    )
+    await workflow.pool.execute(
+        "UPDATE remote_asset_segments SET recovery=$2::jsonb WHERE asset_id=$1",
+        upload.asset_id,
+        json.dumps({**recovery, "share_intent": True}),
+    )
+    assert await workflow.storage.consume_upload_reviews() == 0
+    assert (
+        await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", upload.execution_id)
+        == "USER_ACTION_REQUIRED"
+    )
+    checkpoint = json.loads(
+        await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", upload.execution_id)
+    )
+    assert checkpoint["upload_outcome_review"]["status"] == "REJECTED"
+
+
+async def test_review_success_crash_before_commit_keeps_usage_and_result_reentrant(
+    workflow, held_upload_review, monkeypatch
+):
+    upload, account, evidence, _ = held_upload_review
+    await workflow.storage.review_upload_outcome(
+        upload.execution_id, 0, evidence, operator="fixture", reason="review", apply=True
+    )
+    await workflow.storage.consume_upload_reviews()
+    next_request = await workflow.next_activity()
+    await submit(workflow, report(next_request, share_url=SHARE, evidence=BACKUP))
+    original = workflow.storage.assets.confirm_backup
+
+    async def crash(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise RuntimeError("synthetic crash after debit, before transaction commit")
+
+    monkeypatch.setattr(workflow.storage.assets, "confirm_backup", crash)
+    with pytest.raises(RuntimeError, match="synthetic crash"):
+        await workflow.consume_results()
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == 0
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT usage_counted_at FROM remote_asset_segments WHERE asset_id=$1", upload.asset_id
+        )
+        is None
+    )
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT consumed_at FROM activity_results WHERE attempt_id=$1", next_request.attempt_id
+        )
+        is None
+    )
+    monkeypatch.setattr(workflow.storage.assets, "confirm_backup", original)
+    assert await workflow.consume_results() == 1
+    assert await workflow.consume_results() == 0
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == SIZE
+
+
+async def test_review_cross_day_confirmation_debits_confirmation_day_once(workflow, held_upload_review):
+    upload, account, evidence, _ = held_upload_review
+    await workflow.pool.execute(
+        "UPDATE accounts SET daily_uploaded_bytes=123,quota_reset_at=now()-interval '1 day' WHERE id=$1", account
+    )
+    await workflow.storage.review_upload_outcome(
+        upload.execution_id, 0, evidence, operator="fixture", reason="review", apply=True
+    )
+    await workflow.storage.consume_upload_reviews()
+    next_request = await workflow.next_activity()
+    result = report(next_request, share_url=SHARE, evidence=BACKUP)
+    await submit(workflow, result)
+    await workflow.consume_results()
+    await workflow.consume_results()
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == SIZE
+    assert not await submit(workflow, result)
 
 
 async def reach_upload(workflow, info_hash="a" * 40):
@@ -316,6 +535,17 @@ async def test_only_a_held_execution_may_be_resumed_bdd_045(workflow):
         await StorageWorkflow(workflow.pool).resume_after_user_action(
             execution, operator="fixture-operator", reason="not held"
         )
+
+
+async def test_storage_resume_cannot_release_a_held_playback_execution(workflow):
+    await reach_upload(workflow)
+    execution = await workflow.pool.fetchval("SELECT id FROM executions")
+    await workflow.pool.execute("UPDATE executions SET state='USER_ACTION_REQUIRED',stage='playback'")
+    with pytest.raises(ValueError, match="another execution stage"):
+        await StorageWorkflow(workflow.pool).resume_after_user_action(
+            execution, operator="fixture-operator", reason="wrong resume entry"
+        )
+    assert await workflow.pool.fetchval("SELECT state FROM executions") == "USER_ACTION_REQUIRED"
 
 
 async def test_verification_failure_never_becomes_durable_bdd_055_059(workflow):
@@ -1027,7 +1257,25 @@ async def test_failed_retrieval_can_only_resume_verification_with_new_proof(work
     await storage.reconcile_existing_segment(
         target.execution_id, 0, source.asset_id, 0, evidence, operator="fixture", reason="reviewed", apply=True
     )
-    verify = await workflow.next_activity()
+
+    async def next_due_verification():
+        # Reconciliation schedules by the DB clock. A host clock correction
+        # can make its just-written due_at briefly future; do not edit that fact.
+        async def wait_for_due():
+            while True:
+                request = await workflow.next_activity()
+                if request is not None:
+                    return request
+                timing = await workflow.pool.fetchrow(
+                    "SELECT state,due_at,clock_timestamp() AS checked_at FROM executions WHERE id=$1",
+                    target.execution_id,
+                )
+                assert timing["state"] == "READY" and timing["due_at"] > timing["checked_at"], dict(timing)
+                await asyncio.sleep(min(1, (timing["due_at"] - timing["checked_at"]).total_seconds() + 0.01))
+
+        return await asyncio.wait_for(wait_for_due(), timeout=10)
+
+    verify = await next_due_verification()
     await submit(workflow, report(verify, outcome="verification_failed", error_code="READBACK_FAILED"))
     await workflow.consume_results()
     proof = {**evidence, "provider_asset_id": str(target.asset_id)}
@@ -1040,7 +1288,7 @@ async def test_failed_retrieval_can_only_resume_verification_with_new_proof(work
     assert await storage.retry_verification(
         target.execution_id, 0, proof, operator="fixture", reason="fresh proof", apply=True
     )
-    retried = await workflow.next_activity()
+    retried = await next_due_verification()
     assert retried.stage == "verify" and retried.operation_id == verify.operation_id
     assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == SIZE
     assert (
@@ -1053,3 +1301,64 @@ async def test_failed_retrieval_can_only_resume_verification_with_new_proof(work
         await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", target.execution_id)
     )
     assert checkpoint["verification_recoveries"][0]["previous_error_code"] == "READBACK_FAILED"
+
+
+@pytest.mark.parametrize("defect", [None, "filename", "account", "generation", "unconfirmed"])
+async def test_share_only_review_is_queued_without_claiming_success(workflow, held_upload_review, defect):
+    upload, account, evidence, recovery = held_upload_review
+    from pixav.shared.remote_assets import segment_from_row
+
+    segment = segment_from_row(
+        await workflow.pool.fetchrow("SELECT * FROM remote_asset_segments WHERE asset_id=$1", upload.asset_id)
+    )
+    for key in ("share_url", "backup_evidence", "cold_readback"):
+        evidence.pop(key)
+    evidence.update(
+        version="upload-outcome-review-v2",
+        outcome="EXISTING_ITEM_REQUIRES_COLD",
+        filename=segment.filename,
+        same_account_confirmed=True,
+        backed_up=True,
+        original_quality=True,
+    )
+    if defect == "filename":
+        evidence["filename"] = "pixav-wrong.mp4"
+    elif defect == "account":
+        evidence["account_id"] = str(uuid.uuid4())
+    elif defect == "generation":
+        evidence["generation"] += 1
+    elif defect == "unconfirmed":
+        evidence["same_account_confirmed"] = False
+    audit = {"operator": "fixture", "reason": "existing exact candidate without share location"}
+    before = await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", upload.execution_id)
+    if defect:
+        with pytest.raises(ValueError):
+            await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit, apply=True)
+        assert (
+            await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", upload.execution_id) == before
+        )
+        return
+    assert await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit)
+    assert await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", upload.execution_id) == before
+    assert await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit, apply=True)
+    assert not await workflow.storage.review_upload_outcome(upload.execution_id, 0, evidence, **audit, apply=True)
+    assert await workflow.storage.consume_upload_reviews() == 1
+    next_request = await workflow.next_activity()
+    assert next_request.operation_id == upload.operation_id and next_request.account_id == account
+    saved = json.loads(
+        await workflow.pool.fetchval("SELECT recovery FROM remote_asset_segments WHERE asset_id=$1", upload.asset_id)
+    )
+    assert saved["upload_outcome_review"]["recovery_before"] == recovery
+    assert all(saved[k] == v for k, v in recovery.items())
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == 0
+    assert (
+        await workflow.pool.fetchval("SELECT count(*) FROM remote_asset_segments WHERE usage_counted_at IS NOT NULL")
+        == 0
+    )
+    result = report(next_request, share_url=SHARE, evidence=BACKUP)
+    assert await submit(workflow, result)
+    assert await workflow.consume_results() == 1
+    assert not await submit(workflow, result)
+    assert await workflow.consume_results() == 0
+    assert await workflow.pool.fetchval("SELECT daily_uploaded_bytes FROM accounts WHERE id=$1", account) == SIZE
+    assert await workflow.pool.fetchval("SELECT count(*) FROM operation_intents WHERE stage='upload'") == 1

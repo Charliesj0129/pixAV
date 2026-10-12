@@ -16,8 +16,6 @@ _DEFAULT_CRITICAL = 100
 class QueueDepthMonitor:
     """Monitor queue depths and enforce backpressure.
 
-    Implements the ``BackpressureMonitor`` protocol.
-
     Returns ``True`` (OK to dispatch) when total queue depth
     (queued + in-flight ``:processing``) is below the critical threshold,
     ``False`` when backpressured.

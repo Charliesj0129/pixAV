@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from pixav.media_loader.preparation import MediaFacts, timeline_defect
+from pixav.shared.cold_receipts import validate_account_cold_receipt
 from pixav.shared.models import utc_now
 
 # Only a Photos sharing location can stand for a Photos asset. Any other host is
@@ -187,6 +188,10 @@ class VerificationPolicy(BaseModel):
 
     def validate_segment_readback(self, segment: RemoteAssetSegment, evidence: dict) -> None:
         """Cold read-back of one segment: full bytes and hash, independent session."""
+        try:
+            validate_account_cold_receipt(segment, evidence)
+        except ValueError:
+            raise IntegrityError("cold authentication receipt invalid") from None
         if evidence.get("method") != COLD_READBACK_METHOD:
             raise IntegrityError("independent cloud provenance required")
         if evidence.get("size") != segment.size_bytes:

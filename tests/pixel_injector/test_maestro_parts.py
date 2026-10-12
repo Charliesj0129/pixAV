@@ -92,6 +92,34 @@ async def test_original_quality_and_account_observation_are_required(upload):
         await u._photos_ready()
 
 
+async def test_quota_observation_uses_db_clock_and_actual_display_precision(upload):
+    from datetime import datetime, timedelta, timezone
+
+    u, _, _ = upload
+    started = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    observed = started + timedelta(seconds=2)
+    u.observation_clock = AsyncMock(side_effect=[started, observed])
+    u.observation_binding = {"account_id": "synthetic-account", "owner": "synthetic-owner"}
+    u.attributes = AsyncMock(return_value=[{"text": "125 MB of 15 GB"}])
+    result = await u.quota_observation()
+    assert result["observed_at"] == observed.isoformat()
+    assert result["observation_started_at"] == started.isoformat()
+    assert result["display_resolution"] == "1 MB"
+    assert result["clock"] == "postgresql"
+    assert result["binding"] == u.observation_binding
+
+
+async def test_quota_observation_rejects_reversed_db_clock(upload):
+    from datetime import datetime, timedelta, timezone
+
+    u, _, _ = upload
+    started = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    u.observation_clock = AsyncMock(side_effect=[started, started - timedelta(seconds=1)])
+    u.attributes = AsyncMock(return_value=[{"text": "125.00 MB of 15 GB"}])
+    with pytest.raises(CanaryBlockedError, match="clock invalid"):
+        await u.quota_observation()
+
+
 async def test_resume_reconciles_guest_and_media_store_without_repush_bdd_048_003(upload):
     """A retried execution reconciles the existing effect instead of repeating it."""
     u, session, root = upload
@@ -658,3 +686,66 @@ async def test_details_does_not_acknowledge_an_unidentified_dialog(upload):
     u.attributes = AsyncMock(return_value=[{"text": "GOT IT"}])
     await u.open_details()
     assert all(call.args != ([{"tapOn": "GOT IT"}],) for call in u.commands.await_args_list)
+
+
+async def test_existing_selected_share_journals_once_and_reuses_after_crash(upload):
+    import copy
+
+    u, session, _ = upload
+    account = Account(email="fixture@example.invalid")
+    u.adb.return_value = "Account {name=fixture@example.invalid, type=com.google}"
+    u.attributes = AsyncMock(
+        return_value=[{"text": t} for t in (u.part.filename, "Backed up", "Original quality", "3840 x 2160")]
+    )
+    u.clipboard = AsyncMock(side_effect=[None, "https://photos.app.goo.gl/synthetic"])
+    u.recovery.update(push_intent=True, publish_intent=True)
+    saved = []
+
+    async def save(value):
+        saved.append(copy.deepcopy(value))
+
+    u.save = save
+
+    async def flow(name):
+        if name == "create-link":
+            assert saved[-1]["link_intent"] is True
+            assert saved[-1]["operations"]["share"]["intent_at"]
+            raise RuntimeError("synthetic interruption after intent")
+
+    u.flow.side_effect = flow
+    verifier = MaestroPartVerifier(u)
+    with pytest.raises(RuntimeError):
+        await verifier.share_selected_existing(session, account)
+    assert u.recovery["push_intent"] and u.recovery["publish_intent"]
+    u.attributes.side_effect = AssertionError("resume must only recover existing clipboard")
+    url, evidence = await verifier.share_selected_existing(session, account)
+    assert url == "https://photos.app.goo.gl/synthetic" and evidence["backed_up"]
+    assert [c.args[0] for c in u.flow.await_args_list].count("create-link") == 1
+    assert all(c.args[0] not in ("login", "upload") for c in u.flow.await_args_list)
+
+
+@pytest.mark.parametrize(
+    "defect", ["account", "multiple_accounts", "wrong_item", "partial", "not_backed_up", "challenge"]
+)
+async def test_existing_share_refuses_ambiguous_ui_without_any_share_intent(upload, defect):
+    u, session, _ = upload
+    account = Account(email="fixture@example.invalid")
+    u.adb.return_value = "Account {name=fixture@example.invalid, type=com.google}"
+    texts = [u.part.filename, "Backed up", "Original quality", "3840 x 2160"]
+    if defect == "account":
+        u.adb.return_value = "Account {name=wrong@example.invalid, type=com.google}"
+    if defect == "multiple_accounts":
+        u.adb.return_value += "\nAccount {name=wrong@example.invalid, type=com.google}"
+    if defect == "wrong_item":
+        texts[0] = "pixav-wrong.mp4"
+    if defect == "partial":
+        texts = ["No results"]
+    if defect == "not_backed_up":
+        texts.remove("Backed up")
+    u.attributes = AsyncMock(return_value=[{"text": t} for t in texts])
+    if defect == "challenge":
+        u.attributes.side_effect = UserActionRequiredError("challenge")
+    with pytest.raises(CanaryBlockedError):
+        await MaestroPartVerifier(u).share_selected_existing(session, account)
+    assert not u.recovery.get("share_intent") and not u.recovery.get("link_intent")
+    u.flow.assert_not_awaited()

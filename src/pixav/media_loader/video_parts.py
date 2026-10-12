@@ -188,6 +188,25 @@ class PartMedia:
     def deadline(duration: float) -> int:
         return max(1800, math.ceil(duration * 4))
 
+    @staticmethod
+    def movie_timescale(raw: dict) -> int:
+        """Keep every input stream tick representable in MP4 edit lists.
+
+        The default millisecond movie clock can trim a fractional video tick
+        when a reset segment starts between audio samples. Raising the movie
+        clock preserves it without changing codec packets or hash tolerances.
+        """
+        try:
+            bases = [Fraction(stream["time_base"]) for stream in raw["streams"]]
+        except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+            raise IncompatibleMediaError("invalid MP4 stream clock") from exc
+        if not bases or any(base <= 0 for base in bases):
+            raise IncompatibleMediaError("invalid MP4 stream clock")
+        timescale = math.lcm(1000, *(base.denominator for base in bases))
+        if timescale > 2_147_483_647:
+            raise IncompatibleMediaError("native stream clocks exceed the lossless MP4 movie clock limit")
+        return timescale
+
     def command(self, args: list[str], timeout: int, *, output: Any = subprocess.PIPE) -> bytes:
         if self.check:
             self.check()
@@ -377,7 +396,7 @@ class PartMedia:
             time_base = Fraction(0)
             first = last = None
             previous = ""
-            count = collisions = 0
+            count = collisions = identical_collisions = 0
             for binary in output:
                 line = binary.decode().strip()
                 if line.startswith("#tb 0:"):
@@ -392,17 +411,12 @@ class PartMedia:
                 if last is not None and pts <= last:
                     if pts < last:
                         raise IncompatibleMediaError("non-monotonic decoded video timeline")
-                    # An equal stamp is not automatically a defect. FFmpeg's
-                    # best_effort_timestamp heuristic overrides a container stamp it
-                    # judges implausible for the nominal rate: measured on one 2.5 hour
-                    # feature, two frames 6,333 ticks apart at t=9002.74s were emitted
-                    # under a single tick, both full 3840x2160 frames carrying different
-                    # content hashes. Nothing was lost and nothing was repeated, and
-                    # validate_timeline() has already proved every container stamp
-                    # distinct. A genuinely repeated frame also carries the previous
-                    # content hash, and is still refused below.
+                    # Decoder timestamps are heuristic labels. Even identical
+                    # content can be two legitimate frames with distinct packet
+                    # timestamps, for example a stationary final frame. Such a
+                    # collision needs an additional complete packet/frame check.
                     if fields[5] == previous:
-                        raise IncompatibleMediaError("repeated decoded video frame")
+                        identical_collisions += 1
                     collisions += 1
                 last = pts
                 previous = fields[5]
@@ -415,6 +429,9 @@ class PartMedia:
             # the timeline is being measured against the wrong base again.
             if collisions * 1000 > count:
                 raise IncompatibleMediaError("decoded video timeline collapses onto repeated timestamps")
+            if identical_collisions:
+                result["native_video_packets"] = self._validate_decoded_packets(path, duration, count)
+                result["video_identical_tick_collisions"] = identical_collisions
             result.update(
                 video_sha256=digest.hexdigest(),
                 video_frames=count,
@@ -472,6 +489,14 @@ class PartMedia:
         result["signature"] = self.signature(raw)
         result["duration"] = float(raw["format"]["duration"])
         return result
+
+    def _validate_decoded_packets(self, path: Path, duration: float, frames: int) -> int:
+        stamps = self.presentation_stamps(path, duration)
+        if len(stamps) != frames:
+            raise IncompatibleMediaError("decoded frame count differs from complete packet timeline")
+        if any(left == right for left, right in zip(stamps, stamps[1:], strict=False)):
+            raise IncompatibleMediaError("repeated decoded video frame has a repeated packet timestamp")
+        return len(stamps)
 
     @staticmethod
     def compare(expected: dict, actual: dict) -> None:
@@ -543,6 +568,7 @@ class PartMedia:
             raise ValueError("invalid part target")
         raw = self.validate_source(source)
         duration = float(raw["format"]["duration"])
+        movie_timescale = self.movie_timescale(raw)
         # Source, previous parts and quarantined attempts already reduce free
         # space. Reserve only the NEW split, premerge and streamed frame hashes.
         require_space([(directory, math.ceil(source.stat().st_size * 2.1) + math.ceil(duration * 120 * 256))])
@@ -592,7 +618,7 @@ class PartMedia:
                             )
                         ),
                         "-segment_format_options",
-                        "avoid_negative_ts=disabled",
+                        f"avoid_negative_ts=disabled:movie_timescale={movie_timescale}",
                         "-reset_timestamps",
                         "1",
                         "-segment_list",
@@ -610,7 +636,14 @@ class PartMedia:
                     interval /= 2
                     continue
                 merged = root / "precheck.mp4"
-                spans = [float(row[2]) - float(row[1]) for row in entries]
+                # A VFR frame can end before the next segment starts. Concat
+                # must preserve that authored gap, rather than compressing it
+                # to the previous segment's last packet duration.
+                starts = [float(row[1]) - float(entries[0][1]) for row in entries]
+                spans = [
+                    (starts[index + 1] if index + 1 < len(starts) else duration) - start
+                    for index, start in enumerate(starts)
+                ]
                 self.merge(paths, merged, duration, spans=spans)
                 self.compare(reference, self.fingerprint(merged, root, duration))
                 parts = []
@@ -630,8 +663,8 @@ class PartMedia:
                     else:
                         os.link(path, destination)
                     # Segment-list time is a muxer timeline; store contiguous source-relative boundaries.
-                    start = 0.0 if index == 0 else float(entries[index][1]) - float(entries[0][1])
-                    end = duration if index == len(paths) - 1 else float(entries[index + 1][1]) - float(entries[0][1])
+                    start = starts[index]
+                    end = duration if index == len(paths) - 1 else starts[index + 1]
                     parts.append(
                         VideoPart(
                             video_id=video_id,

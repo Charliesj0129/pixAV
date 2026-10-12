@@ -1,9 +1,12 @@
 server {
     listen 8080;
     access_log off;
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    resolver_timeout 5s;
+    set $pixav_playback_upstream strm_resolver:8000;
     location = /health { return 200 'ok'; }
     location /stream/ {
-        proxy_pass http://strm_resolver:8000;
+        proxy_pass http://$pixav_playback_upstream;
         proxy_set_header Authorization "Bearer ${PIXAV_RESOLVER_BEARER}";
         proxy_set_header Host strm_resolver;
         proxy_http_version 1.1;

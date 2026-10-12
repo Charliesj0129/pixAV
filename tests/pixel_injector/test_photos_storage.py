@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from pixav.pixel_injector.photos_storage import (
-    COLD_SOURCE_MOUNT,
     COLD_WORK_MOUNT,
     PhotosColdReadback,
 )
@@ -120,12 +119,11 @@ def readback(tmp_path, client, **changes) -> PhotosColdReadback:
         tmp_path / "readback",
         client_factory=lambda: client,
         image=IMAGE,
-        source_root=tmp_path / "src",
         **changes,
     )
 
 
-async def test_the_container_mounts_only_the_work_dir_and_the_source_tree_bdd_052(tmp_path):
+async def test_the_container_uses_image_code_and_mounts_only_the_work_dir_bdd_052(tmp_path):
     client = FakeClient()
 
     receipt = await readback(tmp_path, client).read_back(segment())
@@ -137,7 +135,6 @@ async def test_the_container_mounts_only_the_work_dir_and_the_source_tree_bdd_05
     assert Path(work).parent == tmp_path / "readback" / str(ASSET) / "3"
     assert Path(work).name.startswith("session-")
     assert spec["volumes"] == {
-        str(tmp_path / "src"): {"bind": COLD_SOURCE_MOUNT, "mode": "ro"},
         work: {"bind": COLD_WORK_MOUNT, "mode": "rw"},
     }
     assert receipt["cold_inputs"] == "provider-only"
@@ -152,7 +149,7 @@ async def test_the_staging_root_is_never_offered_to_the_readback(tmp_path):
 
     mounted = set(client.created[0].spec["volumes"])
     assert not any("storage-staging" in source for source in mounted)
-    assert len(mounted) == 2
+    assert len(mounted) == 1
 
 
 async def test_an_unexpected_mount_fails_the_readback(tmp_path, monkeypatch):
@@ -232,7 +229,6 @@ async def test_bind_sources_are_translated_for_a_containerised_worker(tmp_path):
         tmp_path / "readback",
         client_factory=lambda: client,
         image=IMAGE,
-        source_root=tmp_path / "src",
         host_project_root="/home/operator/pixAV",
         project_root=tmp_path,
     )
@@ -241,7 +237,7 @@ async def test_bind_sources_are_translated_for_a_containerised_worker(tmp_path):
 
     mounts = sorted(client.created[0].spec["volumes"])
     assert mounts[0].startswith(f"/home/operator/pixAV/readback/{ASSET}/3/session-")
-    assert mounts[1] == "/home/operator/pixAV/src"
+    assert len(mounts) == 1
 
 
 def test_reconciled_provider_identity_survives_cold_manifest_without_recovery():
@@ -274,3 +270,48 @@ async def test_incomplete_browser_is_not_a_remote_integrity_verdict(tmp_path, er
     with pytest.raises(ReadbackUnavailableError) as caught:
         await readback(tmp_path, client).read_back(segment())
     assert caught.value.error_type == error
+
+
+async def test_share_existing_uses_only_retained_runtime_and_no_local_staging(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+
+    from pixav.pixel_injector.photos_storage import MaestroSegmentUploader
+    from pixav.shared.models import Account
+
+    account = Account(id=uuid.uuid4(), email="fixture@example.invalid")
+    calls = []
+
+    @asynccontextmanager
+    async def lock(pool, account_id, owner):
+        calls.append(("locked", account_id, owner))
+        yield lambda: None
+
+    monkeypatch.setattr("pixav.pixel_injector.photos_storage.photos_ui_ownership", lock)
+    monkeypatch.setattr(
+        "pixav.pixel_injector.photos_storage.stage_segment", lambda *a, **k: pytest.fail("must not stage")
+    )
+    normal = AsyncMock(side_effect=AssertionError("must not acquire/provision normal runtime"))
+    retained = AsyncMock(return_value=(type("Guest", (), {"id": "guest"})(), object()))
+    share = AsyncMock(return_value=(SHARE_URL, {"backed_up": True, "original_quality": True}))
+    monkeypatch.setattr("pixav.pixel_injector.photos_storage.MaestroPartVerifier.share_selected_existing", share)
+    upload = MaestroSegmentUploader(
+        normal,
+        owner="synthetic-owner",
+        flows=tmp_path,
+        mode="redroid",
+        staging_root=tmp_path,
+        ui_pool=object(),
+        existing_runtime=retained,
+    )
+    part = segment(
+        account_id=account.id,
+        recovery={
+            "upload_outcome_review": {"evidence": {"guest_owner": "synthetic-owner", "account_id": str(account.id)}}
+        },
+    )
+    result = await upload.share_existing(part, account, AsyncMock())
+    assert result[0] == SHARE_URL and calls == [("locked", account.id, "synthetic-owner")]
+    retained.assert_awaited_once_with(account.id)
+    normal.assert_not_awaited()
+    share.assert_awaited_once()

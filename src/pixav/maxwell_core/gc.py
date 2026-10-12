@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from pixav.library_projection.repository import RECONCILE_LOCK
 from pixav.library_projection.writer import publication_is_complete
-from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
+from pixav.shared.client_playback_evidence import client_matches_current_manifest, parse_client_playback_evidence
 from pixav.shared.enums import TaskState
 from pixav.shared.metrics import record_cleanup_rejection
 
@@ -177,6 +177,8 @@ _GATE_CONDITIONS = (
     "no_open_execution",
     "no_active_reader",
     "retention_expired",
+    "single_video_path_reference",
+    "cleanup_journal_available",
 )
 
 
@@ -243,8 +245,8 @@ class LocalFileJanitor:
             evidence = row["playback_evidence"]
             if isinstance(evidence, str):
                 evidence = json.loads(evidence)
-            client = ClientPlaybackEvidence.model_validate(evidence.get("client_playback"))
-            return client.matches(dict(row)) and row["ready_at"] <= client.observed_at <= row["checked_at"]
+            client = parse_client_playback_evidence(evidence.get("client_playback"))
+            return await client_matches_current_manifest(client, dict(row), conn)
         except (ValidationError, ValueError, TypeError, AttributeError):
             return False
 
@@ -279,6 +281,34 @@ class LocalFileJanitor:
         # artifact back is paid for a decision that is actually about to be made.
         observed = await asyncio.to_thread(artifact_facts, target)
         return observed == (row["artifact_sha256"], int(row["size_bytes"]))
+
+    async def _single_path_reference(self, conn: asyncpg.Connection, video_id, path: str) -> bool:
+        """Refuse shared files until group authorization and recovery are available.
+
+        Eligibility belongs to the file, not merely the due video row. Include
+        retained workflow/segment references and readers, even when the other
+        video has no due cleanup timestamp. Resolve aliases only to identify
+        references; deletion itself still refuses symlink components.
+        """
+        sources = ["SELECT id AS video_id, local_path AS path FROM videos WHERE local_path IS NOT NULL"]
+        if await self._table_available(conn, "workflow_artifacts"):
+            sources.append(
+                "SELECT wt.video_id, a.path FROM workflow_artifacts a "
+                "JOIN executions e ON e.id=a.execution_id JOIN workflow_tasks wt ON wt.task_id=e.task_id"
+            )
+        if await self._table_available(conn, "remote_asset_segments"):
+            sources.append(
+                "SELECT r.video_id, s.local_path AS path FROM remote_asset_segments s "
+                "JOIN remote_assets r ON r.id=s.asset_id WHERE s.local_path IS NOT NULL"
+            )
+        if await self._table_available(conn, "reader_leases"):
+            sources.append("SELECT video_id, path FROM reader_leases WHERE lease_until > now()")
+        canonical = os.path.realpath(path)
+        for reference in await conn.fetch(" UNION ALL ".join(sources)):
+            if reference["path"] and os.path.realpath(reference["path"]) == canonical:
+                if reference["video_id"] != video_id:
+                    return False
+        return True
 
     async def _evaluate(self, conn: asyncpg.Connection, video_id, path: str) -> dict[str, bool]:
         """Recompute every gate condition for one artifact, on the DB clock."""
@@ -324,6 +354,8 @@ class LocalFileJanitor:
             "no_open_execution": not row["open_work"],
             "no_active_reader": not row["reader"],
             "retention_expired": bool(row["due"]),
+            "single_video_path_reference": await self._single_path_reference(conn, video_id, path),
+            "cleanup_journal_available": await self._table_available(conn, "cleanup_journal"),
         }
         # Keyed on the declared list so a new guarantee cannot be added to the
         # contract without this evaluation being forced to answer for it.
@@ -340,6 +372,109 @@ class LocalFileJanitor:
             applied,
             json.dumps(reasons),
         )
+
+    @staticmethod
+    def _fingerprint(target: Path) -> dict:
+        info = target.lstat()
+        parent = target.parent.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("cleanup target is not a regular file")
+        return {
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "ctime_ns": info.st_ctime_ns,
+            "parent_device": parent.st_dev,
+            "parent_inode": parent.st_ino,
+        }
+
+    async def _persist_intent(self, conn, video_id, path: str, target: Path, gates: dict) -> tuple[uuid.UUID, dict]:
+        fingerprint = self._fingerprint(target)
+        facts = await asyncio.to_thread(artifact_facts, target)
+        authorized = await self._authorized_target(conn, video_id, path)
+        if facts is None or not authorized or self._fingerprint(target) != fingerprint:
+            raise ValueError("cleanup target changed during intent creation")
+        fingerprint["sha256"] = facts[0]
+        # This transaction must commit before filesystem mutation. No FK here
+        # requests a second connection's lock on the already-locked video.
+        async with self._pool.acquire() as journal_conn, journal_conn.transaction():
+            existing = await journal_conn.fetchrow(
+                "SELECT * FROM cleanup_journal WHERE path=$1 AND state='INTENT'", str(target)
+            )
+            if existing:
+                previous = json.loads(existing["fingerprint"])
+                if existing["video_id"] != video_id or previous != fingerprint:
+                    raise ValueError("pending cleanup intent names another object")
+                return existing["id"], fingerprint
+            intent_id = uuid.uuid4()
+            await journal_conn.execute(
+                """INSERT INTO cleanup_journal(id,video_id,path,fingerprint,gates)
+                VALUES($1,$2,$3,$4::jsonb,$5::jsonb)""",
+                intent_id,
+                video_id,
+                str(target),
+                json.dumps(fingerprint),
+                json.dumps({**gates, "domain_path": path}),
+            )
+        return intent_id, fingerprint
+
+    async def recover(self, *, apply: bool = False) -> dict[str, int]:
+        """Converge missing files with committed intents; never unlink in recovery.
+
+        Existing/replaced files remain pending for normal re-evaluation. The
+        default reports only and creates no audit or domain/journal updates.
+        """
+        counts = {"recovered": 0, "pending": 0, "rejected": 0}
+        rows = await self._pool.fetch("SELECT * FROM cleanup_journal WHERE state='INTENT' ORDER BY created_at")
+        for row in rows:
+            target, missing = safe_cleanup_candidate(self._download_dir, row["path"])
+            fingerprint, gates = json.loads(row["fingerprint"]), json.loads(row["gates"])
+            if target is None:
+                counts["rejected"] += 1
+                continue
+            if not missing:
+                counts["pending"] += 1
+                continue
+            try:
+                parent = target.parent.stat()
+            except OSError:
+                counts["rejected"] += 1
+                continue
+            if (parent.st_dev, parent.st_ino) != (fingerprint["parent_device"], fingerprint["parent_inode"]):
+                counts["rejected"] += 1
+                continue
+            async with self._pool.acquire() as conn, conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", RECONCILE_LOCK)
+                current = await conn.fetchval("SELECT local_path FROM videos WHERE id=$1 FOR UPDATE", row["video_id"])
+                if current != gates["domain_path"] or not await self._single_path_reference(
+                    conn, row["video_id"], current
+                ):
+                    counts["rejected"] += 1
+                    continue
+                # Recheck after waiting for locks; recovery must never clear a
+                # newly restored file's domain path.
+                checked, absent = safe_cleanup_candidate(self._download_dir, row["path"])
+                if checked is None or not absent:
+                    counts["rejected"] += 1
+                    continue
+                counts["recovered"] += 1
+                if apply:
+                    await conn.execute(
+                        "UPDATE videos SET local_path=NULL,updated_at=now() WHERE id=$1", row["video_id"]
+                    )
+                    await self._audit(
+                        conn,
+                        row["video_id"],
+                        current,
+                        "missing",
+                        True,
+                        {"committed_cleanup_intent": str(row["id"]), "filesystem_absent": True},
+                    )
+                    await conn.execute(
+                        "UPDATE cleanup_journal SET state='COMPLETED',completed_at=now() WHERE id=$1", row["id"]
+                    )
+        return counts
 
     async def cleanup(  # noqa: C901 -- explicit refusal/audit paths
         self, *, apply: bool | None = None
@@ -362,11 +497,16 @@ class LocalFileJanitor:
                         await self._audit(conn, video_id, path, "unsafe", False, {"path_containment": False})
                 continue
             async with self._pool.acquire() as conn, conn.transaction():
-                # Hold the row for the whole decision so nothing can start
-                # reading, or open an execution, between the check and the unlink.
-                await conn.execute("SELECT id FROM videos WHERE id=$1 FOR UPDATE", video_id)
-                # Serialize with publication swap/withdrawal through the unlink.
+                # Match publication's lock order: advisory lock before row lock.
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", RECONCILE_LOCK)
+                # Protect the video's recorded path for the whole decision.
+                # Cross-process filesystem ownership still needs shared file locks.
+                current_path = await conn.fetchval("SELECT local_path FROM videos WHERE id=$1 FOR UPDATE", video_id)
+                if current_path != path:
+                    counts["rejected"] += 1
+                    if apply:
+                        await self._audit(conn, video_id, path, "rejected", False, {"local_path_unchanged": False})
+                    continue
                 gates = await self._evaluate(conn, video_id, path)
                 if not all(gates.values()):
                     counts["rejected"] += 1
@@ -382,16 +522,20 @@ class LocalFileJanitor:
                     continue
                 if missing or not target.exists():
                     counts["missing"] += 1
-                    await conn.execute(
-                        "UPDATE videos SET local_path=NULL,updated_at=now() WHERE id=$1 AND local_path=$2",
-                        video_id,
-                        path,
-                    )
-                    await self._audit(conn, video_id, path, "missing", True, gates)
+                    await self._audit(conn, video_id, path, "missing", False, {**gates, "committed_intent": False})
                     continue
                 try:
+                    intent_id, fingerprint = await self._persist_intent(conn, video_id, path, target, gates)
+                    observed = self._fingerprint(target)
+                    if observed != {key: value for key, value in fingerprint.items() if key != "sha256"}:
+                        raise ValueError("cleanup target changed after intent commit")
                     target.unlink()
-                except OSError as exc:
+                    descriptor = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                except (OSError, ValueError) as exc:
                     counts["failed"] += 1
                     logger.error("cleanup could not remove an approved artifact: %s", type(exc).__name__)
                     await self._audit(conn, video_id, path, "failed", True, {**gates, "error": type(exc).__name__})
@@ -403,4 +547,7 @@ class LocalFileJanitor:
                     path,
                 )
                 await self._audit(conn, video_id, path, "deleted", True, gates)
+                await conn.execute(
+                    "UPDATE cleanup_journal SET state='COMPLETED',completed_at=now() WHERE id=$1", intent_id
+                )
         return counts

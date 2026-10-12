@@ -9,8 +9,9 @@ import pytest
 
 from pixav.media_loader.activity import MediaActivityWorker
 from pixav.media_loader.interfaces import DownloadObservation
+from pixav.media_loader.preparation import MediaFacts, PreparedArtifact
 from pixav.shared.exceptions import MediaDependencyError, RemuxError, SourceUnavailableError, TorrentOwnershipError
-from pixav.shared.workflow import ActivityRequest
+from pixav.shared.workflow import ActivityRequest, ActivityResult
 
 
 def request(**changes):
@@ -37,6 +38,21 @@ def worker_for(command, tmp_path):
     queue.pop_claim.return_value = (command.model_dump(mode="json"), "receipt")
     worker = MediaActivityWorker(pool, client, AsyncMock(), output_dir=str(tmp_path))
     return worker, pool, client, queue
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+async def test_completed_artifact_missing_from_worker_mount_is_dependency_fault(tmp_path, symlink):
+    command = request()
+    worker, pool, client, _ = worker_for(command, tmp_path)
+    media = tmp_path / "missing.mp4"
+    if symlink:
+        media.symlink_to(tmp_path / "absent.mp4")
+    client.check_download.return_value = DownloadObservation(progress=1, downloaded_bytes=256, artifact_path=str(media))
+    result = await worker.execute(command)
+    assert result.operation_id == command.operation_id
+    assert result.outcome == ("invalid_media" if symlink else "infrastructure")
+    assert result.error_code == ("INVALID_MEDIA" if symlink else "MEDIA_DEPENDENCY")
+    assert len(pool.mock_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -137,3 +153,36 @@ async def test_download_pause_does_not_execute_or_create_retry(tmp_path):
     assert not pool.mock_calls
     client.check_download.assert_not_awaited()
     queue.nack.assert_awaited_once_with("receipt", requeue=True)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+async def test_revalidated_preparation_is_bound_to_the_retained_input(tmp_path, changed):
+    command = request(stage="prepare", input_path=str(tmp_path / "synthetic.mp4"))
+    worker, pool, _, queue = worker_for(command, tmp_path)
+    pool.fetchrow.return_value["checkpoint"] = json.dumps(
+        {"download_path": command.input_path, "preparation_revalidation": [{"input_sha256": "a" * 64}]}
+    )
+    facts = MediaFacts(
+        container="mp4",
+        size_bytes=100,
+        duration_seconds=10,
+        sha256=("b" if changed else "a") * 64,
+        streams=({"kind": "video", "codec": "h264", "width": 1920, "height": 1080}, {"kind": "audio", "codec": "aac"}),
+    )
+    prepared = PreparedArtifact(
+        path=command.input_path,
+        input_path=command.input_path,
+        input_sha256=facts.sha256,
+        input_facts=facts,
+        facts=facts,
+    )
+    worker.execute = AsyncMock(
+        return_value=ActivityResult(
+            **command.model_dump(exclude={"stage", "identity", "input_path"}), outcome="success", prepared=prepared
+        )
+    )
+    assert await worker.run_one(queue)
+    result = ActivityResult.model_validate_json(pool.fetchval.call_args.args[1])
+    assert result.outcome == ("unknown_effect" if changed else "success")
+    assert result.error_code == ("PREPARATION_INPUT_CHANGED" if changed else None)
+    queue.ack.assert_awaited_once_with("receipt")

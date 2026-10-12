@@ -35,6 +35,8 @@ from pixav.maxwell_core.media_workflow import MediaWorkflow
 from pixav.maxwell_core.storage_workflow import StorageWorkflow
 from pixav.shared.db import create_pool
 from pixav.shared.instance import database_identity
+from pixav.shared.upload_outcome_review import parse_upload_review
+from pixav.strm_resolver.real_av_acceptance import file_digest
 
 OPEN_STATES = ("READY", "RUNNING", "WAITING_RETRY", "WAITING_QUOTA", "USER_ACTION_REQUIRED")
 
@@ -93,14 +95,35 @@ async def _run(args: argparse.Namespace) -> int:
         try:
             return await _write(args, workflow, pool)
         except ValueError as exc:
-            print(f"refused: {exc}")
+            message = "UPLOAD_OUTCOME_REVIEW_INVALID" if args.command == "review-upload-outcome" else str(exc)
+            print(f"refused: {message}")
             return 2
     finally:
         await pool.close()
 
 
 async def _review_storage(args: argparse.Namespace, pool: Any) -> int:
-    if args.command == "retry-verification":
+    if args.command == "review-upload-outcome":
+        if not args.db_identity:
+            raise ValueError("upload outcome review requires exact --db-identity")
+        payload = parse_upload_review(json.loads(args.evidence.read_text()))
+        if (
+            args.artifact.is_symlink()
+            or args.artifact.stat().st_mode & 0o077
+            or file_digest(args.artifact) != payload.artifact_sha256
+        ):
+            raise ValueError("upload investigation artifact changed or is not private")
+        changed = await StorageWorkflow(pool).review_upload_outcome(
+            args.execution_id,
+            args.segment_index,
+            payload.model_dump(mode="json"),
+            operator=args.operator,
+            reason=args.reason,
+            apply=args.apply,
+        )
+        print(json.dumps({"apply": args.apply, "eligible_or_queued": changed, "execution_advanced": False}))
+        return 0
+    elif args.command == "retry-verification":
         if not args.db_identity:
             raise ValueError("verification recovery requires exact --db-identity")
         payload = json.loads(args.evidence.read_text())
@@ -134,7 +157,7 @@ async def _review_storage(args: argparse.Namespace, pool: Any) -> int:
 
 async def _write(args: argparse.Namespace, workflow: MediaWorkflow, pool: Any) -> int:
     """Operator acts. Each one refuses a state it has no business changing."""
-    if args.command in {"retry-verification", "reconcile-existing"}:
+    if args.command in {"retry-verification", "reconcile-existing", "review-upload-outcome"}:
         return await _review_storage(args, pool)
     if args.command == "resume":
         await StorageWorkflow(pool).resume_after_user_action(
@@ -181,6 +204,15 @@ def main() -> None:
 
     inspection = commands.add_parser("inspect", help="show one execution with its attempt history")
     inspection.add_argument("execution_id", type=uuid.UUID)
+
+    review = commands.add_parser("review-upload-outcome", help="queue exact original-operation review; dry-run default")
+    review.add_argument("execution_id", type=uuid.UUID)
+    review.add_argument("--segment-index", type=int, required=True)
+    review.add_argument("--evidence", type=Path, required=True)
+    review.add_argument("--artifact", type=Path, required=True)
+    review.add_argument("--operator", required=True)
+    review.add_argument("--reason", required=True)
+    review.add_argument("--apply", action="store_true")
 
     reconcile = commands.add_parser("reconcile-existing", help="cold-proven existing original; defaults to dry-run")
     reconcile.add_argument("execution_id", type=uuid.UUID)

@@ -20,6 +20,8 @@ import asyncpg
 from pydantic import ValidationError
 
 from pixav.pixel_injector.canary import CanaryBlockedError
+from pixav.pixel_injector.maestro_parts import UploadReviewRequiredError
+from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
 from pixav.shared.exceptions import ReadbackUnavailableError, RedroidError, UploadError, VerificationError
 from pixav.shared.models import Account
 from pixav.shared.queue import TaskQueue
@@ -30,6 +32,13 @@ from pixav.shared.storage_models import (
     VerificationPolicy,
     current_policy,
     policy_for,
+)
+from pixav.shared.upload_outcome_review import (
+    ExistingItemShareReview,
+    parse_upload_review,
+    recovery_digest,
+    validate_review_cold_binding,
+    validate_share_recovery,
 )
 from pixav.shared.workflow import ActivityRequest, ActivityResult
 
@@ -54,6 +63,15 @@ class SegmentUploader(Protocol):
         journal: JournalFn,
     ) -> tuple[str, dict]:
         """Return ``(share_url, backup_evidence)`` once the provider accepted it."""
+        ...
+
+    async def share_existing(
+        self,
+        segment: RemoteAssetSegment,
+        account: Account,
+        journal: JournalFn,
+    ) -> tuple[str, dict]:
+        """Inspect/share only; no staging, push, publication or login."""
         ...
 
     async def release(self, segment: RemoteAssetSegment) -> None:
@@ -151,10 +169,10 @@ class StorageActivityWorker:
             if request.stage == "upload":
                 return await self._upload(request, segment, token, fields)
             return await self._verify(request.asset_id, segment, fields)
-        except CanaryBlockedError:
+        except (CanaryBlockedError, AccountSessionRequiredError) as exc:
             # Includes login challenges. The adapter requires UI/runtime review;
             # infrastructure retries cannot resolve an unknown remote effect.
-            return ActivityResult(**fields, outcome="user_action", error_code="USER_ACTION_REQUIRED")
+            return ActivityResult(**fields, outcome="user_action", error_code=_review_error_code(exc))
         except QuotaExhaustedError:
             return ActivityResult(**fields, outcome="quota_exhausted", error_code="QUOTA_EXHAUSTED")
         except IntegrityError:
@@ -168,7 +186,7 @@ class StorageActivityWorker:
             # would authorize a blind resend, so the authority reconciles first.
             return ActivityResult(**fields, outcome="unknown_effect", error_code="REMOTE_EFFECT_UNKNOWN")
         except Exception:
-            logger.exception("storage activity failed")
+            logger.error("storage activity dependency failed")
             return ActivityResult(**fields, outcome="infrastructure", error_code="DEPENDENCY_FAILURE")
 
     @staticmethod
@@ -186,11 +204,64 @@ class StorageActivityWorker:
         account = await self._account(request.account_id)
         journal = self._journal(request, token)
         await journal("upload_intent", dict(segment.recovery))
+        if "upload_outcome_review" in segment.recovery:
+            return await self._review_existing_upload(request, segment, fields, account, journal)
         share_url, evidence = await asyncio.wait_for(
             self.uploader.upload(segment, account, journal), timeout=self.upload_timeout_seconds
         )
         self.policy.validate_share_location(share_url)
         self.policy.validate_backup_evidence(evidence)
+        return ActivityResult(**fields, outcome="success", share_url=share_url, evidence=evidence)
+
+    async def _review_existing_upload(self, request, segment, fields, account, journal) -> ActivityResult:
+        stored = segment.recovery["upload_outcome_review"]
+        review = parse_upload_review(stored["evidence"])
+        if (
+            stored.get("status") != "ACCEPTED"
+            or review.operation_id != request.operation_id
+            or review.execution_id != request.execution_id
+            or review.account_id != request.account_id
+            or review.asset_id != segment.asset_id
+            or review.segment_index != segment.segment_index
+            or review.segment_sha256 != segment.sha256
+            or request.generation <= review.generation
+        ):
+            raise CanaryBlockedError("existing upload review binding changed")
+        if isinstance(review, ExistingItemShareReview):
+            try:
+                validate_share_recovery(stored, segment.recovery)
+            except ValueError as exc:
+                raise CanaryBlockedError("existing share recovery binding changed") from exc
+            if review.filename != segment.filename:
+                raise CanaryBlockedError("existing item filename changed")
+            share_url, backup_evidence = await asyncio.wait_for(
+                self.uploader.share_existing(segment, account, journal), timeout=self.upload_timeout_seconds
+            )
+        else:
+            if review.recovery_sha256 != recovery_digest(segment.recovery):
+                raise CanaryBlockedError("existing upload recovery binding changed")
+            share_url, backup_evidence = review.share_url, review.backup_evidence
+        # Every path must acquire fresh provider-only bytes before reporting
+        # success. A sharing link never authorizes push or publication.
+        candidate = segment.model_copy(update={"share_url": share_url})
+        policy, expected = await self._asset_policy(segment.asset_id)
+        policy.validate_share_location(share_url)
+        policy.validate_backup_evidence(backup_evidence)
+        receipt = await asyncio.wait_for(self.readback.read_back(candidate), timeout=self.verify_timeout_seconds)
+        validate_review_cold_binding(candidate, share_url, receipt)
+        policy.validate_segment_readback(candidate, receipt)
+        policy.validate_segment_media(candidate, expected, receipt)
+        evidence = {
+            **backup_evidence,
+            "upload_outcome_review": {
+                "version": review.version,
+                "artifact_sha256": review.artifact_sha256,
+                "provider_completed_after": review.provider_completed_after.isoformat(),
+                "provider_completed_before": review.provider_completed_before.isoformat(),
+                "confirmed_at": stored["confirmed_at"],
+                "cold_readback": receipt,
+            },
+        }
         return ActivityResult(**fields, outcome="success", share_url=share_url, evidence=evidence)
 
     async def _verify(self, asset_id: UUID, segment, fields) -> ActivityResult:
@@ -298,3 +369,9 @@ class StorageActivityWorker:
 
 def _json(payload: dict) -> str:
     return json.dumps(payload)
+
+
+def _review_error_code(error: CanaryBlockedError | AccountSessionRequiredError) -> str:
+    if isinstance(error, AccountSessionRequiredError):
+        return "PHOTOS_ACCOUNT_SESSION_REQUIRED"
+    return error.code if isinstance(error, UploadReviewRequiredError) else "USER_ACTION_REQUIRED"

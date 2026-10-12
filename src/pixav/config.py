@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     # Strm-Resolver
     resolver_host: str = "0.0.0.0"
     resolver_port: int = 8000
+    resolver_require_reader_role: bool = False
 
     # Health endpoints (each worker exposes /health and /metrics on its port)
     maxwell_core_health_port: int = 8001
@@ -126,6 +127,8 @@ class Settings(BaseSettings):
     # The cold read-back container writes here. It stays under the project data
     # root so ``host_project_root`` can translate it for the Docker daemon.
     storage_readback_image: str = "pixav-storage-tools:1"
+    photos_cold_auth_secret: str = ""
+    storage_upload_tools_image: str = "pixav-photos-canary:maestro-2.10.0"
     # Where this process's project root lives on the Docker daemon's host. A
     # worker that runs on the host leaves it empty; a containerised worker sets
     # it, because bind-mount sources it hands the daemon are resolved on the
@@ -154,6 +157,7 @@ class Settings(BaseSettings):
     # Crawl
     # Format: "URL|tag1,tag2;URL2|tag3"
     crawl_seed_urls: str = "https://www.sehuatang.org/forum-103-1.html|sehuatang,hd"
+    crawl_user_agent: str = Field(default="Mozilla/5.0", min_length=1, max_length=1024, pattern=r"^[\x20-\x7E]+$")
     # Filter which internal links to visit from seed pages. Leave blank to visit everything.
     # Common forum patterns include either "thread-..." or "viewthread" style routes.
     crawl_link_filter_pattern: str = r"(viewthread|thread(-\d+)+\.html)"
@@ -165,8 +169,9 @@ class Settings(BaseSettings):
     crawl_empty_error_threshold: int = 3
     crawl_empty_cycles_key: str = "pixav:crawl:empty_cycles"
     # Optional cookies for crawling (raw Cookie header or Netscape cookie file path).
-    crawl_cookie_header: str = ""
+    crawl_cookie_header: str = Field(default="", repr=False)
     crawl_cookie_file: str = ""
+    crawl_cohort_file: str = ""
 
     # Redis queue names
     queue_crawl: str = "pixav:crawl"

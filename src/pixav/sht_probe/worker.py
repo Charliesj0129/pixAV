@@ -8,7 +8,6 @@ import time
 from typing import Protocol
 
 from pixav.config import Settings, get_settings
-from pixav.shared.cookies import load_cookies
 from pixav.shared.db import create_pool
 from pixav.shared.metrics import (
     record_crawl_cookie_error,
@@ -21,13 +20,16 @@ from pixav.shared.metrics import (
 from pixav.shared.queue import TaskQueue
 from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import SourceCandidateRepository, VideoRepository
+from pixav.sht_probe.cohort import load_cohort
 from pixav.sht_probe.crawler import HttpxCrawler
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
 from pixav.sht_probe.jackett_client import JackettClient
 from pixav.sht_probe.models import CrawlResult
+from pixav.sht_probe.origins import is_retained_source_url
 from pixav.sht_probe.parser import BeautifulSoupExtractor
 from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
 from pixav.sht_probe.service import ShtProbeService
+from pixav.sht_probe.source_session import SourceSessionRequiredError, load_source_session
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +50,10 @@ def _seed_crawler_cookies(settings: Settings, *crawlers: _SeedableCrawler | None
     almost no thread links, so the crawl "succeeds" with nothing to show for it.
     """
     try:
-        cookies, source = load_cookies(
+        cookies = load_source_session(
             cookie_header=settings.crawl_cookie_header,
             cookie_file=settings.crawl_cookie_file,
+            allowed_urls=[entry.split("|", 1)[0].strip() for entry in _parse_csv(settings.crawl_seed_urls)],
         )
     except FileNotFoundError:
         record_crawl_cookie_error("missing")
@@ -66,7 +69,7 @@ def _seed_crawler_cookies(settings: Settings, *crawlers: _SeedableCrawler | None
     for crawler in crawlers:
         if crawler is not None:
             crawler.seed_cookies(cookies)
-    logger.info("seeded %d crawl cookie(s) (%s)", len(cookies), source)
+    logger.info("seeded %d scoped crawl cookie(s)", len(cookies))
 
 
 async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
@@ -86,7 +89,7 @@ async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
 
         # Build optional components
         flaresolverr = FlareSolverrSession(settings.flaresolverr_url) if settings.flaresolverr_url else None
-        crawler = HttpxCrawler(flaresolverr=flaresolverr)
+        crawler = HttpxCrawler(flaresolverr=flaresolverr, user_agent=settings.crawl_user_agent)
         # Default generic components
         generic_extractor = BeautifulSoupExtractor()
         sehuatang_crawler = (
@@ -94,11 +97,19 @@ async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
                 flaresolverr=flaresolverr,
                 request_delay_seconds=settings.crawl_request_delay_seconds,
                 max_board_pages=settings.crawl_max_board_pages,
+                user_agent=settings.crawl_user_agent,
             )
             if flaresolverr
             else None
         )
         _seed_crawler_cookies(settings, crawler, sehuatang_crawler)
+        cohort = load_cohort(
+            settings.crawl_cohort_file,
+            seeds=[entry.split("|", 1)[0].strip() for entry in _parse_csv(settings.crawl_seed_urls)],
+            min_score=settings.source_min_quality_score,
+            managed=settings.managed_media_workflow,
+            queries=settings.crawl_queries,
+        )
         sehuatang_extractor = SehuatangExtractor()
         jackett = JackettClient(settings.jackett_url, settings.jackett_api_key) if settings.jackett_api_key else None
 
@@ -112,6 +123,7 @@ async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
             embeddings_enabled=settings.embeddings_enabled,
             managed_media_workflow=settings.managed_media_workflow,
             min_quality_score=settings.source_min_quality_score,
+            cohort=cohort,
         )
         sehuatang_service = (
             ShtProbeService(
@@ -125,6 +137,7 @@ async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
                 managed_media_workflow=settings.managed_media_workflow,
                 page_fetch_concurrency=4,
                 min_quality_score=settings.source_min_quality_score,
+                cohort=cohort,
             )
             if sehuatang_crawler
             else None
@@ -147,7 +160,7 @@ async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
                 url = entry.strip()
 
             try:
-                is_sehuatang = "sehuatang.org" in url
+                is_sehuatang = is_retained_source_url(url)
                 active_service = sehuatang_service if (is_sehuatang and sehuatang_service) else generic_service
 
                 crawl_result = await active_service.run_crawl(
@@ -166,6 +179,9 @@ async def run_once(settings: Settings) -> CrawlResult:  # noqa: C901
                     # but zero additions must not be treated as a confirmed empty crawl.
                     extracted_magnets += len(crawl_result)
                 record_task_processed(_METRICS_MODULE, len(crawl_result))
+            except SourceSessionRequiredError:
+                await redis.set(settings.crawl_empty_cycles_key + ":session_status", "USER_ACTION_REQUIRED")
+                raise
             except Exception as exc:
                 record_task_failed(_METRICS_MODULE)
                 logger.error("crawl failed for %s: %s", url, exc)
@@ -244,6 +260,12 @@ async def run_loop(settings: Settings, *, health_state: object | None = None) ->
                 run_once(settings),
                 timeout=settings.crawl_interval_seconds + 15 * 60,
             )
+        except SourceSessionRequiredError:
+            record_task_failed(_METRICS_MODULE)
+            logger.error("USER_ACTION_REQUIRED: replace and verify source session, then restart source worker")
+            if health_state is not None and hasattr(health_state, "mark_unready"):
+                health_state.mark_unready("USER_ACTION_REQUIRED")
+            await asyncio.Event().wait()
         except asyncio.TimeoutError as exc:
             record_crawl_cycle_timeout()
             record_task_failed(_METRICS_MODULE)

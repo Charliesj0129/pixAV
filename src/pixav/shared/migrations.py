@@ -13,6 +13,8 @@ from pathlib import Path
 
 import asyncpg
 
+from pixav.shared.instance import database_identity
+
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
@@ -46,7 +48,7 @@ def select_pending(filenames: list[str], applied: set[str], until: str | None = 
     return [name for name in ordered if name not in applied]
 
 
-async def run_migrations(dsn: str, *, until: str | None = None) -> list[str]:
+async def run_migrations(dsn: str, *, until: str | None = None, expected_identity: str | None = None) -> list[str]:
     """Apply every pending migration up to ``until``; return what was applied."""
     if not MIGRATIONS_DIR.is_dir():
         # Globbing a missing directory yields nothing, so without this the
@@ -56,6 +58,11 @@ async def run_migrations(dsn: str, *, until: str | None = None) -> list[str]:
 
     conn: asyncpg.Connection = await asyncpg.connect(dsn)
     try:
+        if expected_identity is not None and await database_identity(conn) != expected_identity:
+            raise ValueError("migration database identity mismatch")
+        # Session ownership spans the ledger read and every migration. Closing
+        # the connection releases this lock even after cancellation or failure.
+        await conn.execute("SELECT pg_advisory_lock(716492805321)")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS _migrations (
                 filename TEXT PRIMARY KEY,
@@ -73,8 +80,9 @@ async def run_migrations(dsn: str, *, until: str | None = None) -> list[str]:
         for name in pending:
             logger.info("apply %s", name)
             sql = (MIGRATIONS_DIR / name).read_text(encoding="utf-8")
-            await conn.execute(sql)
-            await conn.execute("INSERT INTO _migrations (filename) VALUES ($1)", name)
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute("INSERT INTO _migrations (filename) VALUES ($1)", name)
 
         logger.info("migrations complete (%d applied)", len(pending))
         return pending

@@ -7,6 +7,7 @@ is offered as input, what is recomputed, what is published -- runs for real.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -152,6 +153,61 @@ async def test_prepare_offers_the_verified_readback_by_hard_link_bdd_066(tmp_pat
     assert published.read_bytes() == CONTENT
     assert not (tmp_path / "cache" / ".work" / str(playable["id"])).joinpath(str(result.attempt_id)).exists()
     assert result.playable_asset_id == playable["id"] and result.purpose == "prepare"
+
+
+async def test_prepare_reuses_a_fresh_cold_session_instead_of_downloading_again(tmp_path):
+    materializer = FakeMaterializer()
+    worker, playable, segment = build(tmp_path, materializer)
+    source = verified_readback(tmp_path, segment)
+    session = source.parent / "session-fresh"
+    session.mkdir()
+    for path in list(source.parent.glob("*.mp4*")):
+        path.rename(session / path.name)
+    result = await worker.execute(request_for(playable, "prepare"))
+    assert result.outcome == "success" and result.evidence["inputs"] == "verified-readback"
+    assert materializer.linked_inode == (session / source.name).stat().st_ino
+
+
+async def test_separate_mounts_offer_a_verified_private_copy(tmp_path, monkeypatch):
+    materializer = FakeMaterializer()
+    worker, playable, segment = build(tmp_path, materializer)
+    source = verified_readback(tmp_path, segment)
+    real_link = os.link
+
+    def separate_mounts(original, destination):
+        if "cloud" in Path(destination).parts:
+            raise OSError(errno.EXDEV, "separate mounts")
+        return real_link(original, destination)
+
+    monkeypatch.setattr(os, "link", separate_mounts)
+    result = await worker.execute(request_for(playable, "prepare"))
+    assert result.outcome == "success" and result.evidence["inputs"] == "verified-readback"
+    assert materializer.linked_inode != source.stat().st_ino
+    assert source.read_bytes() == CONTENT
+
+
+async def test_corrupted_cross_mount_copy_and_symlink_session_are_not_offered(tmp_path, monkeypatch):
+    materializer = FakeMaterializer()
+    worker, playable, segment = build(tmp_path, materializer)
+    source = verified_readback(tmp_path, segment)
+    original = tmp_path / "outside"
+    original.mkdir()
+    source.parent.joinpath("session-symlink").symlink_to(original, target_is_directory=True)
+    real_link = os.link
+
+    def separate_mounts(original, destination):
+        if "cloud" in Path(destination).parts:
+            raise OSError(errno.EXDEV, "separate mounts")
+        return real_link(original, destination)
+
+    def bad_copy(reader, writer):
+        writer.write(b"untrusted copy")
+
+    monkeypatch.setattr(os, "link", separate_mounts)
+    monkeypatch.setattr("pixav.pixel_injector.playback_activity.shutil.copyfileobj", bad_copy)
+    result = await worker.execute(request_for(playable, "prepare"))
+    assert result.outcome == "success" and result.evidence["inputs"] == "photos"
+    assert materializer.seen_cloud == [] and source.read_bytes() == CONTENT
 
 
 async def test_prepare_falls_back_to_photos_when_readback_is_gone_bdd_078(tmp_path):

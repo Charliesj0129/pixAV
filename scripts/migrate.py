@@ -31,6 +31,7 @@ def main() -> None:
     itself when this runs as the compose ``migrate`` service.
     """
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db-identity", default=None, help="refuse a different PostgreSQL cluster before any SQL")
     parser.add_argument(
         "--until",
         default=None,
@@ -41,7 +42,7 @@ def main() -> None:
 
     dsn = os.environ.get("PIXAV_DSN", "").strip() or get_settings().dsn
     try:
-        asyncio.run(run_migrations(dsn, until=args.until))
+        asyncio.run(run_migrations(dsn, until=args.until, expected_identity=args.db_identity))
     except ValueError as exc:
         parser.exit(2, f"migration refused: {exc}\n")
 

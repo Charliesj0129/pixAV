@@ -577,6 +577,123 @@ async def test_only_a_diagnosed_infrastructure_failure_may_be_reopened(workflow)
     assert await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", execution) == "FAILED"
 
 
+async def failed_preparation(workflow, tmp_path):
+    await seed(workflow)
+    downloads, prepared = tmp_path / "downloads", tmp_path / "prepared"
+    downloads.mkdir()
+    source = downloads / "synthetic.mp4"
+    payload = b"retained synthetic media bytes"
+    source.write_bytes(payload)
+    download = await workflow.next_activity()
+    await submit(workflow, report(download, artifact_path=str(source)))
+    await workflow.consume_results()
+    command = await workflow.next_activity()
+    await submit(workflow, report(command, "invalid_media", error_code="INVALID_MEDIA"))
+    await workflow.consume_results()
+    facts = MediaFacts(
+        container="mov,mp4",
+        size_bytes=len(payload),
+        duration_seconds=10,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        streams=({"kind": "video", "codec": "h264", "width": 1920, "height": 1080}, {"kind": "audio", "codec": "aac"}),
+    )
+    artifact = PreparedArtifact(
+        path=str(source), input_path=str(source), input_sha256=facts.sha256, input_facts=facts, facts=facts
+    )
+    directory = prepared / str(command.operation_id) / "segments"
+    directory.mkdir(parents=True)
+    intent = directory / "segment.intent.json"
+    intent.write_text(
+        json.dumps(
+            {
+                "identity": str(command.operation_id),
+                "target_bytes": 9_500_000_000,
+                "artifact": artifact.model_dump(mode="json"),
+            }
+        )
+    )
+    args = dict(
+        operator="fixture-operator",
+        reason="diagnosed validator fault repaired",
+        validator_revision="d" * 64,
+        download_root=downloads,
+        preparation_root=prepared,
+    )
+    return command, source, intent, args
+
+
+async def test_preparation_revalidation_keeps_intents_history_and_budget_bdd_033_035(workflow, tmp_path):
+    command, _, _, args = await failed_preparation(workflow, tmp_path)
+    before = await workflow.pool.fetchrow("SELECT * FROM executions WHERE id=$1", command.execution_id)
+    assert await workflow.revalidate_preparation(command.execution_id, **args)
+    after = await workflow.pool.fetchrow("SELECT * FROM executions WHERE id=$1", command.execution_id)
+    assert after["stage"] == "prepare" and after["state"] == "READY"
+    assert after["max_retries"] == before["max_retries"]
+    assert after["infrastructure_retries"] == before["infrastructure_retries"]
+    assert after["recovery_count"] == before["recovery_count"]
+    history = json.loads(after["checkpoint"])["preparation_revalidation"]
+    assert history[0]["operator"] == args["operator"] and history[0]["validator_revision"] == "d" * 64
+    assert history[0]["prior_error_code"] == "INVALID_MEDIA"
+    assert (
+        await workflow.pool.fetchval(
+            "SELECT payload->>'outcome' FROM activity_results WHERE attempt_id=$1", command.attempt_id
+        )
+        == "invalid_media"
+    )
+    resumed = await workflow.next_activity()
+    assert resumed.operation_id == command.operation_id and resumed.execution_id == command.execution_id
+    assert resumed.generation > command.generation
+    assert await workflow.pool.fetchval("SELECT count(*) FROM operation_intents") == 2
+
+
+@pytest.mark.parametrize(
+    "fault", ["changed_input", "symlink", "wrong_intent", "missing_download", "remote_facts", "storage_failure"]
+)
+async def test_preparation_revalidation_rejects_unproven_or_remote_inputs(workflow, tmp_path, fault):
+    command, source, intent, args = await failed_preparation(workflow, tmp_path)
+    if fault == "changed_input":
+        source.write_bytes(b"x" * source.stat().st_size)
+    elif fault == "symlink":
+        original = source.with_suffix(".retained")
+        source.rename(original)
+        source.symlink_to(original)
+    elif fault == "wrong_intent":
+        document = json.loads(intent.read_text())
+        document["identity"] = str(uuid4())
+        intent.write_text(json.dumps(document))
+    elif fault == "missing_download":
+        await workflow.pool.execute("DELETE FROM workflow_artifacts WHERE execution_id=$1", command.execution_id)
+    elif fault == "remote_facts":
+        artifact = await workflow.pool.fetchval(
+            "SELECT id FROM workflow_artifacts WHERE execution_id=$1", command.execution_id
+        )
+        video = await workflow.pool.fetchval("SELECT video_id FROM workflow_tasks WHERE task_id=$1", command.task_id)
+        await workflow.pool.execute(
+            "INSERT INTO remote_assets(id,video_id,artifact_id,policy_version,expected,segment_count) VALUES($1,$2,$3,'photos-original-v2','{}',1)",
+            uuid4(),
+            video,
+            artifact,
+        )
+    else:
+        await workflow.pool.execute(
+            "UPDATE executions SET stage='verify',failure_class='verification_failed' WHERE id=$1", command.execution_id
+        )
+    with pytest.raises(ValueError):
+        await workflow.revalidate_preparation(command.execution_id, **args)
+    assert await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", command.execution_id) == "FAILED"
+    assert "preparation_revalidation" not in json.loads(
+        await workflow.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", command.execution_id)
+    )
+
+
+@pytest.mark.parametrize("field", ["operator", "reason", "validator_revision"])
+async def test_preparation_revalidation_requires_operator_and_revision(workflow, tmp_path, field):
+    command, _, _, args = await failed_preparation(workflow, tmp_path)
+    args[field] = ""
+    with pytest.raises(ValueError, match="operator, reason and validator revision"):
+        await workflow.revalidate_preparation(command.execution_id, **args)
+
+
 async def test_an_infrastructure_failure_never_poisons_the_candidate_bdd_015_032(workflow):
     """A fault on this side is not evidence about the swarm on the other side.
 

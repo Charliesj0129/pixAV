@@ -18,6 +18,7 @@ from pixav.media_loader.video_parts import (
     PartMedia,
     contained_file,
     disk_budget,
+    sha256,
 )
 from pixav.shared.models import VideoPart
 from pixav.sht_probe.scoring import QualityScorer
@@ -71,7 +72,11 @@ def test_failed_reference_persistence_stops_before_segmentation(tmp_path, monkey
     source = tmp_path / "synthetic.mp4"
     source.write_bytes(b"source")
     media = PartMedia()
-    monkeypatch.setattr(media, "validate_source", lambda *_: {"format": {"duration": "10"}})
+    monkeypatch.setattr(
+        media,
+        "validate_source",
+        lambda *_: {"format": {"duration": "10"}, "streams": [{"time_base": "1/1000"}]},
+    )
     monkeypatch.setattr(media, "source_reference", lambda *_: {"sha256": "a", "timeline": {}, "reference": {}})
     monkeypatch.setattr("pixav.media_loader.video_parts.require_space", lambda *_: None)
 
@@ -275,6 +280,139 @@ def test_real_four_k_stream_copy_round_trip(tmp_path):
     assert json.loads(result.stdout)["content"] == "PASS"
 
 
+def test_split_merge_keeps_the_gap_before_the_next_source_segment(tmp_path, monkeypatch):
+    source = tmp_path / "synthetic.mp4"
+    source.write_bytes(b"x" * 40)
+    raw = {
+        "format": {"duration": "10"},
+        "streams": [{"codec_type": "video", "codec_name": "h264", "time_base": "1/1000", "r_frame_rate": "30/1"}],
+    }
+    reference = {
+        "video_sha256": "a",
+        "video_frames": 300,
+        "audio_sha256": "b",
+        "encoded_sha256": "c",
+        "signature": [],
+        "duration": 10,
+        "av_offsets": [],
+    }
+    media = PartMedia()
+    monkeypatch.setattr("pixav.media_loader.video_parts.require_space", lambda *_: None)
+    monkeypatch.setattr(media, "validate_source", lambda *_: raw)
+    monkeypatch.setattr(
+        media, "source_reference", lambda *_: {"sha256": sha256(source), "reference": reference, "timeline": {}}
+    )
+    monkeypatch.setattr(media, "fingerprint", lambda *_: reference)
+    monkeypatch.setattr(media, "probe", lambda *_: raw)
+    merged_spans = []
+
+    def split(args, timeout):
+        listing = Path(args[args.index("-segment_list") + 1])
+        listing.write_text("part-000000.mp4,0.000000,5.000000\npart-000001.mp4,5.000467,10.000000\n")
+        for index in range(2):
+            (listing.parent / f"part-{index:06d}.mp4").write_bytes(b"p" * 8)
+
+    def merge(paths, destination, duration, *, spans):
+        merged_spans.extend(spans)
+
+    monkeypatch.setattr(media, "command", split)
+    monkeypatch.setattr(media, "merge", merge)
+    directory = tmp_path / "prepared"
+    directory.mkdir()
+    parts, _ = media.prepare(source, directory, uuid.uuid4(), target=20)
+    assert merged_spans == pytest.approx([5.000467, 4.999533])
+    assert parts[0].end_seconds == parts[1].start_seconds == pytest.approx(5.000467)
+    assert parts[-1].end_seconds == 10
+
+
+@pytest.mark.parametrize(
+    ("bases", "expected"),
+    [(["1/10000000", "1/48000"], 30_000_000), (["1001/30000", "1/48000"], 240_000)],
+)
+def test_movie_clock_keeps_fractional_video_and_audio_ticks(bases, expected):
+    assert PartMedia.movie_timescale({"streams": [{"time_base": value} for value in bases]}) == expected
+
+
+@pytest.mark.parametrize("bases", [[], ["0/1"], ["-1/1000"], ["1/0"], ["bad"], ["1/2147483647", "1/48000"]])
+def test_movie_clock_rejects_invalid_or_unrepresentable_stream_clocks(bases):
+    with pytest.raises(IncompatibleMediaError, match="clock"):
+        PartMedia.movie_timescale({"streams": [{"time_base": value} for value in bases]})
+
+
+@pytest.mark.integration
+def test_real_variable_clock_split_preserves_fractional_boundary(tmp_path):
+    if os.getenv("PIXAV_RUN_MEDIA_TESTS") != "1":
+        pytest.skip("opt-in real FFmpeg tools container")
+    media = PartMedia(
+        minimum_dimensions=(1, 1),
+        prefix=[
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cpus",
+            "4",
+            "--memory",
+            "4g",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{tmp_path}:{tmp_path}",
+            os.getenv("PIXAV_READBACK_CONTRACT_IMAGE", "pixav-photos-canary:maestro-2.10.0"),
+        ],
+    )
+    source = tmp_path / "synthetic-variable-clock.mp4"
+    media.command(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-xerror",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=30000/1001:duration=10.07",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=10.07",
+            "-vf",
+            r"settb=1/10000000,setpts=PTS+mod(N\,17)*100",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-threads",
+            "2",
+            "-g",
+            "31",
+            "-bf",
+            "2",
+            "-sc_threshold",
+            "0",
+            "-enc_time_base:v",
+            "1:10000000",
+            "-video_track_timescale",
+            "10000000",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        120,
+    )
+    directory = tmp_path / "parts"
+    directory.mkdir()
+    parts, reference = media.prepare(source, directory, uuid.uuid4(), target=source.stat().st_size * 4 // 5)
+    assert len(parts) == 2
+    assert reference["local_merge"] == "PASS"
+    assert reference["reference"]["video_frames"] == 302
+    assert source.exists()
+
+
 class TestOperationFailureClassification:
     """An infrastructure fault must not be blamed on the media.
 
@@ -456,7 +594,7 @@ class TestDecodedTimelineGuard:
     def _rows(self, count=1200):
         return [(index * 166833, f"{index:064x}") for index in range(count)]
 
-    def _parse(self, rows, tmp_path):
+    def _parse(self, rows, tmp_path, packet_stamps=None):
         """Runs fingerprint() far enough to parse the frame hashes and no further."""
         calls: list[list[str]] = []
         payload = self._payload(rows)
@@ -468,7 +606,11 @@ class TestDecodedTimelineGuard:
                 return b""
             raise StopProbeError
 
-        with patch.object(PartMedia, "command", record):
+        stamps = packet_stamps if packet_stamps is not None else sorted(pts for pts, _ in rows)
+        with (
+            patch.object(PartMedia, "command", record),
+            patch.object(PartMedia, "presentation_stamps", return_value=stamps),
+        ):
             PartMedia().fingerprint(tmp_path / "film.mp4", tmp_path, 10.0)
 
     def test_an_overridden_stamp_with_different_content_is_accepted(self, tmp_path):
@@ -483,6 +625,29 @@ class TestDecodedTimelineGuard:
         rows[700] = rows[699]
         with pytest.raises(IncompatibleMediaError, match="repeated decoded video frame"):
             self._parse(rows, tmp_path)
+
+    def test_stationary_content_with_unique_native_timestamps_is_accepted(self, tmp_path):
+        rows = self._rows()
+        native = [pts for pts, _ in rows]
+        rows[700] = rows[699]
+        with pytest.raises(StopProbeError):
+            self._parse(rows, tmp_path, packet_stamps=native)
+
+    @pytest.mark.parametrize("difference", [-1, 1])
+    def test_stationary_content_requires_one_packet_per_decoded_frame(self, tmp_path, difference):
+        rows = self._rows()
+        rows[700] = rows[699]
+        native = [index * 166833 for index in range(len(rows) + difference)]
+        with pytest.raises(IncompatibleMediaError, match="frame count differs"):
+            self._parse(rows, tmp_path, packet_stamps=native)
+
+    def test_stationary_content_does_not_hide_a_systematic_clock_collapse(self, tmp_path):
+        rows = self._rows()
+        native = [pts for pts, _ in rows]
+        rows[700] = rows[699]
+        rows[701] = rows[699]
+        with pytest.raises(IncompatibleMediaError, match="collapses onto repeated timestamps"):
+            self._parse(rows, tmp_path, packet_stamps=native)
 
     def test_a_timeline_running_backwards_is_still_refused(self, tmp_path):
         rows = self._rows()

@@ -236,7 +236,7 @@ class QBitClient:
                 "/api/v2/torrents/addTrackers",
                 data={"hash": torrent_hash, "urls": "\n".join(self._extra_trackers)},
             )
-            if response.status_code != 200:
+            if not 200 <= response.status_code < 300:
                 logger.warning(
                     "qBittorrent rejected fallback trackers for %s: HTTP %d %s",
                     torrent_hash,
@@ -355,6 +355,10 @@ class QBitClient:
                 or tag not in str(rows[0].get("tags", "")).split(", ")
             ):
                 raise TorrentOwnershipError("torrent add result requires reconciliation")
+        # Reapply the configured trackers only after exact operation ownership
+        # is confirmed. A resumed metadata download must use current transport
+        # configuration without creating another torrent or changing its tag.
+        await self._add_extra_trackers(info_hash)
         return rows[0]
 
     async def check_download(

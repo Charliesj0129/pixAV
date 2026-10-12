@@ -265,7 +265,34 @@ def confirmed_upload_rates(observation: dict) -> list[dict]:
     return result
 
 
-def managed_window(observation: dict) -> dict:
+def continuous_observation(samples: list[dict], last_upload: str | None) -> dict:
+    """Preserve interruptions; elapsed upload age cannot establish continuity."""
+    ordered = sorted(samples, key=lambda item: seconds(item["at"]))
+    interruptions = []
+    beginning = seconds(ordered[0]["at"]) if ordered else None
+    for before, after in zip(ordered, ordered[1:], strict=False):
+        gap = seconds(after["at"]) - seconds(before["at"])
+        if gap <= 0:
+            raise ValueError("observation timestamps must be distinct")
+        if gap > 900:
+            interruptions.append({"before": before["at"], "after": after["at"], "gap_seconds": gap})
+            beginning = seconds(after["at"])
+    elapsed = 0.0
+    if last_upload and beginning is not None and len(ordered) >= 2:
+        end = seconds(ordered[-1]["at"])
+        uploaded = seconds(last_upload)
+        if uploaded > end:
+            raise ValueError("upload timestamp is newer than the observation")
+        elapsed = max(0.0, end - max(beginning, uploaded))
+    return {
+        "continuous_observation_seconds": elapsed,
+        "continuous_observation_at_least_24h": elapsed >= 86400,
+        "observation_interruptions": interruptions,
+        "maximum_allowed_interval_seconds": 900,
+    }
+
+
+def managed_window(observation: dict, *, samples: list[dict] | None = None) -> dict:
     """Summarize DB facts without treating them as live acceptance evidence."""
     managed = observation.get("managed") or {}
     assets = managed.get("assets", [])
@@ -286,6 +313,7 @@ def managed_window(observation: dict) -> dict:
         "upload_age_at_least_24h": elapsed is not None and elapsed >= 86400,
         "provider_quota_verified": False,
         "restart_recovery_verified": False,
+        **continuous_observation(samples or [], latest),
     }
 
 
@@ -371,7 +399,9 @@ def build_report(cohort: dict, observations: list[dict], events: list[dict], inv
         "qbit": inventory,
         "managed": ordered[-1].get("managed"),
         "transfer": ordered[-1].get("transfer"),
-        "managed_window": managed_window(ordered[-1]),
+        "managed_window": managed_window(
+            ordered[-1], samples=[cohort, *ordered] if seconds(cohort["at"]) < seconds(ordered[0]["at"]) else ordered
+        ),
         "photos_acceptance": "OPEN",  # Counts cannot establish cold-path or provider quota evidence.
         "production_gate": "OPEN",  # Timing alone cannot prove playback/VPN/promotion.
     }

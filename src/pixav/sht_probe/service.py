@@ -14,11 +14,14 @@ from pixav.shared.metrics import record_source_adapter_error, record_untitled_re
 from pixav.shared.models import Video
 from pixav.shared.queue import TaskQueue
 from pixav.shared.repository import SourceCandidateRepository, VideoRepository
+from pixav.sht_probe.cohort import SourceCohort
 from pixav.sht_probe.crawler import HttpxCrawler
 from pixav.sht_probe.interfaces import IndexerAdapter
 from pixav.sht_probe.models import CrawlResult, MagnetCandidate
+from pixav.sht_probe.origins import is_retained_source_url
 from pixav.sht_probe.parser import BeautifulSoupExtractor
 from pixav.sht_probe.scoring import QualityScorer
+from pixav.sht_probe.source_session import SourceSessionRequiredError
 
 if TYPE_CHECKING:
     from pixav.sht_probe.sehuatang import SehuatangCrawler, SehuatangExtractor
@@ -48,6 +51,7 @@ class ShtProbeService:
         managed_media_workflow: bool = False,
         embeddings_enabled: bool = False,
         page_fetch_concurrency: int = 1,
+        cohort: SourceCohort | None = None,
     ) -> None:
         self._video_repo = video_repo
         self._queue = queue
@@ -61,6 +65,9 @@ class ShtProbeService:
         self._page_fetch_concurrency = max(1, page_fetch_concurrency)
         self._embedding_service = None
         self._last_untitled_rejected = 0
+        self._cohort = cohort
+        if cohort is not None and (not managed_media_workflow or min_quality_score != cohort.min_score):
+            raise ValueError("source cohort requires managed admission with unchanged normal threshold")
         if embeddings_enabled:
             from pixav.shared.embedding import EmbeddingService
 
@@ -95,6 +102,9 @@ class ShtProbeService:
 
         logger.info("starting crawl from %s (filter=%s, tags=%s)", seed_url, link_pattern, tags)
         page_urls = await self._crawler.crawl(seed_url, link_pattern)
+        if self._cohort is not None:
+            allowed_pages = {item.page_url for item in self._cohort.items}
+            page_urls = [url for url in page_urls if url in allowed_pages]
         if isinstance(max_pages, int) and max_pages > 0:
             page_urls = page_urls[:max_pages]
         logger.info("found %d page links from %s", len(page_urls), seed_url)
@@ -103,6 +113,8 @@ class ShtProbeService:
 
         async def _extract(html: str, source_url: str) -> list[MagnetCandidate]:
             method = getattr(type(self._extractor), "extract_candidates", None)
+            if self._cohort is not None and source_url not in {item.page_url for item in self._cohort.items}:
+                return []
             if callable(method):
                 return await self._extractor.extract_candidates(html, source_url)  # type: ignore[attr-defined]
             magnets = await self._extractor.extract(html)
@@ -120,6 +132,8 @@ class ShtProbeService:
                         html = await self._crawler.fetch_page_html(page_url)
                         for candidate in await _extract(html, page_url):
                             candidates[candidate.uri] = candidate
+                    except SourceSessionRequiredError:
+                        raise
                     except Exception as exc:
                         logger.warning("failed to extract from %s: %s", page_url, exc)
             else:
@@ -136,6 +150,8 @@ class ShtProbeService:
                     return_exceptions=True,
                 )
                 for page_url, result in zip(page_urls, results, strict=True):
+                    if isinstance(result, SourceSessionRequiredError):
+                        raise result
                     if isinstance(result, BaseException):
                         logger.warning("failed to extract from %s: %s", page_url, result)
                         continue
@@ -143,7 +159,8 @@ class ShtProbeService:
                         candidates[candidate.uri] = candidate
 
         result_metadata = [
-            {"magnet_uri": item.uri, "title": item.title, "source_url": item.source_url} for item in candidates.values()
+            {"magnet_uri": item.uri, "title": item.title, "source_url": item.source_url, "size": item.size_bytes}
+            for item in candidates.values()
         ]
         self._last_untitled_rejected = 0
         new_magnets = await self._persist_new(list(candidates), results=result_metadata, tags=tags)
@@ -164,6 +181,8 @@ class ShtProbeService:
         Returns:
             List of newly discovered magnet URIs.
         """
+        if self._cohort is not None:
+            raise ValueError("source cohort only permits native discovery")
         if self._jackett is None:
             raise RuntimeError("jackett is required for run_search()")
 
@@ -220,7 +239,7 @@ class ShtProbeService:
             item = result_by_magnet.get(magnet, {})
             title = str(item.get("title") or _title_from_magnet(magnet))
             source_url = str(item.get("source_url") or "")
-            if ("sehuatang.org" in source_url or "sehuatang" in (tags or [])) and _is_untitled(title):
+            if (is_retained_source_url(source_url) or "sehuatang" in (tags or [])) and _is_untitled(title):
                 self._last_untitled_rejected += 1
                 record_untitled_rejected()
                 logger.warning("reject Sehuatang candidate without title: %s", magnet[:80])
@@ -285,6 +304,10 @@ class ShtProbeService:
                     "size_bytes": row.get("size", 0),
                 }
                 candidate = SourcePolicy(min_score=self._min_quality_score).normalize(payload)
+                if self._cohort is not None and not self._cohort.includes(
+                    row.get("source_url", ""), candidate.info_hash
+                ):
+                    continue
             except (ValueError, KeyError, TypeError, AttributeError):
                 # One unusable row is discarded and counted; the rest of the
                 # provider's answer is still worth having.

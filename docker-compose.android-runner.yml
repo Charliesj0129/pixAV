@@ -1,0 +1,55 @@
+# Standalone Windows Emulator development tools; do not merge with worker stacks.
+# Android and its retained account state live on Windows, outside Docker/WSL.
+services:
+  android_runner:
+    profiles: [android-dev]
+    image: ${PIXAV_ANDROID_RUNNER_IMAGE:?set an immutable local tools image ID or digest}
+    pull_policy: never
+    command: [sleep, infinity]
+    restart: "no"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 256
+    environment:
+      # 5037 is the Windows ADB server, not the emulator's adbd port (5555).
+      ADB_SERVER_SOCKET: tcp:${PIXAV_ANDROID_ADB_SERVER_HOST:-host.docker.internal}:5037
+      PIXAV_ANDROID_ADB_SERVER_HOST: ${PIXAV_ANDROID_ADB_SERVER_HOST:-host.docker.internal}
+      ANDROID_SERIAL: ${PIXAV_ANDROID_SERIAL:?set the exact Windows emulator serial}
+      MAESTRO_CLI_NO_ANALYTICS: "1"
+    volumes:
+      - type: bind
+        source: ${PIXAV_ANDROID_RUNNER_STAGING_DIR:?set an existing synthetic-media staging directory}
+        target: /parts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/maestro/android-runner-smoke.yaml
+        target: /flows/android-runner-smoke.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    # CLI state and reports are disposable; never mount an AVD or host secrets.
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m,mode=1777
+      - /root:rw,nosuid,nodev,size=512m,mode=0700
+      - /work:rw,nosuid,nodev,size=512m,mode=0700
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pixav_adb_state="$$(timeout --kill-after=2s 10s adb -s "$$ANDROID_SERIAL" get-state 2>/dev/null)"
+          && test "$$(printf '%s' "$$pixav_adb_state" | tr -d '\r\n')" = device
+          && pixav_boot_state="$$(timeout --kill-after=2s 10s adb -s "$$ANDROID_SERIAL" shell getprop sys.boot_completed 2>/dev/null)"
+          && test "$$(printf '%s' "$$pixav_boot_state" | tr -d '\r\n')" = 1
+      interval: 30s
+      timeout: 25s
+      retries: 3
+      start_period: 240s
+    labels:
+      pixav.runtime.role: android-dev-tools

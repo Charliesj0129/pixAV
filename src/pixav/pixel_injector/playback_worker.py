@@ -30,8 +30,10 @@ def build_worker(pool: asyncpg.Pool, settings: Settings) -> PlaybackActivityWork
     materializer = PhotosPlaybackMaterializer(
         cache_root,
         image=settings.storage_readback_image,
-        source_root=Path(__file__).resolve().parents[2],
         host_project_root=settings.host_project_root,
+        authentication_secret=settings.photos_cold_auth_secret,
+        ui_pool=pool,
+        owner=settings.storage_worker_owner,
     )
     return PlaybackActivityWorker(
         pool,

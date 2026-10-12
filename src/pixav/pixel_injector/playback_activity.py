@@ -11,6 +11,7 @@ never needs to trust anything it did not see verified.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import asyncpg
 from pydantic import ValidationError
 
 from pixav.media_loader.video_parts import contained_file, sha256
+from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
 from pixav.pixel_injector.photos_storage import COLD_MOUNTS, ColdProcessError, PhotosColdReadback
 from pixav.shared.playable_assets import playable_from_row
 from pixav.shared.playback_models import (
@@ -60,8 +62,11 @@ class PhotosPlaybackMaterializer(PhotosColdReadback):
     LABEL = "playback-materialize"
 
     async def materialize(self, manifest: dict, work: Path, *, timeout_seconds: int) -> dict:
-        payload = json.dumps(manifest).encode()
-        receipt = await asyncio.to_thread(self._run, work, payload, timeout_seconds=timeout_seconds)
+        if self.requires_fresh_work:
+            receipt = await self.run_authenticated(manifest, work, timeout_seconds)
+        else:
+            payload = json.dumps(manifest).encode()
+            receipt = await asyncio.to_thread(self._run, work, payload, timeout_seconds=timeout_seconds)
         return {**receipt, "cold_mounts": list(COLD_MOUNTS)}
 
 
@@ -73,9 +78,16 @@ class PlaybackRefusedError(Exception):
         self.code = code
 
 
-def _redacted(segment: RemoteAssetSegment) -> dict:
+def _redacted(segment: RemoteAssetSegment, *, account_bound: bool = False) -> dict:
     """What the isolated process may know: the provider location and the facts."""
-    clean = segment.model_copy(update={"local_path": "", "account_id": None, "recovery": {}, "verification": {}})
+    clean = segment.model_copy(
+        update={
+            "local_path": "",
+            "account_id": segment.account_id if account_bound else None,
+            "recovery": {},
+            "verification": {},
+        }
+    )
     return json.loads(clean.model_dump_json())
 
 
@@ -85,13 +97,35 @@ def _link_verified_readback(segment: RemoteAssetSegment, readback_root: Path, cl
     The file must sit beside its original cold receipt, be a regular file inside
     the read-back root, and hash to the durable segment's digest now. Anything
     less and the segment is simply not offered, so the isolated process fetches
-    it from Photos instead. Hard links cost no space and cannot be redirected.
+    it from Photos instead. Fresh-session directories and legacy receipts are
+    supported. Separate Docker mounts may prohibit hard links; then a private
+    copy is hashed again before it is offered. Rebuild never calls this helper.
     """
     folder = readback_root / str(segment.asset_id) / str(segment.segment_index)
+    # Inspect only this segment's immediate, bounded session directories. Do
+    # not follow a symlink or search staging for a similarly named original.
+    folders = [folder]
+    try:
+        if folder.is_symlink():
+            return False
+        for child in folder.iterdir():
+            if child.name.startswith("session-") and child.is_dir() and not child.is_symlink():
+                folders.append(child)
+                if len(folders) > 65:
+                    return False
+    except OSError:
+        return False
+    for candidate in sorted(folders, key=lambda p: p.name, reverse=True):
+        if _offer_readback(segment, readback_root, candidate, cloud):
+            return True
+    return False
+
+
+def _offer_readback(segment: RemoteAssetSegment, root: Path, folder: Path, cloud: Path) -> bool:
     source, receipt = folder / segment.filename, folder / (segment.filename + ".json")
     try:
-        contained_file(readback_root, source)
-        contained_file(readback_root, receipt)
+        contained_file(root, source)
+        contained_file(root, receipt)
         report = json.loads(receipt.read_text())
         if (
             report.get("method") != COLD_READBACK_METHOD
@@ -101,9 +135,25 @@ def _link_verified_readback(segment: RemoteAssetSegment, readback_root: Path, cl
             or sha256(source) != segment.sha256
         ):
             return False
-        os.link(source, cloud / segment.filename)
-        os.link(receipt, cloud / receipt.name)
-    except (OSError, ValueError):
+        for original in (source, receipt):
+            destination = cloud / original.name
+            try:
+                os.link(original, destination)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with original.open("rb") as reader, os.fdopen(fd, "wb") as writer:
+                    shutil.copyfileobj(reader, writer)
+                    writer.flush()
+                    os.fsync(writer.fileno())
+        if (cloud / segment.filename).stat().st_size != segment.size_bytes or sha256(
+            cloud / segment.filename
+        ) != segment.sha256:
+            raise ValueError("read-back changed while it was offered")
+        if json.loads((cloud / receipt.name).read_text()) != report:
+            raise ValueError("read-back receipt changed while it was offered")
+    except (OSError, ValueError, UnicodeError):
         for stray in (cloud / segment.filename, cloud / (segment.filename + ".json")):
             with suppress(FileNotFoundError):
                 stray.unlink()
@@ -139,8 +189,10 @@ class PlaybackActivityWorker:
             return ActivityResult(**fields, outcome="success", evidence=evidence)
         except PlaybackRefusedError as refused:
             return ActivityResult(**fields, outcome="verification_failed", error_code=refused.code)
+        except AccountSessionRequiredError:
+            return ActivityResult(**fields, outcome="user_action", error_code="PHOTOS_ACCOUNT_SESSION_REQUIRED")
         except Exception:
-            logger.exception("playback activity failed")
+            logger.error("playback activity failed")
             return ActivityResult(**fields, outcome="infrastructure", error_code="PLAYBACK_MATERIALIZATION_FAILED")
 
     async def _load(self, request: ActivityRequest) -> tuple[PlayableAsset, dict, list[RemoteAssetSegment]]:
@@ -183,7 +235,7 @@ class PlaybackActivityWorker:
         cloud = work / "cloud"
         cloud.mkdir(mode=0o700)
         offered = 0
-        if request.purpose == "prepare":
+        if request.purpose == "prepare" and not getattr(self.materializer, "requires_fresh_work", False):
             for segment in segments:
                 offered += await asyncio.to_thread(_link_verified_readback, segment, self.readback_root, cloud)
         inputs: PlaybackInputs = (
@@ -191,7 +243,10 @@ class PlaybackActivityWorker:
         )
         manifest = {
             "version": 1,
-            "segments": [_redacted(segment) for segment in segments],
+            "segments": [
+                _redacted(segment, account_bound=bool(getattr(self.materializer, "requires_fresh_work", False)))
+                for segment in segments
+            ],
             "expected": expected,
             "output": cache_object_name(playable.id),
         }
@@ -200,6 +255,8 @@ class PlaybackActivityWorker:
                 manifest, work, timeout_seconds=self.segment_timeout_seconds * len(segments)
             )
         except ColdProcessError as failure:
+            if failure.error_type in {"AccountSessionRequiredError", "AccountSessionMismatchError"}:
+                raise AccountSessionRequiredError("Photos session requires operator login") from None
             if failure.error_type in _SEGMENT_MISMATCH:
                 raise PlaybackRefusedError("PLAYBACK_SEGMENT_MISMATCH") from None
             if failure.error_type in _INTEGRITY:
@@ -262,9 +319,14 @@ class PlaybackActivityWorker:
             await queue.ack(receipt)
             return True
         token = uuid.uuid4()
-        if not await self._matches_intent(request) or not await self.pool.fetchval(
-            "SELECT claim_activity($1,$2)", request.attempt_id, token
-        ):
+        matched = await self._matches_intent(request)
+        if not matched or not await self.pool.fetchval("SELECT claim_activity($1,$2)", request.attempt_id, token):
+            logger.warning(
+                "playback attempt refused: intent_match=%s generation=%s attempt=%s",
+                matched,
+                request.generation,
+                request.attempt_id,
+            )
             await queue.ack(receipt)
             return True
         running = asyncio.create_task(self.execute(request))

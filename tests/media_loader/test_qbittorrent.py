@@ -746,3 +746,43 @@ async def test_managed_unknown_operation_never_adds_or_deletes(client, rows):
     with pytest.raises(TorrentOwnershipError):
         await client.check_download("a" * 40, str(uuid4()))
     assert all("/torrents/add" not in str(call.request.url) for call in respx.calls)
+
+
+@respx.mock
+@pytest.mark.parametrize("owned", [True, False])
+@pytest.mark.parametrize("tracker_status", [200, 204])
+async def test_resumed_download_refreshes_trackers_only_for_exact_owner(owned, tracker_status):
+    from uuid import uuid4
+
+    from pixav.shared.exceptions import TorrentOwnershipError
+
+    operation = str(uuid4())
+    row = {"hash": "a" * 40, "tags": f"pixav-operation-{operation}" if owned else "foreign"}
+    respx.post("http://qbit:8080/api/v2/auth/login").mock(return_value=_modern_login_response())
+    respx.get("http://qbit:8080/api/v2/torrents/info").mock(return_value=httpx.Response(200, json=[row]))
+    tracker = respx.post("http://qbit:8080/api/v2/torrents/addTrackers").mock(
+        return_value=httpx.Response(tracker_status)
+    )
+    qbit = QBitClient(
+        base_url="http://qbit:8080",
+        username="admin",
+        password="test-only",
+        extra_trackers=("http://tracker:9000/announce",),
+    )
+    try:
+        if owned:
+            assert await qbit._owned_download("a" * 40, operation, allow_add=False) == row
+            assert tracker.call_count == 1
+            assert parse_qs(tracker.calls[0].request.content.decode()) == {
+                "hash": ["a" * 40],
+                "urls": ["http://tracker:9000/announce"],
+            }
+        else:
+            with pytest.raises(TorrentOwnershipError):
+                await qbit._owned_download("a" * 40, operation, allow_add=False)
+            assert not tracker.called
+        assert all(
+            str(call.request.url).split("?")[0] != "http://qbit:8080/api/v2/torrents/add" for call in respx.calls
+        )
+    finally:
+        await qbit.aclose()

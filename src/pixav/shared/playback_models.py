@@ -17,6 +17,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from pixav.media_loader.preparation import MediaFacts, PreparationPolicy, timeline_defect
+from pixav.shared.cold_receipts import AccountColdBinding, validate_account_cold_receipt
 from pixav.shared.models import utc_now
 from pixav.shared.storage_models import COLD_READBACK_METHOD, IntegrityError, RemoteAssetSegment
 
@@ -88,6 +89,11 @@ class SegmentReceipt(BaseModel):
     size: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     method: str
+    receipt_version: str | None = None
+    authentication: AccountColdBinding | None = Field(default=None, repr=False)
+    cold_inputs: str | None = None
+    cold_mounts: tuple[str, ...] | None = None
+    decode: str | None = None
 
 
 class MaterializationReceipt(BaseModel):
@@ -119,6 +125,10 @@ def _check_segments(ordered: Sequence[RemoteAssetSegment], receipt: Materializat
             raise IntegrityError("a segment was not obtained from the provider original")
         if obtained.size != segment.size_bytes or obtained.sha256 != segment.sha256:
             raise IntegrityError("a segment's bytes do not match the durable manifest")
+        try:
+            validate_account_cold_receipt(segment, obtained.model_dump(mode="json"))
+        except ValueError:
+            raise IntegrityError("playback cold account receipt invalid") from None
 
 
 def _check_join(expected: dict, ordered: Sequence[RemoteAssetSegment], receipt: MaterializationReceipt) -> None:

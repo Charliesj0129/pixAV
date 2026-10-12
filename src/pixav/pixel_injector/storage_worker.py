@@ -35,11 +35,13 @@ from pixav.shared.workflow import STORAGE_QUEUE, require_workflow_role
 logger = logging.getLogger(__name__)
 
 
-def default_runtime(pool: asyncpg.Pool, settings: Settings, *, owner: str) -> Callable[[Any], Any]:
+def default_runtime(
+    pool: asyncpg.Pool, settings: Settings, *, owner: str, existing: bool = False
+) -> Callable[[Any], Any]:
     """The journalled retained guest this worker owns."""
     import docker
 
-    return ManagedRuntime(
+    managed = ManagedRuntime(
         pool,
         cast(Any, docker).from_env(),
         owner=owner,
@@ -47,12 +49,14 @@ def default_runtime(pool: asyncpg.Pool, settings: Settings, *, owner: str) -> Ca
         guest_data_root=Path(settings.storage_guest_data_dir),
         profile_name=settings.redroid_profile,
         profiles_path=settings.redroid_profiles_path or None,
+        tools_image=settings.storage_upload_tools_image,
         host_project_root=settings.host_project_root,
         guest_cpus=settings.storage_guest_cpus,
         guest_memory_mb=settings.storage_guest_memory_mb,
         tools_cpus=settings.storage_tools_cpus,
         tools_memory_mb=settings.storage_tools_memory_mb,
-    ).acquire
+    )
+    return managed.acquire_existing if existing else managed.acquire
 
 
 def build_worker(
@@ -65,18 +69,29 @@ def build_worker(
     """Assemble the worker around the configured Pixel-compatible environment."""
     if settings.pixel_injector_mode != PIXEL_COMPATIBLE_MODE:
         raise RuntimeError("managed storage requires the Pixel-compatible upload environment")
+
+    async def observation_clock():
+        return await pool.fetchval("SELECT clock_timestamp()")
+
     uploader = MaestroSegmentUploader(
         runtime if runtime is not None else default_runtime(pool, settings, owner=owner),
         owner=owner,
         flows=Path(settings.storage_flows_dir),
         mode=settings.pixel_injector_mode,
         staging_root=Path(settings.storage_staging_dir),
+        observation_clock=observation_clock,
+        ui_pool=pool,
+        existing_runtime=(
+            runtime if runtime is not None else default_runtime(pool, settings, owner=owner, existing=True)
+        ),
     )
     readback = PhotosColdReadback(
         Path(settings.storage_readback_dir),
         image=settings.storage_readback_image,
-        source_root=Path(__file__).resolve().parents[2],
         host_project_root=settings.host_project_root,
+        authentication_secret=settings.photos_cold_auth_secret,
+        ui_pool=pool,
+        owner=owner,
     )
     return StorageActivityWorker(pool, uploader, readback)
 

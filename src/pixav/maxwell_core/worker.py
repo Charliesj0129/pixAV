@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import AsyncExitStack
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -240,6 +241,7 @@ async def run_loop(  # noqa: C901
     """
     pool = await create_pool(settings)
     redis = await create_redis(settings)
+    ownership = AsyncExitStack()
 
     try:
         managed = None
@@ -258,6 +260,9 @@ async def run_loop(  # noqa: C901
             from pixav.sht_probe.policy import SourcePolicy
 
             await require_workflow_role(pool, "pixav_execution_authority")
+            from pixav.shared.authority_ownership import execution_authority_ownership
+
+            await ownership.enter_async_context(execution_authority_ownership(pool))
             managed = MediaWorkflow(
                 pool,
                 local_retention_hours=settings.local_cleanup_success_hours,
@@ -384,14 +389,20 @@ async def run_loop(  # noqa: C901
                     try:
                         disk_status = await disk_guard.check_and_latch()
                         await managed.tick(
-                            managed_queue, download_paused=disk_status.paused, storage_queue=storage_queue
+                            managed_queue,
+                            download_paused=disk_status.paused,
+                            storage_queue=storage_queue,
+                            playback_queue=playback_queue,
                         )
                     except Exception:
                         logger.warning("managed scheduling dependency unavailable; retry on next tick")
 
     finally:
-        await redis.aclose()
-        await pool.close()
+        try:
+            await ownership.aclose()
+        finally:
+            await redis.aclose()
+            await pool.close()
 
 
 def main() -> None:

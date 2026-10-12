@@ -107,6 +107,16 @@ class ManagedRuntime:
 
     # ── acquire ──────────────────────────────────────────────────────────────
 
+    async def acquire_existing(self, account_id: uuid.UUID) -> tuple[Any, Any]:
+        """Reuse only the reviewed account's recorded guest; never replace it."""
+        record = await self._record()
+        if record is None or record["state"] != "READY" or str(record["account_id"]) != str(account_id):
+            raise CanaryBlockedError("existing-item runtime binding unavailable")
+        containers = await asyncio.to_thread(owned_containers, self.client, self.owner)
+        if {record["guest_id"], record["tools_id"]} != {item.id for item in containers}:
+            raise CanaryBlockedError("existing-item runtime identity changed")
+        return await self._retained(record)
+
     async def acquire(self, account_id: uuid.UUID | None = None) -> tuple[Any, Any]:
         """Return the retained guest and tools containers for this account."""
         record = await self._record()

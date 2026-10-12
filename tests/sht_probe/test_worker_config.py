@@ -9,6 +9,7 @@ import pytest
 
 from pixav.config import Settings
 from pixav.sht_probe.models import CrawlResult
+from pixav.sht_probe.source_session import SourceSessionRequiredError
 from pixav.sht_probe.worker import _seed_crawler_cookies, run_loop, run_once
 
 
@@ -142,6 +143,19 @@ async def test_crawl_cycle_timeout_records_distinct_metric() -> None:
 
     set_interval.assert_called_once_with(1)
     record_timeout.assert_called_once_with()
+
+
+async def test_session_challenge_stops_retry_and_marks_health_unready():
+    from pixav.shared.health import HealthState
+
+    state = HealthState("sht_probe")
+    with patch("pixav.sht_probe.worker.run_once", new_callable=AsyncMock) as once:
+        once.side_effect = SourceSessionRequiredError("USER_ACTION_REQUIRED")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(run_loop(Settings(), health_state=state), timeout=0.05)
+    assert once.await_count == 1
+    assert not state.ready
+    assert state.reason == "USER_ACTION_REQUIRED"
 
 
 def _empty_cycle_settings() -> Settings:

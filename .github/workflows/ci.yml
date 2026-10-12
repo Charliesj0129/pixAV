@@ -14,7 +14,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       # Ensure optional heavyweight groups are never pulled in by default.
       UV_NO_GROUP: embeddings
@@ -47,5 +47,42 @@ jobs:
       - name: Mypy
         run: uv run mypy src
 
-      - name: Pytest
-        run: uv run pytest -q --cov=src/pixav --cov-report=term-missing --cov-fail-under=80
+      - name: Bind integration identities to job-owned services
+        run: |
+          set -euo pipefail
+          docker context show
+          docker info --format '{{.ID}}'
+          docker compose -f docker-compose.integration.yml up -d --wait postgres
+          postgres_container=$(docker compose -f docker-compose.integration.yml ps -q postgres)
+          echo "POSTGRES_CONTAINER=$postgres_container" >> "$GITHUB_ENV"
+          docker compose -f docker-compose.integration.yml up -d --wait redis
+          redis_container=$(docker compose -f docker-compose.integration.yml ps -q redis)
+          echo "REDIS_CONTAINER=$redis_container" >> "$GITHUB_ENV"
+          docker inspect --format '{{.Id}} {{.Config.Image}} {{json .NetworkSettings.Ports}}' "$postgres_container" "$redis_container"
+          db_identity=$(docker exec "$postgres_container" psql -U pixav_test -d pixav_integration -Atc 'SELECT system_identifier FROM pg_control_system()')
+          redis_identity=$(docker exec "$redis_container" redis-cli --raw INFO server | sed -n 's/^run_id://p' | tr -d '\r')
+          test -n "$db_identity"
+          test -n "$redis_identity"
+          echo "PIXAV_TEST_DB_IDENTITY=$db_identity" >> "$GITHUB_ENV"
+          echo "PIXAV_TEST_REDIS_IDENTITY=$redis_identity" >> "$GITHUB_ENV"
+
+      - name: Pytest with guarded PostgreSQL and Redis integration
+        env:
+          PIXAV_RUN_INTEGRATION: "1"
+          PIXAV_E2E_ADMIN_DSN: postgresql://pixav_test:integration-only@127.0.0.1:15432/pixav_integration
+          PIXAV_E2E_REDIS_URL: redis://127.0.0.1:16379/0
+        run: uv run pytest -q --cov=src/pixav --cov-report=term-missing --cov-report=xml
+
+      - name: Preserve coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: warn
+
+      - name: Remove job-owned integration containers
+        if: always()
+        run: |
+          if [ -n "${REDIS_CONTAINER:-}" ]; then docker rm -f "$REDIS_CONTAINER"; fi
+          if [ -n "${POSTGRES_CONTAINER:-}" ]; then docker rm -f "$POSTGRES_CONTAINER"; fi

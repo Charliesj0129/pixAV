@@ -119,6 +119,8 @@ class _FakeConnection:
         self.updates: list[str] = []
 
     async def fetchval(self, sql: str, *args):
+        if "SELECT local_path FROM videos" in sql:
+            return self.path
         if "to_regclass" in sql:
             # Only the projection table these fakes can stand in for exists.
             # ``playable_assets`` and ``cleanup_authorizations`` answer absent,
@@ -127,6 +129,9 @@ class _FakeConnection:
         if "library_publications" in sql:
             return True
         return None
+
+    async def fetch(self, sql: str, *args):
+        return [{"video_id": self.video_id, "path": self.path}]
 
     async def fetchrow(self, sql: str, *args):
         if "cleanup_authorizations" in sql:
@@ -171,6 +176,8 @@ class _FakePool:
 def _janitor_pool(media, *, durable, open_work=False, reader=False, due=True, publications=False):
     conn = _FakeConnection(durable=durable, open_work=open_work, reader=reader, due=due, publications=publications)
     rows = [{"id": uuid.uuid4(), "local_path": str(media)}]
+    conn.video_id = rows[0]["id"]
+    conn.path = str(media)
     return _FakePool(rows, conn), conn
 
 

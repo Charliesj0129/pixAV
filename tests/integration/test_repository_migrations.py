@@ -1,6 +1,8 @@
 """Exercise real SQL, including expand/backfill and candidate lifecycle."""
 
+import os
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
@@ -9,6 +11,59 @@ from pixav.shared.repository import SourceCandidateRepository, VideoRepository
 from scripts.phase0_cohort import sample
 
 pytestmark = pytest.mark.integration
+
+
+async def runner_dsn(pool):
+    database = await pool.fetchval("SELECT current_database()")
+    endpoint = urlsplit(
+        os.getenv("PIXAV_E2E_ADMIN_DSN", "postgresql://pixav_test:integration-only@127.0.0.1:15432/pixav_integration")
+    )
+    return urlunsplit(endpoint._replace(path=f"/{database}"))
+
+
+async def test_migration_identity_mismatch_never_creates_ledger(integration_db, monkeypatch, tmp_path):
+    from pixav.shared.migrations import run_migrations
+
+    monkeypatch.setattr("pixav.shared.migrations.MIGRATIONS_DIR", tmp_path)
+    (tmp_path / "001_probe.sql").write_text("CREATE TABLE migration_probe(id integer);")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        await run_migrations(await runner_dsn(integration_db), expected_identity="wrong-instance")
+    assert await integration_db.fetchval("SELECT to_regclass('_migrations')") is None
+    assert await integration_db.fetchval("SELECT to_regclass('migration_probe')") is None
+
+
+async def test_runner_serializes_concurrent_deployments(integration_db, monkeypatch, tmp_path):
+    import asyncio
+
+    from pixav.shared.migrations import run_migrations
+
+    monkeypatch.setattr("pixav.shared.migrations.MIGRATIONS_DIR", tmp_path)
+    (tmp_path / "001_probe.sql").write_text("CREATE TABLE migration_probe(id integer); SELECT pg_sleep(0.2);")
+    dsn = await runner_dsn(integration_db)
+    results = await asyncio.gather(run_migrations(dsn), run_migrations(dsn))
+    assert sorted(results) == [[], ["001_probe.sql"]]
+    assert await integration_db.fetchval("SELECT count(*) FROM _migrations") == 1
+
+
+async def test_runner_rolls_back_sql_when_ledger_insert_fails(integration_db, monkeypatch, tmp_path):
+    import asyncpg
+
+    from pixav.shared.migrations import run_migrations
+
+    monkeypatch.setattr("pixav.shared.migrations.MIGRATIONS_DIR", tmp_path)
+    (tmp_path / "001_probe.sql").write_text("CREATE TABLE migration_probe(id integer);")
+    await integration_db.execute(
+        "CREATE TABLE _migrations(filename text PRIMARY KEY CHECK (filename = 'allowed'), "
+        "applied_at timestamptz NOT NULL DEFAULT now())"
+    )
+    dsn = await runner_dsn(integration_db)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await run_migrations(dsn)
+    assert await integration_db.fetchval("SELECT to_regclass('migration_probe')") is None
+    assert await integration_db.fetchval("SELECT count(*) FROM _migrations") == 0
+    # A failed deployment must also release session ownership for the retry.
+    await integration_db.execute("ALTER TABLE _migrations DROP CONSTRAINT _migrations_filename_check")
+    assert await run_migrations(dsn) == ["001_probe.sql"]
 
 
 async def migrate(pool, until=9):

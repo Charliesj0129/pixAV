@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 
 from pixav.shared.exceptions import CrawlError
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
+from pixav.sht_probe.source_session import SourceSession, SourceSessionRequiredError
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +29,20 @@ class HttpxCrawler:
         *,
         flaresolverr: FlareSolverrSession | None = None,
         timeout: int = 30,
+        user_agent: str = "Mozilla/5.0",
     ) -> None:
         self._flaresolverr = flaresolverr
         self._timeout = timeout
+        self._user_agent = user_agent
         self._cookies: dict[str, str] = {}
+        self._session: SourceSession | None = None
 
     def seed_cookies(self, cookies: dict[str, str]) -> None:
         """Seed the crawler cookie jar (e.g. from a browser session export)."""
         if cookies:
+            if isinstance(cookies, SourceSession):
+                self._session = cookies
+                return
             self._cookies.update(cookies)
 
     async def crawl(self, url: str, link_pattern: str | None = None) -> list[str]:
@@ -75,14 +82,17 @@ class HttpxCrawler:
                 timeout=self._timeout,
                 follow_redirects=True,
                 cookies=self._cookies,
-                headers={"User-Agent": "Mozilla/5.0"},  # Basic evasion
+                headers={"User-Agent": self._user_agent},
             ) as client:
-                resp = await client.get(url)
+                resp = await self._session.fetch(client, url) if self._session is not None else await client.get(url)
                 resp.raise_for_status()
                 # Update cookies if server sent new ones
-                self._cookies.update(resp.cookies)
+                if self._session is None:
+                    self._cookies.update(resp.cookies)
                 return resp.text
         except httpx.HTTPError as direct_err:
+            if self._session is not None:
+                raise SourceSessionRequiredError("USER_ACTION_REQUIRED: scoped source session fetch failed") from None
             logger.warning("direct fetch failed for %s: %s", url, direct_err)
             if self._flaresolverr is None:
                 raise CrawlError(f"direct fetch failed and no FlareSolverr configured: {direct_err}") from direct_err

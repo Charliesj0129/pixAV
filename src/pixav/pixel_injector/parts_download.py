@@ -7,17 +7,28 @@ publish a database row; the parent checks the report before committing readiness
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import signal
+import subprocess
 import sys
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pixav.media_loader.preparation import inspect_media
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary, sha256
 from pixav.pixel_injector.canary_download import OriginalMismatchError, copy_original
+from pixav.pixel_injector.photos_auth import (
+    AccountCookieSecret,
+    AccountSessionMismatchError,
+    AccountSessionRequiredError,
+    verify_browser_account,
+)
+from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT
 from pixav.shared.models import VideoPart
 from pixav.shared.storage_models import TransferableFile
 
@@ -52,9 +63,114 @@ def observed_media(path: Path) -> dict:
     return json.loads(asyncio.run(inspect_media(str(path))).model_dump_json())
 
 
-def download_original(part: TransferableFile, root: Path) -> dict:
+def decode_original(path: Path) -> None:
+    """Decode the complete provider original; diagnostics stay out of receipts."""
+    with tempfile.TemporaryFile() as errors:
+        result = subprocess.run(  # noqa: S603 - fixed image tool, argv only, verified local provider output
+            [
+                "/usr/bin/ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-threads",
+                "2",
+                "-i",
+                str(path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                # Preserve native frame timestamps, including VFR frames that
+                # would otherwise collide on the nominal frame-rate grid.
+                "-fps_mode:v",
+                "passthrough",
+                "-enc_time_base:v",
+                "-1",
+                "-f",
+                "null",
+                "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=errors,
+            timeout=21600,
+            check=False,
+        )
+        if result.returncode or errors.tell():
+            raise OriginalMismatchError("Photos original failed complete decoding")
+
+
+def _browser_original(
+    part: TransferableFile, temporary: Path, original: Path, auth: AccountCookieSecret | None
+) -> tuple[str, dict | None]:
     from playwright.sync_api import sync_playwright
 
+    account_binding = None
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(downloads_path=str(temporary))
+        try:
+            if auth is None:
+                page = browser.new_page(accept_downloads=True)
+            else:
+                context = browser.new_context(accept_downloads=True, locale="en-US")
+                context.add_cookies(auth.cookies)
+                page = context.new_page()
+                verify_browser_account(page, auth)
+            page.goto(part.share_url, wait_until="domcontentloaded", timeout=60000)
+            if auth is not None:
+                page.goto(
+                    page.url + ("&" if "?" in page.url else "?") + "hl=en",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+            videos = page.get_by_role("link", name=re.compile(r"^Video -"))
+            videos.first.wait_for(state="visible", timeout=30000)
+            if videos.count() != 1:
+                raise OriginalMismatchError("Photos album must contain exactly one video")
+            videos.click(timeout=30000)
+            # Wait for the viewer before opening its menu. During navigation
+            # the album's identically named menu still offers Download all.
+            page.get_by_role("button", name="Open info", exact=True).wait_for(state="visible", timeout=30000)
+            if auth is not None:
+                page.get_by_role("button", name="Open info", exact=True).click(timeout=30000)
+                filename = getattr(part, "provider_filename", part.filename)
+                page.get_by_text(filename, exact=True).wait_for(state="visible", timeout=30000)
+                account_binding = {
+                    "mode": "original-account",
+                    "account_id": str(auth.account_id),
+                    "owner": str(auth.owner),
+                    "account_email_sha256": auth.account_email_sha256,
+                    "session_id": str(uuid.uuid4()),
+                    "item_url_sha256": hashlib.sha256(page.url.encode()).hexdigest(),
+                    "provider_filename_sha256": hashlib.sha256(filename.encode()).hexdigest(),
+                    "original_sha256": part.sha256,
+                    "fresh_context": True,
+                    "cookie_only": True,
+                    "local_media_inputs": False,
+                }
+                page.get_by_role("button", name="Close info", exact=True).click(timeout=30000)
+            page.get_by_role("button", name="More options", exact=True).last.click(timeout=30000)
+            # The individual original action has been verified against full
+            # hashes. Download-all ZIP preparation can stall on a backed-up
+            # video; do not substitute the browser's playback rendition.
+            # Keep the start wait
+            # bounded separately from the six-hour process deadline.
+            with page.expect_download(timeout=600000) as pending:
+                page.get_by_role("menuitem", name=re.compile(r"^Download(?: - Shift\+D)?$")).click(timeout=30000)
+            download = pending.value
+            download.save_as(original)
+            if download.suggested_filename != getattr(part, "provider_filename", part.filename):
+                raise OriginalMismatchError("Photos original filename does not match provider identity")
+            version = browser.version
+        except Exception as error:
+            if auth is not None and type(error).__name__ == "TimeoutError":
+                raise AccountSessionRequiredError("authenticated Photos UI requires review") from None
+            raise
+        finally:
+            browser.close()
+    return version, account_binding
+
+
+def download_original(part: TransferableFile, root: Path, *, authentication: dict | None = None) -> dict:
     if not part.share_url or not part.share_url.startswith(
         ("https://photos.app.goo.gl/", "https://photos.google.com/")
     ):
@@ -62,6 +178,12 @@ def download_original(part: TransferableFile, root: Path) -> dict:
     destination = root / part.filename
     receipt = root / (part.filename + ".json")
     stray = root / (part.filename + ".part")
+    auth = AccountCookieSecret.model_validate(authentication) if authentication is not None else None
+    if auth is not None and getattr(part, "account_id", None) != auth.account_id:
+        raise AccountSessionMismatchError()
+    if auth is not None and any(p.exists() or p.is_symlink() for p in (destination, receipt, stray)):
+        raise ValueError("authenticated cold retrieval requires fresh inputs")
+    account_binding = None
     if destination.exists():
         contained_file(root, destination)
         if not receipt.is_file() or receipt.is_symlink():
@@ -95,34 +217,7 @@ def download_original(part: TransferableFile, root: Path) -> dict:
         # Playwright's click/download-event timeout does not bound.
         signal.alarm(21600)
         original = Path(temporary) / "original.mp4"
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(downloads_path=str(temporary))
-            try:
-                page = browser.new_page(accept_downloads=True)
-                page.goto(part.share_url, wait_until="domcontentloaded", timeout=60000)
-                videos = page.get_by_role("link", name=re.compile(r"^Video -"))
-                videos.first.wait_for(state="visible", timeout=30000)
-                if videos.count() != 1:
-                    raise OriginalMismatchError("Photos album must contain exactly one video")
-                videos.click(timeout=30000)
-                # Wait for the viewer before opening its menu. During navigation
-                # the album's identically named menu still offers Download all.
-                page.get_by_role("button", name="Open info", exact=True).wait_for(state="visible", timeout=30000)
-                page.get_by_role("button", name="More options", exact=True).last.click(timeout=30000)
-                # The individual original action has been verified against full
-                # hashes. Download-all ZIP preparation can stall on a backed-up
-                # video; do not substitute the browser's playback rendition.
-                # Keep the start wait
-                # bounded separately from the six-hour process deadline.
-                with page.expect_download(timeout=600000) as pending:
-                    page.get_by_role("menuitem", name=re.compile(r"^Download(?: - Shift\+D)?$")).click(timeout=30000)
-                download = pending.value
-                download.save_as(original)
-                if download.suggested_filename != getattr(part, "provider_filename", part.filename):
-                    raise OriginalMismatchError("Photos original filename does not match provider identity")
-                version = browser.version
-            finally:
-                browser.close()
+        version, account_binding = _browser_original(part, Path(temporary), original, auth)
         with contained_file(Path(temporary), original).open("rb") as stream:
             copy_original(stream, destination, part.size_bytes, part.sha256)
         signal.alarm(0)
@@ -135,6 +230,15 @@ def download_original(part: TransferableFile, root: Path) -> dict:
         "download_action": "single-video-original",
         "observed": observed_media(destination),
     }
+    if account_binding is not None:
+        decode_original(destination)
+        report.update(
+            receipt_version=AUTHENTICATED_RECEIPT,
+            authentication=account_binding,
+            cold_inputs="provider-only",
+            cold_mounts=["/work:rw"],
+            decode="PASS",
+        )
     # Crash after byte publication leaves an untrusted cached file, never inferred success.
     with receipt.open("x") as handle:
         json.dump(report, handle)

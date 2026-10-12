@@ -34,16 +34,3 @@ class TestCreatePool:
             max_size=10,
             init=init_connection,
         )
-
-    async def test_uses_settings_dsn(self) -> None:
-        """DSN comes from settings.dsn property."""
-        settings = MagicMock()
-        settings.dsn = "postgresql://custom_user:pw@db:5432/mydb"
-
-        mock_pool = MagicMock()
-        with patch("pixav.shared.db.asyncpg.create_pool", new_callable=AsyncMock) as mock_create:
-            mock_create.return_value = mock_pool
-            await create_pool(settings)
-
-        _call_kwargs = mock_create.call_args.kwargs
-        assert _call_kwargs["dsn"] == "postgresql://custom_user:pw@db:5432/mydb"

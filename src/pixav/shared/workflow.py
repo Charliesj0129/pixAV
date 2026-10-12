@@ -125,13 +125,19 @@ STORAGE_QUEUE = "pixav:storage-activity:v1"
 PLAYBACK_QUEUE = "pixav:playback-activity:v1"
 
 
-async def require_workflow_role(pool, role: Literal["pixav_execution_authority", "pixav_activity_worker"]) -> None:
+async def require_workflow_role(
+    pool, role: Literal["pixav_execution_authority", "pixav_activity_worker", "pixav_playback_reader"]
+) -> None:
     """Managed runtime refuses shared privileged logins; roles are provisioned separately."""
     valid = await pool.fetchval(
-        """SELECT NOT rolsuper AND pg_has_role(current_user,$1,'member')
-        AND ($1 <> 'pixav_activity_worker' OR NOT pg_has_role(current_user,'pixav_execution_authority','member'))
+        """SELECT NOT (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)
+        AND pg_has_role(current_user,$1,'member')
+        AND NOT EXISTS (
+            SELECT FROM pg_roles g WHERE g.rolname=ANY($2::text[]) AND g.rolname<>$1
+            AND pg_has_role(current_user,g.oid,'member'))
         FROM pg_roles WHERE rolname=current_user""",
         role,
+        ["pixav_execution_authority", "pixav_activity_worker", "pixav_playback_reader"],
     )
     if not valid:
         raise RuntimeError("managed workflow requires a dedicated non-superuser database role")

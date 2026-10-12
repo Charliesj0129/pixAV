@@ -2,9 +2,9 @@
 """Create the dedicated login roles the managed workflow refuses to run without.
 
 ``require_workflow_role`` rejects a superuser and rejects a login that is a
-member of both group roles, because the whole point of the split is that an
+member of multiple runtime group roles, because the whole point of the split is that an
 activity worker cannot advance an execution and the execution authority never
-touches a provider. Migration 012 creates the two NOLOGIN group roles; the
+touches a provider. Migrations 012 and 019 create the three NOLOGIN group roles; the
 logins that inherit them are deployment identities, not schema, so they live
 here instead of in a migration.
 
@@ -13,7 +13,8 @@ written to a file:
 
     PIXAV_AUTHORITY_ROLE_PASSWORD='...' \
     PIXAV_WORKER_ROLE_PASSWORD='...' \
-    uv run python scripts/provision_workflow_roles.py --apply
+    PIXAV_READER_ROLE_PASSWORD='...' \
+    uv run python scripts/provision_workflow_roles.py --apply --db-identity <system-id>
 
 The default is a dry run: it reports what would change and writes nothing.
 """
@@ -34,6 +35,7 @@ from pixav.shared.instance import database_identity
 ROLE_PLAN: tuple[tuple[str, str, str], ...] = (
     ("pixav_authority", "pixav_execution_authority", "PIXAV_AUTHORITY_ROLE_PASSWORD"),
     ("pixav_worker", "pixav_activity_worker", "PIXAV_WORKER_ROLE_PASSWORD"),
+    ("pixav_reader", "pixav_playback_reader", "PIXAV_READER_ROLE_PASSWORD"),
 )
 
 _SAFE_ROLE = re.compile(r"^[a-z][a-z0-9_]{2,62}$")
@@ -74,7 +76,9 @@ async def _provision(pool: Any, *, name: str, group: str, password: str, exists:
     """Create or align one login role and its single group membership."""
     async with pool.acquire() as connection, connection.transaction():
         verb = "ALTER" if exists else "CREATE"
-        await connection.execute(f"{verb} ROLE {_quote(name)} LOGIN INHERIT NOSUPERUSER")
+        await connection.execute(
+            f"{verb} ROLE {_quote(name)} LOGIN INHERIT NOSUPERUSER " "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
         # DDL cannot take a bind parameter, so the password becomes a quoted
         # literal. It is never logged or printed: only the role name is.
         await connection.execute(f"ALTER ROLE {_quote(name)} PASSWORD {_literal(password)}")
@@ -103,6 +107,9 @@ def _report(observed: dict[str, dict], *, applied: bool) -> None:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.apply and not args.db_identity:
+        print("refusing: --db-identity is required for role changes")
+        return 2
     settings = get_settings()
     pool = await create_pool(settings)
     try:
@@ -116,7 +123,7 @@ async def _run(args: argparse.Namespace) -> int:
         observed = await _observe(pool)
         missing_groups = [group for _, group, _ in ROLE_PLAN if group not in observed]
         if missing_groups:
-            print(f"refusing: apply migration 012 first; missing group role(s) {', '.join(missing_groups)}")
+            print(f"refusing: apply migrations through 019 first; missing group role(s) {', '.join(missing_groups)}")
             return 2
 
         # Read every password before writing anything, so a missing variable

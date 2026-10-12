@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import yaml
@@ -43,6 +43,27 @@ class UserActionRequiredError(CanaryBlockedError):
     """Device confirmation needed; caller persists this and retains the guest."""
 
 
+class UploadReviewRequiredError(CanaryBlockedError):
+    """Closed diagnostic codes; retain all unknown external effects."""
+
+    def __init__(
+        self,
+        code: Literal[
+            "GUEST_STAGE_HASH_MISMATCH", "PUBLISHED_COPY_HASH_MISMATCH", "WRONG_PROVIDER_ITEM", "REMOTE_OUTCOME_UNKNOWN"
+        ],
+        message: str,
+    ) -> None:
+        if code not in {
+            "GUEST_STAGE_HASH_MISMATCH",
+            "PUBLISHED_COPY_HASH_MISMATCH",
+            "WRONG_PROVIDER_ITEM",
+            "REMOTE_OUTCOME_UNKNOWN",
+        }:
+            raise ValueError("unsupported upload review classification")
+        super().__init__(message)
+        self.code = code
+
+
 class MaestroPartUploader:
     def __init__(
         self,
@@ -54,6 +75,8 @@ class MaestroPartUploader:
         save: Callable[[dict], Awaitable[None]],
         flows: Path,
         source_root: str = "/parts",
+        observation_clock: Callable[[], Awaitable[datetime]] | None = None,
+        observation_binding: dict | None = None,
     ) -> None:
         self.guest, self.runner, self.owner = guest, runner, owner
         self.part, self.recovery, self.save, self.flows = part, recovery, save, flows
@@ -61,6 +84,8 @@ class MaestroPartUploader:
         # single video's parts directly; the managed worker mounts a staging
         # root shared by every asset, so each asset addresses its own subtree.
         self.source_root = source_root.rstrip("/")
+        self.observation_clock = observation_clock
+        self.observation_binding = observation_binding
         self.backup_evidence: dict = {}
         self.check: Callable[[], None] | None = None
 
@@ -348,17 +373,32 @@ class MaestroPartUploader:
         await self.save(self.recovery)
 
     async def quota_observation(self) -> dict:
+        started = await self.observation_clock() if self.observation_clock is not None else None
         attrs = await self.attributes()
         values = {a.get(key, "") for a in attrs for key in ("text", "accessibilityText")}
         matches = [v for v in values if re.fullmatch(r"[0-9,.]+ MB of [0-9,.]+ GB", v)]
         if len(matches) != 1:
             raise CanaryBlockedError("account storage observation unavailable; UI review required")
-        return {
+        display = matches[0]
+        quantity = display.split(" MB", 1)[0]
+        decimals = len(quantity.rsplit(".", 1)[1]) if "." in quantity else 0
+        result = {
             "display": matches[0],
-            "display_resolution": "0.01 MB",
+            "display_resolution": ("0." + "0" * (decimals - 1) + "1" if decimals else "1") + " MB",
             "backup_complete": "Backup complete" in values,
             "collector": "Maestro hierarchy; account storage subtitle",
         }
+        if self.observation_clock is not None:
+            observed = await self.observation_clock()
+            if started is None or started.tzinfo is None or observed.tzinfo is None or observed < started:
+                raise CanaryBlockedError("database observation clock invalid; retain guest")
+            result.update(
+                observation_started_at=started.isoformat(),
+                observed_at=observed.isoformat(),
+                clock="postgresql",
+                binding=self.observation_binding,
+            )
+        return result
 
     async def push_file(self, session: RedroidSession, local_path: str) -> str:
         self.guard(session)
@@ -378,7 +418,9 @@ class MaestroPartUploader:
             await self.adb("push", self.source_root + "/" + self.part.filename, stage, timeout=21600)
         # An interrupted push may have left partial bytes. Never infer successful publication.
         if (await self.adb("shell", "sha256sum", stage, timeout=21600)).split()[0] != self.part.sha256:
-            raise CanaryBlockedError("guest stage hash mismatch; retained for reconciliation")
+            raise UploadReviewRequiredError(
+                "GUEST_STAGE_HASH_MISMATCH", "guest stage hash mismatch; retained for reconciliation"
+            )
         await self.receipt("push", complete=True)
         if not self.recovery.get("publish_intent"):
             self.recovery["publish_intent"] = True
@@ -386,7 +428,7 @@ class MaestroPartUploader:
             await self.adb("shell", "mkdir", "-p", "/sdcard/DCIM/Camera")
             await self.adb("shell", "cp", stage, remote, timeout=21600)
         if (await self.adb("shell", "sha256sum", remote, timeout=21600)).split()[0] != self.part.sha256:
-            raise CanaryBlockedError("published guest file hash mismatch")
+            raise UploadReviewRequiredError("PUBLISHED_COPY_HASH_MISMATCH", "published guest file hash mismatch")
         await self.receipt("publish", complete=True)
         await self._media_store(remote)
         return remote
@@ -514,7 +556,7 @@ class MaestroPartUploader:
             urls = set(re.findall(r"https://photos\.app\.goo\.gl/[A-Za-z0-9_-]+", text))
             return urls.pop() if len(urls) == 1 else None
 
-        return await asyncio.to_thread(read)
+        return await self._io(read)
 
 
 class MaestroPartVerifier:
@@ -525,6 +567,49 @@ class MaestroPartVerifier:
         install_http_url_log_redaction()
         self.uploader = uploader
 
+    async def share_selected_existing(self, session: RedroidSession, account: Account) -> tuple[str, dict]:
+        """Inspect the current exact item; never open a possibly corrupt local URI.
+
+        The operator-selected details screen is a prerequisite. Missing/stale
+        UI fails closed instead of searching, publishing, or submitting login.
+        """
+        upload = self.uploader
+        upload.guard(session)
+        accounts = await upload.adb("shell", "dumpsys", "account")
+        google_accounts = set(re.findall(r"Account \{name=([^,]+), type=com\.google\}", accounts))
+        if google_accounts != {account.email}:
+            raise UploadReviewRequiredError("WRONG_PROVIDER_ITEM", "existing item account is ambiguous")
+        saved = upload.recovery.get("existing_item_share")
+        if saved is None:
+            attrs = await upload.attributes()
+            filenames = {a.get("text", "") for a in attrs if re.fullmatch(r"pixav-.*\.mp4", a.get("text", ""))}
+            if filenames != {upload.part.filename}:
+                raise UploadReviewRequiredError("WRONG_PROVIDER_ITEM", "select exact existing item details")
+            video = next(s for s in upload.part.media_info["streams"] if s["codec_type"] == "video")
+            item = collect_item(attrs, upload.part.filename, {**video, "sha256": upload.part.sha256})
+            saved = {"account_id": str(account.id), "owner": upload.owner, "backup_evidence": item}
+            upload.recovery["existing_item_share"] = saved
+            await upload.save(upload.recovery)
+        item = saved["backup_evidence"]
+        if (
+            saved["account_id"] != str(account.id)
+            or saved["owner"] != upload.owner
+            or item.get("filename") != upload.part.filename
+            or item.get("source_sha256") != upload.part.sha256
+            or item.get("backed_up") is not True
+            or item.get("original_quality") is not True
+        ):
+            raise UploadReviewRequiredError("WRONG_PROVIDER_ITEM", "existing share identity changed")
+        # On a pre-link retry recheck the actual screen before touching its share
+        # sheet. After link_intent only the existing clipboard/link can be read.
+        if not upload.recovery.get("link_intent") and not upload.recovery.get("share_url"):
+            attrs = await upload.attributes()
+            filenames = {a.get("text", "") for a in attrs if re.fullmatch(r"pixav-.*\.mp4", a.get("text", ""))}
+            if filenames != {upload.part.filename}:
+                raise UploadReviewRequiredError("WRONG_PROVIDER_ITEM", "existing item selection changed")
+            collect_item(attrs, upload.part.filename, {**item, "sha256": upload.part.sha256})
+        return await self._share(), item
+
     async def wait_for_share_url(self, session: RedroidSession, timeout: int = 300) -> str:
         upload = self.uploader
         upload.guard(session)
@@ -534,7 +619,9 @@ class MaestroPartVerifier:
             attrs = await upload.attributes()
             filenames = {a.get("text", "") for a in attrs if re.fullmatch(r"pixav-.*\.mp4", a.get("text", ""))}
             if filenames and filenames != {upload.part.filename}:
-                raise CanaryBlockedError("Photos item identity mismatch; reconcile retained upload before resuming")
+                raise UploadReviewRequiredError(
+                    "WRONG_PROVIDER_ITEM", "Photos item identity mismatch; reconcile retained upload before resuming"
+                )
             streams = upload.part.media_info["streams"]
             video = next(s for s in streams if s["codec_type"] == "video")
             try:

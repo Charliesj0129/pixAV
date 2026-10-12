@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 from pixav.shared.metrics import record_watermark_rejected
 from pixav.sht_probe.flaresolverr_client import FlareSolverrSession
 from pixav.sht_probe.models import MagnetCandidate
+from pixav.sht_probe.source_session import SourceSession, SourceSessionRequiredError
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +82,16 @@ class SehuatangCrawler:
         request_delay_seconds: float = 2.0,
         max_board_pages: int = 1,
         board_fetch_concurrency: int = 3,
+        user_agent: str = _USER_AGENT_FALLBACK,
     ) -> None:
         self._flaresolverr = flaresolverr
         self._timeout = timeout
         self._delay = request_delay_seconds
         self._max_board_pages = max_board_pages
         self._board_fetch_concurrency = max(1, board_fetch_concurrency)
-        self._user_agent = _USER_AGENT_FALLBACK
+        self._user_agent = user_agent
         self._cookies: dict[str, str] = {}
+        self._session: SourceSession | None = None
         self._page_cache: dict[str, str] = {}
         self._client: httpx.AsyncClient | None = None
         self._client_lock = asyncio.Lock()
@@ -101,6 +104,9 @@ class SehuatangCrawler:
     def seed_cookies(self, cookies: dict[str, str]) -> None:
         """Seed the crawler cookie jar from an external source."""
         if cookies:
+            if isinstance(cookies, SourceSession):
+                self._session = cookies
+                return
             self._cookies.update(cookies)
             if self._client is not None:
                 self._client.cookies.update(cookies)
@@ -144,9 +150,9 @@ class SehuatangCrawler:
             client = await self._get_client()
             if self._cookies:
                 client.cookies.update(self._cookies)
-            response = await client.get(url)
+            response = await self._session.fetch(client, url) if self._session is not None else await client.get(url)
             response.raise_for_status()
-            if response.cookies:
+            if response.cookies and self._session is None:
                 self._cookies.update(dict(response.cookies.items()))
             if self._client is not None and self._cookies:
                 self._client.cookies.update(self._cookies)
@@ -170,6 +176,10 @@ class SehuatangCrawler:
 
     async def _fetch_via_flaresolverr(self, url: str) -> str:
         """Fetch via FlareSolverr and merge returned cookies / user-agent."""
+        if self._session is not None:
+            raise SourceSessionRequiredError(
+                "USER_ACTION_REQUIRED: authenticated browser fallback requires verified redirect isolation"
+            )
         result = await self._flaresolverr.get_html(
             url,
             timeout=self._timeout,
@@ -445,7 +455,8 @@ class SehuatangExtractor:
         """Attach the Discuz thread title to every magnet, including bare hashes."""
         magnets = await self.extract(html)
         title = self.extract_title(html)
-        return [MagnetCandidate(uri=uri, title=title, source_url=source_url) for uri in magnets]
+        size_bytes = self.parse_size_bytes(self._post_body_text(html))
+        return [MagnetCandidate(uri=uri, title=title, source_url=source_url, size_bytes=size_bytes) for uri in magnets]
 
     @staticmethod
     def parse_size_bytes(text: str) -> int:

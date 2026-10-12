@@ -184,6 +184,85 @@ async def test_download_failure_retries_without_touching_the_remote_asset_bdd_08
     assert await workflow.pool.fetchval("SELECT state FROM remote_assets") == "DURABLE"
 
 
+async def held_unclaimed_preparation(workflow):
+    await durable_video(workflow.pool)
+    await workflow.playback.open_due()
+    request = await workflow.next_activity()
+    await workflow.pool.execute(
+        """UPDATE executions SET state='USER_ACTION_REQUIRED',error_code='ACTIVITY_LEASE_EXPIRED',
+        recovery_count=3,infrastructure_retries=1,owner=NULL,lease_until=NULL WHERE id=$1""",
+        request.execution_id,
+    )
+    return request
+
+
+async def test_resume_unclaimed_preparation_keeps_the_operation_history_and_retry_counts(workflow):
+    request = await held_unclaimed_preparation(workflow)
+    assert await workflow.playback.resume_unclaimed_preparation(
+        request.execution_id,
+        generation=request.generation,
+        operator="synthetic operator",
+        reason="transport repaired; no cache effect",
+        review_sha256="a" * 64,
+    )
+    row = await workflow.pool.fetchrow("SELECT * FROM executions WHERE id=$1", request.execution_id)
+    assert row["recovery_count"] == 3 and row["infrastructure_retries"] == 1
+    assert row["generation"] == request.generation + 1
+    audit = json.loads(row["checkpoint"])["transport_resumes"]
+    assert audit[0]["review_sha256"] == "a" * 64
+    next_request = await workflow.next_activity()
+    assert next_request.operation_id == request.operation_id
+    assert next_request.execution_id == request.execution_id
+
+
+async def test_missing_playback_transport_never_claims_or_strands_an_execution(workflow):
+    await durable_video(workflow.pool)
+    opened = await workflow.playback.open_due()
+
+    class Queue:
+        def __init__(self):
+            self.messages = []
+
+        async def push(self, payload):
+            self.messages.append(payload)
+
+    media, playback = Queue(), Queue()
+    assert await workflow.tick(media) == 0
+    row = await workflow.pool.fetchrow("SELECT * FROM executions WHERE id=$1", opened[0])
+    assert row["state"] == "READY" and row["generation"] == 0 and row["lease_until"] is None
+    assert await workflow.tick(media, playback_queue=playback) == 1
+    assert len(playback.messages) == 1 and playback.messages[0]["stage"] == "playback"
+    assert not media.messages
+
+
+@pytest.mark.parametrize("fault", ["generation", "claimed", "pending", "not_durable", "missing_segment", "stage"])
+async def test_resume_refuses_unresolved_or_changed_preparation(workflow, fault):
+    request = await held_unclaimed_preparation(workflow)
+    if fault == "claimed":
+        await workflow.pool.execute("UPDATE activity_attempts SET worker_token=$1", uuid.uuid4())
+    elif fault == "pending":
+        await workflow.pool.execute(
+            "INSERT INTO activity_results(attempt_id,payload) VALUES($1,'{}')", request.attempt_id
+        )
+    elif fault == "not_durable":
+        await workflow.pool.execute("UPDATE remote_assets SET state='VERIFIED',durable_at=NULL")
+    elif fault == "missing_segment":
+        await workflow.pool.execute("DELETE FROM remote_asset_segments")
+    elif fault == "stage":
+        await workflow.pool.execute("UPDATE executions SET stage='verify' WHERE id=$1", request.execution_id)
+    with pytest.raises(ValueError):
+        await workflow.playback.resume_unclaimed_preparation(
+            request.execution_id,
+            generation=request.generation + (1 if fault == "generation" else 0),
+            operator="synthetic operator",
+            reason="synthetic review",
+            review_sha256="a" * 64,
+        )
+    assert await workflow.pool.fetchval("SELECT state FROM executions WHERE id=$1", request.execution_id) == (
+        "USER_ACTION_REQUIRED"
+    )
+
+
 async def test_cache_demand_opens_one_rebuild_that_must_reproduce_the_bytes_bdd_081(workflow):
     video, _ = await ready(workflow)
     row = (await playable(workflow, video))[0]
@@ -334,3 +413,18 @@ async def test_authority_role_can_run_the_playback_transitions(workflow):
         assert await authority.playback.observe() == {"READY": 1}
     finally:
         await pool.close()
+
+
+async def test_expired_account_session_blocks_playback_without_retry_or_invalidation(workflow):
+    """BDD-078/125: session recovery belongs to the operator, not a timer."""
+    video, asset = await durable_video(workflow.pool)
+    await workflow.playback.open_due()
+    request = await workflow.next_activity()
+    await report(workflow, request, outcome="user_action", error_code="PHOTOS_ACCOUNT_SESSION_REQUIRED")
+    execution = await workflow.pool.fetchrow("SELECT * FROM executions WHERE id=$1", request.execution_id)
+    assert execution["state"] == "USER_ACTION_REQUIRED"
+    assert execution["blocked_reason"] == "PHOTOS_ACCOUNT_SESSION_REQUIRED"
+    assert execution["owner"] is None
+    assert (await playable(workflow, video))[0]["state"] == "PREPARING"
+    assert await workflow.pool.fetchval("SELECT state FROM remote_assets WHERE id=$1", asset) == "DURABLE"
+    assert await workflow.next_activity() is None

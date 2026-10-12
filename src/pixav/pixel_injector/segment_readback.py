@@ -1,8 +1,8 @@
 """Cold read-back of one managed segment, in a process that has nothing else.
 
 This module is the entry point of the read-back container. Its whole purpose is
-what it cannot reach: the container mounts ``/work`` and a read-only copy of the
-source tree, and nothing else — no staging root, no guest ``/data``, no database
+what it cannot reach: the container runs image code and mounts only ``/work``
+— no staging root, no guest ``/data``, no database
 credential, no queue. The bytes it reports on can therefore only have come from
 the provider, which is what ``cold_inputs: provider-only`` claims.
 
@@ -31,7 +31,14 @@ def read_back(manifest: dict, root: Path) -> dict:
         raise ValueError("nothing to read back: the segment has no share location")
     if root.is_symlink() or not root.is_dir():
         raise ValueError("read-back root must be a real directory")
-    return {**download_original(segment, root), "cold_inputs": "provider-only"}
+    authentication = manifest.get("authentication")
+    if authentication is not None:
+        if segment.local_path or any(root.iterdir()):
+            raise ValueError("authenticated read-back requires an empty workspace and no local inputs")
+        receipt = download_original(segment, root, authentication=authentication)
+    else:
+        receipt = download_original(segment, root)
+    return {**receipt, "cold_inputs": "provider-only"}
 
 
 def main() -> int:

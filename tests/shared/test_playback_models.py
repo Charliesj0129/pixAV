@@ -161,3 +161,14 @@ def test_cache_object_is_named_by_identity_only():
 
     assert asset.cache_name == cache_object_name(asset.id) == f"{asset.id}.mp4"
     assert asset.state == "PREPARING"
+
+
+def test_parsed_receipt_cannot_drop_unknown_authentication_version():
+    from pixav.shared.playback_models import parse_receipt
+
+    whole = segment(0, 0.0, 20.0, "a" * 64, size=4096)
+    report = receipt([whole], 4096, "a" * 64)
+    report["segments"][0]["receipt_version"] = "unsupported-account-contract"
+    parsed = parse_receipt(report)
+    with pytest.raises(IntegrityError, match="account receipt"):
+        validate_materialization(WHOLE, [whole], parsed)

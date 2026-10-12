@@ -7,11 +7,12 @@ and is not implied by anything asserted here.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 import pytest
 
-from pixav.pixel_injector.maestro_parts import UserActionRequiredError
+from pixav.pixel_injector.maestro_parts import UploadReviewRequiredError, UserActionRequiredError
 from pixav.pixel_injector.photos_storage import MaestroSegmentUploader
 from pixav.pixel_injector.storage_activity import QuotaExhaustedError, StorageActivityWorker
 from pixav.shared.exceptions import UploadError
@@ -167,6 +168,97 @@ async def test_login_challenge_stops_automatic_submission_bdd_045():
     result = await activity.execute(request(), uuid.uuid4())
     assert result.outcome == "user_action"
     assert result.error_code == "USER_ACTION_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["GUEST_STAGE_HASH_MISMATCH", "PUBLISHED_COPY_HASH_MISMATCH", "WRONG_PROVIDER_ITEM", "REMOTE_OUTCOME_UNKNOWN"],
+)
+async def test_upload_review_codes_are_fixed_and_do_not_expose_private_exception(code):
+    activity = worker(FakePool(segment_row()), uploader=Uploader(UploadReviewRequiredError(code, "private detail")))
+    result = await activity.execute(request(), uuid.uuid4())
+    assert result.outcome == "user_action" and result.error_code == code
+    assert "private detail" not in result.model_dump_json()
+
+
+def accepted_original_review(req, row):
+    from pixav.shared.upload_outcome_review import recovery_digest
+
+    evidence = {
+        "version": "upload-outcome-review-v1",
+        "outcome": "EXISTING_ORIGINAL",
+        "database_identity": "synthetic",
+        "database": "synthetic",
+        "account_id": str(req.account_id),
+        "guest_owner": "synthetic",
+        "profile": "gphotos_pixel_xl_v1",
+        "execution_id": str(req.execution_id),
+        "operation_id": str(req.operation_id),
+        "asset_id": str(req.asset_id),
+        "segment_index": req.segment_index,
+        "generation": req.generation - 1,
+        "segment_sha256": row["sha256"],
+        "recovery_sha256": recovery_digest(row["recovery"]),
+        "artifact_sha256": "f" * 64,
+        "observed_at": "2026-01-01T00:00:00Z",
+        "provider_completed_after": "2025-12-31T23:00:00Z",
+        "provider_completed_before": "2026-01-01T00:00:00Z",
+        "share_url": SHARE,
+        "backup_evidence": BACKUP_EVIDENCE,
+        "cold_readback": readback_receipt(),
+    }
+    return {"status": "ACCEPTED", "confirmed_at": "2026-01-01T00:01:00Z", "evidence": evidence}
+
+
+def existing_original_receipt(req, **changes):
+    return readback_receipt(
+        provider_asset_id=str(req.asset_id),
+        provider_segment_index=req.segment_index,
+        provider_share_sha256=hashlib.sha256(SHARE.encode()).hexdigest(),
+        cold_inputs="provider-only",
+        cold_mounts=["/work:rw"],
+        **changes,
+    )
+
+
+async def test_original_upload_review_reads_fresh_cold_without_calling_uploader():
+    req = request(generation=2)
+    row = segment_row(account_id=req.account_id, recovery={"publish_intent": True, "push_intent": True})
+    row["recovery"]["upload_outcome_review"] = accepted_original_review(req, row)
+    pool = FakePool(row)
+    activity = worker(
+        pool, uploader=Uploader(AssertionError("must never upload")), readback=Readback(existing_original_receipt(req))
+    )
+    result = await activity.execute(req, uuid.uuid4())
+    assert result.outcome == "success"
+    assert result.share_url == SHARE
+    assert result.evidence["upload_outcome_review"]["cold_readback"]["sha256"] == row["sha256"]
+    assert result.evidence["upload_outcome_review"]["provider_completed_after"] == "2025-12-31T23:00:00+00:00"
+
+
+@pytest.mark.parametrize("defect", ["operation", "generation", "account", "recovery", "hash"])
+async def test_original_upload_review_cannot_fall_back_to_upload_on_mismatch(defect):
+    req = request(generation=2)
+    row = segment_row(account_id=req.account_id, recovery={"publish_intent": True})
+    stored = accepted_original_review(req, row)
+    row["recovery"]["upload_outcome_review"] = stored
+    if defect == "operation":
+        stored["evidence"]["operation_id"] = str(uuid.uuid4())
+    elif defect == "generation":
+        stored["evidence"]["generation"] = req.generation
+    elif defect == "account":
+        stored["evidence"]["account_id"] = str(uuid.uuid4())
+    elif defect == "recovery":
+        row["recovery"]["backup_intent"] = True
+    got = (
+        Readback(existing_original_receipt(req, sha256="0" * 64))
+        if defect == "hash"
+        else Readback(existing_original_receipt(req))
+    )
+    result = await worker(FakePool(row), uploader=Uploader(AssertionError("must never upload")), readback=got).execute(
+        req, uuid.uuid4()
+    )
+    assert result.outcome in ("user_action", "verification_failed")
 
 
 async def test_quota_exhaustion_is_distinguished_from_failure_bdd_039_124():
@@ -425,3 +517,53 @@ async def test_readonly_dependency_failure_is_retryable_not_remote_loss(error):
     )
     assert result.outcome == "infrastructure"
     assert result.evidence == {"readback_dependency": error}
+
+
+def accepted_share_review(req, row):
+    import copy
+
+    stored = accepted_original_review(req, row)
+    evidence = stored["evidence"]
+    for key in ("share_url", "backup_evidence", "cold_readback"):
+        evidence.pop(key)
+    evidence.update(
+        version="upload-outcome-review-v2",
+        outcome="EXISTING_ITEM_REQUIRES_COLD",
+        filename=RemoteAssetSegment.model_validate(row).filename,
+        same_account_confirmed=True,
+        backed_up=True,
+        original_quality=True,
+    )
+    stored["recovery_before"] = copy.deepcopy(row["recovery"])
+    return stored
+
+
+@pytest.mark.parametrize("defect", [None, "hash", "mounts", "original_intent", "extra_push", "share_failure"])
+async def test_existing_item_share_never_uploads_and_requires_new_cold_bytes(defect):
+    from unittest.mock import AsyncMock
+
+    req = request(generation=2)
+    row = segment_row(account_id=req.account_id, recovery={"publish_intent": True, "push_intent": True})
+    row["recovery"]["upload_outcome_review"] = accepted_share_review(req, row)
+    if defect == "original_intent":
+        row["recovery"]["publish_intent"] = False
+    if defect == "extra_push":
+        row["recovery"]["operations"] = {"push": {"intent_at": "unexpected"}}
+    upload = Uploader(AssertionError("must never upload"))
+    upload.share_existing = AsyncMock(return_value=(SHARE, BACKUP_EVIDENCE))
+    if defect == "share_failure":
+        upload.share_existing.side_effect = UserActionRequiredError("selected details missing")
+    receipt = existing_original_receipt(req)
+    if defect == "hash":
+        receipt["sha256"] = "0" * 64
+    if defect == "mounts":
+        receipt["cold_mounts"] = ["/staging:ro", "/work:rw"]
+    readback = Readback(receipt)
+    result = await worker(FakePool(row), uploader=upload, readback=readback).execute(req, uuid.uuid4())
+    assert result.outcome == (
+        "success" if defect is None else ("verification_failed" if defect in ("hash", "mounts") else "user_action")
+    )
+    if defect in ("original_intent", "extra_push"):
+        upload.share_existing.assert_not_awaited()
+    else:
+        upload.share_existing.assert_awaited_once()

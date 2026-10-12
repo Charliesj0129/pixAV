@@ -11,6 +11,22 @@ from httpx import ASGITransport, AsyncClient
 from pixav.strm_resolver.app import create_app, lifespan
 
 
+@pytest.mark.asyncio
+async def test_reader_role_refusal_closes_startup_resources():
+    app = create_app(redis_url=None, db_dsn="postgresql://synthetic")
+    app.state.require_reader_role = True
+    pool = AsyncMock()
+    with (
+        patch("pixav.strm_resolver.app._open_database", return_value=pool),
+        patch("pixav.strm_resolver.app.require_workflow_role", side_effect=RuntimeError("dedicated role required")),
+    ):
+        with pytest.raises(RuntimeError, match="dedicated"):
+            async with lifespan(app):
+                pytest.fail("a privileged resolver must never start")
+    pool.close.assert_awaited_once()
+    assert app.state.db_pool is None
+
+
 @pytest.fixture
 def app():
     """Create a test FastAPI application."""

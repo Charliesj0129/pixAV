@@ -94,6 +94,9 @@ def parse_cookie_file(path: Path) -> dict[str, str]:
     # Netscape cookie format: domain\tflag\tpath\tsecure\texpiry\tname\tvalue
     for raw_line in text.splitlines():
         line = raw_line.strip()
+        if line.startswith("#HttpOnly_"):
+            raw_line = line.removeprefix("#HttpOnly_")
+            line = raw_line
         if not line or line.startswith("#"):
             continue
 

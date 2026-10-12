@@ -245,3 +245,36 @@ async def test_scheduling_summary_separates_waiting_from_running():
         "download": {"count": 2, "max_due_wait_seconds": 12.0},
         "prepare": {"count": 1, "max_due_wait_seconds": 4.0},
     }
+
+
+def test_continuous_quota_window_requires_samples_and_resets_on_fifteen_minute_gap():
+    from scripts.phase0_cohort import continuous_observation
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    points = [{"at": (start + timedelta(minutes=10 * i)).isoformat()} for i in range(145)]
+    assert not continuous_observation([], start.isoformat())["continuous_observation_at_least_24h"]
+    assert not continuous_observation(points, None)["continuous_observation_at_least_24h"]
+    assert continuous_observation(points, start.isoformat())["continuous_observation_at_least_24h"]
+    interrupted = [point for i, point in enumerate(points) if i != 100]
+    report = continuous_observation(interrupted, start.isoformat())
+    assert not report["continuous_observation_at_least_24h"]
+    assert report["continuous_observation_seconds"] == 43 * 600
+    assert report["observation_interruptions"][0]["gap_seconds"] == 1200
+    assert not continuous_observation(points, (start + timedelta(minutes=1)).isoformat())[
+        "continuous_observation_at_least_24h"
+    ]
+
+
+def test_continuous_window_keeps_interruptions_after_a_new_successful_window():
+    from scripts.phase0_cohort import continuous_observation
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    points = [{"at": start.isoformat()}]
+    points.extend({"at": (start + timedelta(hours=2, minutes=10 * i)).isoformat()} for i in range(145))
+    report = continuous_observation(points, start.isoformat())
+    assert report["continuous_observation_at_least_24h"]
+    assert len(report["observation_interruptions"]) == 1
+    with pytest.raises(ValueError, match="distinct"):
+        continuous_observation([points[0], points[0]], start.isoformat())
+    with pytest.raises(ValueError, match="newer"):
+        continuous_observation(points, (start + timedelta(days=2)).isoformat())

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from html import unescape
 from typing import cast
 
 from bs4 import BeautifulSoup
@@ -46,7 +47,7 @@ class BeautifulSoupExtractor:
 
         # 2. Regex fallback: catch magnets embedded in JS or other contexts
         for match in _MAGNET_RE.finditer(html):
-            magnets.add(match.group(0))
+            magnets.add(unescape(match.group(0)))
 
         logger.debug("extracted %d magnet(s)", len(magnets))
         return list(magnets)

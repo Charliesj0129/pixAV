@@ -196,7 +196,9 @@ class MediaWorkflow:
             )
             return new_id
 
-    async def next_activity(self, *, download_paused: bool = False) -> ActivityRequest | None:
+    async def next_activity(
+        self, *, download_paused: bool = False, available_stages: tuple[str, ...] | None = None
+    ) -> ActivityRequest | None:
         """DB clock, row locking, durable operation intent precede Redis dispatch."""
         async with self.pool.acquire() as conn, conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(721034001)")
@@ -205,6 +207,7 @@ class MediaWorkflow:
                 JOIN workflow_tasks t ON t.task_id=e.task_id
                 WHERE e.state IN ('READY','WAITING_RETRY','WAITING_QUOTA') AND e.due_at <= now()
                 AND (NOT $1::boolean OR e.stage <> 'download')
+                AND ($2::text[] IS NULL OR e.stage=ANY($2::text[]))
                 AND NOT EXISTS (SELECT FROM executions active WHERE active.state='RUNNING' AND active.stage=e.stage)
                 ORDER BY CASE
                     WHEN e.stage <> 'download' THEN 0
@@ -226,6 +229,7 @@ class MediaWorkflow:
                 END,e.due_at,e.created_at,e.id
                 LIMIT 1 FOR UPDATE OF e SKIP LOCKED""",
                 download_paused,
+                list(available_stages) if available_stages is not None else None,
             )
             if execution is None:
                 return None
@@ -678,6 +682,108 @@ class MediaWorkflow:
             )
             return True
 
+    async def revalidate_preparation(
+        self,
+        execution_id: UUID,
+        *,
+        operator: str,
+        reason: str,
+        validator_revision: str,
+        download_root: Path,
+        preparation_root: Path,
+    ) -> bool:
+        """Reassess a diagnosed preparation-validator fault under the same intent.
+
+        This never accepts media or creates a download. The normal activity must
+        validate the retained input and intent again. Remote facts, missing
+        download provenance or changed input bytes prevent this operator action;
+        historical failures and the attempt budget remain intact.
+        """
+        from pixav.media_loader.preparation import PreparedArtifact
+        from pixav.media_loader.video_parts import contained_file
+
+        if not operator.strip() or not reason.strip() or not _SHA256.fullmatch(validator_revision):
+            raise ValueError("revalidation requires operator, reason and validator revision SHA-256")
+        async with self.pool.acquire() as conn, conn.transaction():
+            execution = await conn.fetchrow(
+                """SELECT e.*,w.video_id FROM executions e JOIN workflow_tasks w ON w.task_id=e.task_id
+                WHERE e.id=$1 FOR UPDATE OF e""",
+                execution_id,
+            )
+            if execution is None or (execution["stage"], execution["state"], execution["failure_class"]) != (
+                "prepare",
+                "FAILED",
+                "invalid_media",
+            ):
+                raise ValueError("only a FAILED invalid-media preparation may be revalidated")
+            checkpoint = json.loads(execution["checkpoint"])
+            operation = await conn.fetchrow(
+                "SELECT id,identity FROM operation_intents WHERE execution_id=$1 AND stage='prepare'",
+                execution_id,
+            )
+            if operation is None or operation["identity"] != checkpoint.get("download_operation"):
+                raise ValueError("preparation intent is not bound to the completed download")
+            if not await conn.fetchval(
+                """SELECT EXISTS(SELECT FROM workflow_artifacts a JOIN operation_intents o ON o.id=a.operation_id
+                WHERE a.execution_id=$1 AND o.execution_id=$1 AND o.stage='download'
+                AND o.id::text=$2 AND a.path=$3 AND o.identity !~ '^operator-supplied:')""",
+                execution_id,
+                operation["identity"],
+                checkpoint.get("download_path"),
+            ):
+                raise ValueError("completed native download evidence required")
+            if await conn.fetchval(
+                """SELECT EXISTS(SELECT FROM remote_assets WHERE video_id=$1)
+                OR EXISTS(SELECT FROM storage_handoffs WHERE execution_id=$2)
+                OR EXISTS(SELECT FROM executions WHERE task_id=$3 AND id<>$2
+                    AND state NOT IN ('FAILED','CANCELLED','SUCCEEDED'))""",
+                execution["video_id"],
+                execution_id,
+                execution["task_id"],
+            ):
+                raise ValueError("remote facts or another active execution prevent preparation revalidation")
+            intent = contained_file(
+                preparation_root, preparation_root / str(operation["id"]) / "segments" / "segment.intent.json"
+            )
+            intent_bytes = intent.read_bytes()
+            document = json.loads(intent_bytes)
+            previous = PreparedArtifact.model_validate(document["artifact"])
+            if (
+                document["identity"] != str(operation["id"])
+                or previous.input_path != checkpoint["download_path"]
+                or previous.input_facts is None
+                or previous.input_facts.sha256 != previous.input_sha256
+            ):
+                raise ValueError("retained preparation intent differs from the completed download")
+            source = contained_file(download_root, Path(previous.input_path))
+            if (
+                source.stat().st_size != previous.input_facts.size_bytes
+                or (await asyncio.to_thread(_file_sha256, source)) != previous.input_sha256
+            ):
+                raise ValueError("retained preparation input changed")
+            observed_at = await conn.fetchval("SELECT clock_timestamp()")
+            checkpoint.setdefault("preparation_revalidation", []).append(
+                {
+                    "operator": operator,
+                    "reason": reason,
+                    "validator_revision": validator_revision,
+                    "at": observed_at.isoformat(),
+                    "prior_generation": execution["generation"],
+                    "prior_error_code": execution["error_code"],
+                    "input_sha256": previous.input_sha256,
+                    "intent_sha256": hashlib.sha256(intent_bytes).hexdigest(),
+                    "prepare_operation_id": str(operation["id"]),
+                }
+            )
+            await conn.execute(
+                """UPDATE executions SET state='READY',due_at=now(),generation=generation+1,
+                failure_class=NULL,error_code=NULL,blocked_reason=NULL,owner=NULL,lease_until=NULL,
+                checkpoint=$2::jsonb,updated_at=now() WHERE id=$1""",
+                execution_id,
+                json.dumps(checkpoint),
+            )
+            return True
+
     async def inspect(self, execution_id: UUID) -> Execution | None:
         """Expose task/attempt history and classifications, never raw payloads."""
         async with self.pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
@@ -773,7 +879,14 @@ class MediaWorkflow:
     async def tick(self, queue, *, download_paused: bool = False, storage_queue=None, playback_queue=None) -> int:
         await self.consume_results()
         await self.recover_expired()
-        request = await self.next_activity(download_paused=download_paused)
+        if storage_queue is not None:
+            await self.storage.consume_upload_reviews()
+        stages: tuple[str, ...] = ("download", "prepare")
+        if storage_queue is not None:
+            stages += ("upload", "verify")
+        if playback_queue is not None:
+            stages += ("playback",)
+        request = await self.next_activity(download_paused=download_paused, available_stages=stages)
         if request is None:
             return 0
         target = {"upload": storage_queue, "verify": storage_queue, "playback": playback_queue}.get(

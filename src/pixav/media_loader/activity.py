@@ -23,6 +23,16 @@ from pixav.shared.workflow import ActivityRequest, ActivityResult
 logger = logging.getLogger(__name__)
 
 
+def _completed_media_input(path: str) -> str:
+    artifact = Path(path)
+    if not artifact.is_symlink() and not artifact.exists():
+        # Torrent completion cannot establish visibility in the worker mount.
+        # Preserve the operation for bounded dependency retry, without cooling
+        # down a source whose bytes have not yet been inspected.
+        raise MediaDependencyError("completed torrent artifact is not visible to the worker")
+    return select_media_input(path)
+
+
 class MediaActivityWorker:
     def __init__(
         self,
@@ -57,7 +67,7 @@ class MediaActivityWorker:
                     **fields,
                     outcome="success",
                     download=observation,
-                    artifact_path=select_media_input(observation.artifact_path),
+                    artifact_path=_completed_media_input(observation.artifact_path),
                 )
             if not request.input_path:
                 raise RemuxError("missing downloaded artifact")
@@ -112,6 +122,7 @@ class MediaActivityWorker:
             return True
         import json
 
+        checkpoint = json.loads(row["checkpoint"])
         expected = (
             row["task_id"],
             row["owner"],
@@ -119,7 +130,7 @@ class MediaActivityWorker:
             row["stage"],
             row["operation_id"],
             row["identity"],
-            json.loads(row["checkpoint"]).get("download_path"),
+            checkpoint.get("download_path"),
         )
         observed = (
             request.task_id,
@@ -138,14 +149,20 @@ class MediaActivityWorker:
         if not await self.pool.fetchval("SELECT claim_activity($1,$2)", request.attempt_id, token):
             await queue.ack(receipt)
             return True
-        await self._run_claimed(request, token, queue, receipt)
+        revisions = checkpoint.get("preparation_revalidation", [])
+        expected_input = revisions[-1]["input_sha256"] if revisions else None
+        await self._run_claimed(request, token, queue, receipt, expected_input_sha256=expected_input)
         return True
 
-    async def _run_claimed(self, request, token, queue, receipt) -> None:
+    async def _run_claimed(self, request, token, queue, receipt, *, expected_input_sha256=None) -> None:
         running = asyncio.create_task(self.execute(request))
         heartbeat = asyncio.create_task(self._heartbeat(request, token, running))
         try:
             result = await running
+            if request.stage == "prepare" and result.outcome == "success" and expected_input_sha256:
+                if result.prepared is None or result.prepared.input_sha256 != expected_input_sha256:
+                    fields = request.model_dump(exclude={"stage", "identity", "input_path"})
+                    result = ActivityResult(**fields, outcome="unknown_effect", error_code="PREPARATION_INPUT_CHANGED")
             await self.pool.fetchval("SELECT report_activity($1::jsonb)", result.model_dump_json())
             # A stale report cannot advance execution. Its receipt may be dropped;
             # Maxwell owns reconciliation of the current generation.

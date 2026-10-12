@@ -1,7 +1,7 @@
 """Build one playable object from a durable remote manifest, in isolation.
 
 This is the entry point of the playback materialization container. Like the
-storage read-back, it mounts only ``/work`` and a read-only source tree: no
+storage read-back, it runs image code and mounts only ``/work``: no
 database credential, no queue, no staging root, no playback cache. Segment
 bytes reach it only as Photos originals, fetched here or placed into
 ``/work/cloud`` by the worker as hard links to files the storage read-back
@@ -72,6 +72,12 @@ def materialize(manifest: dict, root: Path) -> dict:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("materialization root must be a real directory")
     segments = _segments(manifest)
+    authentication = manifest.get("authentication")
+    if authentication is not None and (
+        any(s.local_path for s in segments)
+        or any(p.name != "cloud" or not p.is_dir() or p.is_symlink() or any(p.iterdir()) for p in root.iterdir())
+    ):
+        raise ValueError("authenticated playback requires fresh inputs")
     output = str(manifest["output"])
     if not _OUTPUT_NAME.fullmatch(output):
         raise ValueError("output must be named by the playable asset identity")
@@ -82,7 +88,14 @@ def materialize(manifest: dict, root: Path) -> dict:
     destination = root / output
     if destination.exists() or destination.is_symlink():
         raise ValueError("materialization requires a fresh work directory")
-    reports = [download_original(segment, cloud) for segment in segments]
+    reports = [
+        (
+            download_original(segment, cloud, authentication=authentication)
+            if authentication is not None
+            else download_original(segment, cloud)
+        )
+        for segment in segments
+    ]
     if len(segments) == 1:
         os.link(contained_file(cloud, cloud / segments[0].filename), destination)
         # The same inode the read-back just observed and hashed in full.
@@ -96,7 +109,17 @@ def materialize(manifest: dict, root: Path) -> dict:
     receipt = {
         "method": MATERIALIZATION_METHOD,
         "segments": [
-            {"index": s.segment_index, "size": r["size"], "sha256": r["sha256"], "method": r["method"]}
+            {
+                "index": s.segment_index,
+                "size": r["size"],
+                "sha256": r["sha256"],
+                "method": r["method"],
+                **{
+                    key: r[key]
+                    for key in ("receipt_version", "authentication", "cold_inputs", "cold_mounts", "decode")
+                    if key in r
+                },
+            }
             for s, r in zip(segments, reports, strict=True)
         ],
         "junctions": junctions,

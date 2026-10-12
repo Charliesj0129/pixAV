@@ -39,6 +39,9 @@ def test_omitting_a_runtime_uses_the_journalled_managed_guest(monkeypatch):
         async def acquire(self, account_id=None):  # pragma: no cover - never called here
             raise AssertionError("acquire is not part of assembly")
 
+        async def acquire_existing(self, account_id):  # pragma: no cover - never called here
+            raise AssertionError("existing acquisition is not part of assembly")
+
     monkeypatch.setattr("pixav.pixel_injector.storage_worker.ManagedRuntime", Runtime)
     monkeypatch.setattr("docker.from_env", lambda: object(), raising=False)
 
@@ -47,6 +50,7 @@ def test_omitting_a_runtime_uses_the_journalled_managed_guest(monkeypatch):
     assert worker.uploader is not None
     assert built["staging_root"] == Path(settings().storage_staging_dir)
     assert built["profile_name"] == settings().redroid_profile
+    assert built["tools_image"] == settings().storage_upload_tools_image
     assert built["guest_cpus"] == settings().storage_guest_cpus
     assert built["guest_memory_mb"] == settings().storage_guest_memory_mb
     assert built["tools_cpus"] == settings().storage_tools_cpus
@@ -60,7 +64,7 @@ def test_the_readback_is_configured_with_its_own_isolated_image(monkeypatch):
     worker = build_worker(object(), settings(), lambda account_id: None, owner="owner-1")
 
     assert worker.readback._image == settings().storage_readback_image
-    assert worker.readback._source_root == Path("src").resolve()
+    assert not hasattr(worker.readback, "_source_root")
 
 
 def test_the_worker_owner_must_be_a_stable_uuid():

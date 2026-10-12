@@ -7,10 +7,17 @@ rows, written the way LibraryProjection and PlaybackResolver write them; only
 the last tests hold every guarantee at once, and only then is a file removed.
 """
 
+import asyncio
 import hashlib
 import json
+import os
+import signal
+import subprocess
+import sys
 import uuid
+from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
@@ -20,6 +27,7 @@ from pixav.library_projection.render import render_projection
 from pixav.library_projection.repository import ArtworkRecord
 from pixav.library_projection.writer import ProjectionWriter
 from pixav.maxwell_core.gc import LocalFileJanitor
+from pixav.shared.playable_assets import PlayableAssetRepository
 from pixav.shared.remote_assets import RemoteAssetRepository
 
 pytestmark = pytest.mark.integration
@@ -339,14 +347,18 @@ async def playback_ready(db, video, *, verified):
         playable = uuid.uuid4()
         await db.execute(
             """INSERT INTO playable_assets(id,video_id,remote_asset_id,preparation_version,state,size_bytes,sha256,
-            ready_at,materialized_at) VALUES($1,$2,$3,'photos-playback-v1','READY',19,$4,now(),now())""",
+            ready_at,materialized_at) VALUES($1,$2,$3,'photos-playback-v1','READY',19,$4,
+            now()-interval '1 hour',now()-interval '1 hour')""",
             playable,
             video,
             remote,
             "d" * 64,
         )
     if verified:
-        observed = await db.fetchval("SELECT now()")
+        # These fixtures model already completed playback. Keep them in explicit
+        # history so small host clock corrections cannot create future evidence.
+        # Separate tests still verify future and before-READY evidence rejection.
+        observed = await db.fetchval("SELECT now()-interval '30 minutes'")
         client = {
             "method": "jellyfin-client-v1",
             "video_id": str(video),
@@ -367,11 +379,96 @@ async def playback_ready(db, video, *, verified):
             "resume": "PASS",
         }
         await db.execute(
-            "UPDATE playable_assets SET playback_verified_at=now(),playback_evidence=$2::jsonb WHERE id=$1",
+            "UPDATE playable_assets SET playback_verified_at=$3,playback_evidence=$2::jsonb WHERE id=$1",
             playable,
             json.dumps({"client_playback": client}),
+            observed,
         )
     return playable
+
+
+@pytest.mark.parametrize("mismatch", [None, "playable_asset_id", "remote_asset_id", "sha256"])
+async def test_http_reverification_preserves_only_matching_client_evidence(db, tmp_path, mismatch):
+    video, _ = await artifact(db, tmp_path)
+    playable = await playback_ready(db, video, verified=True)
+    previous = json.loads(await db.fetchval("SELECT playback_evidence FROM playable_assets WHERE id=$1", playable))
+    if mismatch:
+        previous["client_playback"][mismatch] = "f" * 64 if mismatch == "sha256" else str(uuid.uuid4())
+        await db.execute(
+            "UPDATE playable_assets SET playback_evidence=$2::jsonb WHERE id=$1", playable, json.dumps(previous)
+        )
+    http = {"method": "stable-http-v1", "size": 19, "sha256": "d" * 64, "get": "PASS"}
+    assert await PlayableAssetRepository(db).record_playback_verification(playable, http)
+    stored = json.loads(await db.fetchval("SELECT playback_evidence FROM playable_assets WHERE id=$1", playable))
+    assert stored["get"] == "PASS"
+    assert ("client_playback" in stored) == (mismatch is None)
+    if mismatch is None:
+        assert stored["client_playback"] == previous["client_playback"]
+    assert "client_playback" not in http, "the caller's report must remain unchanged"
+
+
+async def test_v2_review_registered_and_cleanup_rechecks_manifest_and_reference_bdd_135_143(db, tmp_path):
+    from pixav.shared.client_playback_evidence import playback_manifest_digest
+
+    video, media = await artifact(db, tmp_path)
+    playable = await playback_ready(db, video, verified=True)
+    previous = json.loads(await db.fetchval("SELECT playback_evidence FROM playable_assets WHERE id=$1", playable))
+    client = previous["client_playback"]
+    remote = uuid.UUID(client["remote_asset_id"])
+    await db.execute("UPDATE workflow_artifacts SET facts=$1::jsonb", json.dumps({"facts": {"sha256": "c" * 64}}))
+    await db.execute(
+        """INSERT INTO remote_asset_segments(asset_id,segment_index,start_seconds,end_seconds,size_bytes,sha256,local_path,media_info)
+        VALUES($1,0,0,60,19,$2,'synthetic','{}')""",
+        remote,
+        "d" * 64,
+    )
+    manifest = [dict(x) for x in await db.fetch("SELECT * FROM remote_asset_segments WHERE asset_id=$1", remote)]
+    confirmed = await db.fetchval("SELECT now()-interval '10 minutes'")
+    client.update(
+        method="jellyfin-client-v2",
+        manifest_sha256=playback_manifest_digest(manifest),
+        reference_source_sha256="c" * 64,
+        reference_sha256="f" * 64,
+        trace_sha256="a" * 64,
+        analysis_sha256="b" * 64,
+        item_id="fixture-item",
+        session_id="fixture-session",
+        device_id="fixture-device",
+        duration_seconds=60,
+        junction_seconds=[],
+        saved_resume_seconds=30,
+        operator_confirmed_at=confirmed.isoformat(),
+        windows=[
+            {
+                "kind": kind,
+                "expected_seconds": target,
+                "content_seconds": target,
+                "recording_seconds": i * 20,
+                "duration_seconds": 10,
+                "uncertainty_seconds": 0.5,
+                "visual_confirmation": "PASS",
+                "audio_confirmation": "PASS",
+                "identifiable": True,
+                "continuous": True,
+            }
+            for i, (kind, target) in enumerate(
+                (("beginning", 0), ("middle", 25), ("end", 50), ("seek", 20), ("resume", 30))
+            )
+        ],
+    )
+    repo = PlayableAssetRepository(db)
+    http = {"size": 19, "sha256": "d" * 64}
+    assert await repo.record_playback_verification(playable, {**http, "client_playback": client})
+    gate = janitor(db, tmp_path, apply=False)
+    assert await gate._verified_playback(db, video)
+    client["reference_source_sha256"] = "b" * 64
+    assert not await repo.record_playback_verification(playable, {**http, "client_playback": client})
+    await db.execute("UPDATE remote_asset_segments SET sha256=$1 WHERE asset_id=$2", "f" * 64, remote)
+    assert not await gate._verified_playback(db, video)
+    assert await repo.record_playback_verification(playable, http)
+    stored = json.loads(await db.fetchval("SELECT playback_evidence FROM playable_assets WHERE id=$1", playable))
+    assert "client_playback" not in stored
+    assert media.read_bytes() == b"the only local copy"
 
 
 async def playback_verified(db, video):
@@ -552,6 +649,217 @@ async def test_every_guarantee_together_removes_exactly_the_approved_target_bdd_
     assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
     assert await db.fetchval("SELECT state FROM remote_assets WHERE video_id=$1", video) == "DURABLE"
     assert await db.fetchval("SELECT state FROM playable_assets WHERE video_id=$1", video) == "READY"
+
+
+@pytest.mark.parametrize("reference_kind", ["video", "alias", "workflow", "segment", "reader"])
+async def test_other_video_referencing_the_file_blocks_cleanup_even_when_not_due(db, tmp_path, reference_kind):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other, other_media = await artifact(db, other_dir, due=False)
+    if reference_kind in ("video", "alias"):
+        path = str(media) if reference_kind == "video" else str(other_dir / ".." / media.name)
+        await db.execute("UPDATE videos SET local_path=$1 WHERE id=$2", path, other)
+    elif reference_kind == "workflow":
+        await db.execute("UPDATE workflow_artifacts SET path=$1 WHERE path=$2", str(media), str(other_media))
+    elif reference_kind == "segment":
+        asset = await db.fetchval("SELECT id FROM remote_assets WHERE video_id=$1", other)
+        await db.execute(
+            """INSERT INTO remote_asset_segments(asset_id,segment_index,start_seconds,end_seconds,
+            size_bytes,sha256,local_path,media_info) VALUES($1,0,0,1,19,$2,$3,'{}')""",
+            asset,
+            "d" * 64,
+            str(media),
+        )
+    else:
+        await db.execute(
+            """INSERT INTO reader_leases(id,video_id,path,holder,lease_until)
+            VALUES($1,$2,$3,'test-reader',now()+interval '1 hour')""",
+            uuid.uuid4(),
+            other,
+            str(media),
+        )
+    before = await db.fetchval("SELECT count(*) FROM cleanup_audit")
+    preview = await janitor(db, tmp_path, apply=False).cleanup()
+    assert preview["rejected"] == 1 and preview["eligible"] == 0
+    assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == before
+    stats = await janitor(db, tmp_path).cleanup()
+    assert stats["deleted"] == 0 and stats["rejected"] == 1
+    assert media.read_bytes() == b"the only local copy" and other_media.exists()
+    assert '"single_video_path_reference": false' in await reasons_for(db)
+
+
+async def test_path_changed_after_candidate_scan_preserves_both_files(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    replacement = tmp_path / "replacement.mp4"
+    replacement.write_bytes(b"new staging path")
+
+    class ChangedAfterScan:
+        async def fetch(self, query, *args):
+            rows = await db.fetch(query, *args)
+            await db.execute("UPDATE videos SET local_path=$1 WHERE id=$2", str(replacement), video)
+            return rows
+
+        def acquire(self):
+            return db.acquire()
+
+    stats = await janitor(ChangedAfterScan(), tmp_path).cleanup()
+    assert stats["deleted"] == 0 and stats["rejected"] == 1
+    assert media.exists() and replacement.read_bytes() == b"new staging path"
+    assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) == str(replacement)
+    assert '"local_path_unchanged": false' in await reasons_for(db)
+
+
+@pytest.mark.parametrize("stage", ["before-intent", "after-intent", "after-unlink", "after-commit"])
+async def test_cleanup_sigkill_recovery_uses_only_committed_intents(db, tmp_path, stage):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    database = await db.fetchval("SELECT current_database()")
+    endpoint = urlsplit(os.environ["PIXAV_E2E_ADMIN_DSN"])
+    dsn = urlunsplit(endpoint._replace(path=f"/{database}"))
+    ready = tmp_path / "kill-ready"
+    child = tmp_path / "cleanup-child.py"
+    child.write_text("""
+import asyncio, json, os, sys
+from pathlib import Path
+import asyncpg
+from pixav.maxwell_core.gc import LocalFileJanitor
+from pixav.shared.instance import database_identity
+from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
+
+dsn, root, stage, ready = sys.argv[1:]
+async def checkpoint():
+    Path(ready).write_text("ready")
+    await asyncio.sleep(60)
+class KillJanitor(LocalFileJanitor):
+    async def _verified_playback(self, conn, video):
+        row = await conn.fetchrow("SELECT *,now() AS checked_at FROM playable_assets WHERE video_id=$1 AND state='READY'", video)
+        if row:
+            client = ClientPlaybackEvidence.model_validate(json.loads(row["playback_evidence"])["client_playback"])
+            Path(root, "playback-gate.json").write_text(json.dumps({
+                "ready_at": row["ready_at"].isoformat(), "observed_at": client.observed_at.isoformat(),
+                "checked_at": row["checked_at"].isoformat(), "binding_matches": client.matches(dict(row)),
+            }))
+        return await super()._verified_playback(conn, video)
+    async def _persist_intent(self, *args):
+        if stage == "before-intent": await checkpoint()
+        result = await super()._persist_intent(*args)
+        if stage == "after-intent": await checkpoint()
+        return result
+    async def _audit(self, conn, video, path, decision, applied, reasons):
+        if stage == "after-unlink" and decision == "deleted": await checkpoint()
+        await super()._audit(conn, video, path, decision, applied, reasons)
+async def main():
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+    try:
+        assert await database_identity(pool) == os.environ["PIXAV_TEST_DB_IDENTITY"]
+        assert (await pool.fetchval("SELECT current_database()")).startswith("pixav_test_")
+        await KillJanitor(pool, download_dir=root, library_root=root+"/library").cleanup(apply=True)
+        if stage == "after-commit": await checkpoint()
+    finally: await pool.close()
+asyncio.run(main())
+""")
+    process = subprocess.Popen(  # noqa: S603 -- guarded child uses only this test's database and files
+        [sys.executable, str(child), dsn, str(tmp_path), stage, str(ready)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(200):
+            if ready.exists():
+                break
+            if process.poll() is not None:
+                audit = await db.fetch("SELECT decision,reasons FROM cleanup_audit ORDER BY created_at")
+                trace = tmp_path / "playback-gate.json"
+                facts = trace.read_text() if trace.exists() else "missing playback trace"
+                pytest.fail(
+                    f"cleanup child exited before checkpoint: code={process.returncode}, audit={list(audit)}, facts={facts}"
+                )
+            await asyncio.sleep(0.05)
+        assert ready.exists(), "cleanup did not reach crash checkpoint"
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGKILL)
+        process.wait(timeout=10)
+    assert media.exists() == (stage in ("before-intent", "after-intent"))
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal") == (stage != "before-intent")
+    operator = janitor(db, tmp_path)
+    if stage == "after-unlink":
+        assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) == str(media)
+        assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 0
+        assert (await operator.recover())["recovered"] == 1
+        assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 0
+        assert await db.fetchval("SELECT state FROM cleanup_journal") == "INTENT"
+        assert (await operator.recover(apply=True))["recovered"] == 1
+        assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
+        assert await db.fetchval("SELECT decision FROM cleanup_audit") == "missing"
+        assert await db.fetchval("SELECT state FROM cleanup_journal") == "COMPLETED"
+        assert (await operator.recover(apply=True))["recovered"] == 0
+    elif stage == "after-intent":
+        assert (await operator.recover(apply=True))["pending"] == 1
+        assert media.exists()
+        assert (await operator.cleanup())["deleted"] == 1
+        assert await db.fetchval("SELECT count(*) FROM cleanup_journal") == 1
+    elif stage == "before-intent":
+        assert await operator.recover() == {"recovered": 0, "pending": 0, "rejected": 0}
+    else:
+        assert await db.fetchval("SELECT state FROM cleanup_journal") == "COMPLETED"
+        assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 1
+        assert (await operator.recover(apply=True))["recovered"] == 0
+
+
+@pytest.mark.parametrize("invalid_time", ["future", "before-ready"])
+async def test_client_evidence_outside_ready_and_db_clock_is_rejected(db, tmp_path, invalid_time):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    row = await db.fetchrow(
+        "SELECT ready_at,playback_evidence,now() AS checked_at FROM playable_assets WHERE video_id=$1", video
+    )
+    evidence = json.loads(row["playback_evidence"])
+    observed = (
+        row["checked_at"] + timedelta(days=1) if invalid_time == "future" else row["ready_at"] - timedelta(days=1)
+    )
+    evidence["client_playback"]["observed_at"] = observed.isoformat()
+    await db.execute(
+        "UPDATE playable_assets SET playback_evidence=$2::jsonb WHERE video_id=$1", video, json.dumps(evidence)
+    )
+    assert (await janitor(db, tmp_path).cleanup())["rejected"] == 1
+    assert media.exists()
+    assert not json.loads(await reasons_for(db))["verified_playback_evidence"]
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal") == 0
+
+
+async def test_replacement_after_committed_intent_is_preserved(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+
+    class ReplaceAfterIntent(LocalFileJanitor):
+        async def _persist_intent(self, *args):
+            result = await super()._persist_intent(*args)
+            replacement = tmp_path / "replacement.mp4"
+            replacement.write_bytes(media.read_bytes())
+            replacement.replace(media)
+            return result
+
+    operator = ReplaceAfterIntent(db, download_dir=str(tmp_path), library_root=str(tmp_path / "library"))
+    assert (await operator.cleanup(apply=True))["failed"] == 1
+    assert media.read_bytes() == b"the only local copy"
+    assert await db.fetchval("SELECT state FROM cleanup_journal") == "INTENT"
+    assert (await janitor(db, tmp_path).cleanup())["failed"] == 1
+    assert media.exists()
+    assert (await operator.recover(apply=True))["pending"] == 1
 
 
 async def test_publication_of_a_superseded_object_is_not_complete_bdd_005_131(db, tmp_path):
