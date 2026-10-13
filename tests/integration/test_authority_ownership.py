@@ -83,3 +83,21 @@ async def test_photos_ui_disconnect_cancels_owner(integration_db):
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_same_photos_account_cannot_overlap_different_runtime_owners(integration_db):
+    async with photos_ui_ownership(integration_db, "synthetic-account", "first-runtime"):
+        with pytest.raises(RuntimeError, match="another reader or writer"):
+            async with photos_ui_ownership(integration_db, "synthetic-account", "second-runtime"):
+                pytest.fail("one account acquired overlapping UI owners")
+    async with photos_ui_ownership(integration_db, "synthetic-account", "second-runtime") as check:
+        check()
+
+
+async def test_same_runtime_owner_cannot_overlap_different_photos_accounts(integration_db):
+    async with photos_ui_ownership(integration_db, "first-account", "synthetic-runtime"):
+        with pytest.raises(RuntimeError, match="another reader or writer"):
+            async with photos_ui_ownership(integration_db, "second-account", "synthetic-runtime"):
+                pytest.fail("one runtime acquired overlapping account sessions")
+    async with photos_ui_ownership(integration_db, "second-account", "synthetic-runtime") as check:
+        check()
