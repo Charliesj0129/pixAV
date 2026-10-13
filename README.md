@@ -42,7 +42,7 @@ repository 只保留 [Windows Android 工具入口](docker-compose.android-runne
 
 當前 Windows Docker Desktop 資料磁碟為 `D:\DockerDesktopData\disk\docker_data.vhdx`，其開機 distro 亦位於同一 D 槽根目錄；Ubuntu-24.04 的 Docker WSL 整合已核對。Android SDK 位於 `D:\Android\Sdk`，原 C 槽 SDK 路徑只是相容 junction。專案、保留 guest、備份及還原均實際位於 D 槽。不能沿用已不存在的 `docker-desktop-data` registration 或舊 `wsl/data/ext4.vhdx` 搬移腳本；每次操作仍核對當前 daemon 與實體位置。
 
-保留所有專案的 volumes、映像與停機政策；原 application／guest 容器仍停止，其他專案未隨 daemon 恢復啟動。WSL 內刪檔與 trim 不代表 Windows D 槽已回收同量實體空間，未取得實體容量證據不得宣稱。
+2026-10-13 操作者確認已人工移除十四個 pixAV 舊容器；當次核對原 daemon、五十九個保留 volumes、離線 DB system identifier、當前 DB 三十張表的內容與完整 roles／認證、保留資料內容及十四個可定位的實際 bind；隔離查詢使用原 DB volume 的唯讀 tmpfs 複本，原檔案 fingerprint 不變。舊播放 cache／tools staging 的三個 binding 已失去原暫時路徑，維持未核實；新部署須重新核對其 host／container device、inode 與內容。保留 guest 資料、journal、operation／generation，缺失容器引用先 reconciliation；刪除容器不能授權重傳。其他專案保持停止。WSL 內刪檔與 trim 不代表 Windows D 槽已回收同量實體空間，未取得實體容量證據不得宣稱。
 
 搬移前核對當前 daemon、原容器／volume 集合、DB identifier／ledger、queue checkpoint 與實際 bind 身分；一致離線加密備份和獨立完整還原通過後，才改變資料位置並精確清除原 C 副本。目的地、備份、還原及 staging 均核對底層實體磁碟，保留 100 GiB／10% reserve。全 WSL 釋鎖若新增其他專案中斷範圍，須取得當次授權。搬移成功、刪檔與 Windows 實體容量釋放各自以收據判定。
 
@@ -244,6 +244,8 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 
 [docker-compose.android-runner.yml](docker-compose.android-runner.yml) **獨立使用**，不與 base／prod／direct／acceptance 合併；它只宣告一個工具容器，不啟動應用 worker，也不自動登入、push 或 upload。[`.env.example`](.env.example) 的 `PIXAV_ANDROID_*` 鍵只供這份 Compose 使用，未增加可用的 `PIXAV_PIXEL_INJECTOR_MODE`。
 
+[Android transport selector](src/pixav/pixel_injector/android_target.py) 讓 [Maestro flow／hierarchy](src/pixav/pixel_injector/canary_maestro.py) 明確接收 Windows server 與 exact emulator serial；提供 credentials 或操作 UI 前，拒絕與 runner `ADB_SERVER_SOCKET`／`ANDROID_SERIAL` 不一致或重複的設定。未指定 external target 的 caller 也不能默默接到 Windows runner。serial 仍不代表 runtime identity／ownership／fencing；managed callers、runtime migration 與 live Maestro forwarding 尚待驗收。transport 與帳號／owner UI 鎖變更的完整檢查為 1,874 passed／8 skipped，含身分核對的專用 PostgreSQL／Redis 核心整合；未執行的 live／restart drill 不列為通過。
+
 先在 Windows 安裝 Android SDK／Emulator、啟用 WHPX，透過 Device Manager 建立專用 AVD；依 host 架構選 system image，需 Photos／Play 的映像另驗登入及指定上傳能力。以下 PowerShell 的 SDK 路徑與 AVD 名稱是範例，使用前核對實際位置與版本：
 
 ```powershell
@@ -256,11 +258,11 @@ $pixavEmulator = Join-Path $pixavSdk 'emulator\emulator.exe'
 & $pixavEmulator -list-avds
 ```
 
-Windows 是唯一 ADB server owner。先核對 5037 listener 與 Windows Firewall，僅允許當次確認的 Docker backend 控制路徑；需變更 firewall 時另取得授權。ADB remote server 本身不是帳號認證邊界，不能以 `-a` 配合開放所有網路的規則。依 [ADB server 選項](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md) 與 [Maestro remote host 說明](https://docs.maestro.dev/maestro-cli/how-to-install-maestro-cli)，在專用 PowerShell 視窗以前景啟動，保持視窗開啟：
+Windows 是唯一 ADB server owner。先核對 5037 listener、owner 與版本，再使用當次實測的 Docker backend 控制路徑；Windows Platform-Tools 35.0.2 的 loopback server 已可由 Docker Desktop runner 的 `host.docker.internal` 存取，Maestro forwarding 仍另驗。ADB remote server 本身不是帳號認證邊界，不以 `-a` 對 LAN／公網開放 listener；需變更 firewall 時另取得授權。依 [ADB server 選項](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md) 與 [Maestro remote host 說明](https://docs.maestro.dev/maestro-cli/how-to-install-maestro-cli)，在專用 PowerShell 視窗以前景啟動，保持視窗開啟：
 
 ```powershell
-# 僅在受控 firewall 與無衝突 listener 已確認後使用。
-& $pixavAdb -a -P 5037 nodaemon server
+# 僅在無衝突 listener 且當次 Docker 控制路徑已確認後使用。
+& $pixavAdb -L tcp:5037 nodaemon server
 ```
 
 已有 server 時先核對 owner／版本／listen address，不直接 `taskkill` 或 `kill-server`。另一個 PowerShell 視窗使用相同 SDK 路徑啟動已核對的 AVD；`5554` 被占用就停止查證，不接到另一裝置。禁用 Quick Boot snapshot 載入／保存，保留 userdata；不使用 `-wipe-data`。
