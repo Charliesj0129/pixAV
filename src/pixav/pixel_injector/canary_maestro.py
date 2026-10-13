@@ -7,13 +7,22 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from pixav.pixel_injector.android_target import CONTAINER_ANDROID_TARGET, AndroidTarget
 from pixav.pixel_injector.canary import OWNER_LABEL, CanaryBlockedError
 
 
-def run_flow(runner: Any, owner: str, flow: Path, *, credentials: dict[str, str] | None = None) -> None:
+def run_flow(
+    runner: Any,
+    owner: str,
+    flow: Path,
+    *,
+    credentials: dict[str, str] | None = None,
+    target: AndroidTarget = CONTAINER_ANDROID_TARGET,
+) -> None:
     """Use subprocess environment for credentials; discard private login traces."""
     if runner.labels.get(OWNER_LABEL) != owner or runner.labels.get("pixav.photos_canary.role") != "tools":
         raise CanaryBlockedError("Maestro runner ownership mismatch")
+    target.require_runner(runner)
     name = "canary-flow-" + uuid.uuid4().hex
     root = "/tmp/" + name  # noqa: S108 - exclusive 0700 directory in owned container tmpfs
     environment = {
@@ -49,8 +58,7 @@ def run_flow(runner: Any, owner: str, flow: Path, *, credentials: dict[str, str]
                 "--kill-after=5s",
                 "90",
                 "maestro",
-                "--device",
-                "127.0.0.1:5555",
+                *target.maestro_arguments,
                 "test",
                 "--test-output-dir",
                 root + "/output",
@@ -73,12 +81,13 @@ def run_flow(runner: Any, owner: str, flow: Path, *, credentials: dict[str, str]
             runner.client.api.timeout = previous_timeout
 
 
-def hierarchy(runner: Any, owner: str) -> list[dict[str, str]]:
+def hierarchy(runner: Any, owner: str, *, target: AndroidTarget = CONTAINER_ANDROID_TARGET) -> list[dict[str, str]]:
     """Read UI attributes in memory; never persist account screens or raw CLI output."""
     import json
 
     if runner.labels.get(OWNER_LABEL) != owner or runner.labels.get("pixav.photos_canary.role") != "tools":
         raise CanaryBlockedError("Maestro runner ownership mismatch")
+    target.require_runner(runner)
     root = "/tmp/canary-inspect-" + uuid.uuid4().hex  # noqa: S108 - exclusive owned tmpfs directory
     previous_timeout = runner.client.api.timeout
     runner.client.api.timeout = 150
@@ -89,7 +98,7 @@ def hierarchy(runner: Any, owner: str) -> list[dict[str, str]]:
             raise CanaryBlockedError("could not create private hierarchy directory")
         created = True
         result = runner.exec_run(
-            ["timeout", "--kill-after=5s", "90", "maestro", "--device", "127.0.0.1:5555", "hierarchy"],
+            ["timeout", "--kill-after=5s", "90", "maestro", *target.maestro_arguments, "hierarchy"],
             environment={
                 "HOME": root,
                 "JAVA_TOOL_OPTIONS": "-Duser.home=" + root,

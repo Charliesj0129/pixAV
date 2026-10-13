@@ -80,3 +80,71 @@ def test_hierarchy_retains_only_attributes_in_memory_and_cleans(runner):
     ]
     assert hierarchy(runner, "owner") == [{}, {"text": "Backed up"}]
     assert runner.exec_run.call_args.args[0][:3] == ["rm", "-rf", "--"]
+
+
+def external_target(runner):
+    from pixav.pixel_injector.android_target import AndroidTarget
+
+    runner.attrs = {
+        "Config": {"Env": ["ADB_SERVER_SOCKET=tcp:host.docker.internal:5037", "ANDROID_SERIAL=emulator-5554"]}
+    }
+    return AndroidTarget("emulator-5554", "host.docker.internal")
+
+
+def test_windows_flow_uses_remote_server_and_exact_serial(runner, flow):
+    target = external_target(runner)
+    runner.exec_run.return_value = SimpleNamespace(exit_code=0, output=b"")
+    run_flow(runner, "owner", flow, target=target)
+    command = runner.exec_run.call_args_list[1].args[0]
+    assert command[3:8] == ["maestro", "--host", "host.docker.internal", "--device", "emulator-5554"]
+    assert "127.0.0.1:5555" not in command
+
+
+def test_windows_hierarchy_uses_the_same_transport_as_upload(runner):
+    from pixav.pixel_injector.canary_maestro import hierarchy
+
+    target = external_target(runner)
+    runner.exec_run.side_effect = [
+        SimpleNamespace(exit_code=0),
+        SimpleNamespace(exit_code=0, output=b'{"attributes":{},"children":[]}'),
+        SimpleNamespace(exit_code=0),
+    ]
+    assert hierarchy(runner, "owner", target=target) == [{}]
+    command = runner.exec_run.call_args_list[1].args[0]
+    assert command[3:] == ["maestro", "--host", "host.docker.internal", "--device", "emulator-5554", "hierarchy"]
+
+
+def test_wrong_remote_server_blocks_before_credentials_or_ui(runner, flow):
+    target = external_target(runner)
+    runner.attrs["Config"]["Env"][0] = "ADB_SERVER_SOCKET=tcp:other-host:5037"
+    with pytest.raises(CanaryBlockedError, match="tools environment"):
+        run_flow(runner, "owner", flow, target=target, credentials={"email": "fake@example.test", "password": "secret"})
+    runner.exec_run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["ADB_SERVER_SOCKET=tcp:host.docker.internal:5037", "ANDROID_SERIAL=emulator-5556"],
+        [
+            "ADB_SERVER_SOCKET=tcp:host.docker.internal:5037",
+            "ANDROID_SERIAL=emulator-5554",
+            "ANDROID_SERIAL=emulator-5554",
+        ],
+        ["ANDROID_SERIAL=emulator-5554"],
+        None,
+    ],
+)
+def test_remote_environment_must_be_unambiguous(runner, flow, values):
+    target = external_target(runner)
+    runner.attrs["Config"]["Env"] = values
+    with pytest.raises(CanaryBlockedError):
+        run_flow(runner, "owner", flow, target=target)
+    runner.exec_run.assert_not_called()
+
+
+def test_external_runner_cannot_silently_use_the_container_default(runner, flow):
+    external_target(runner)
+    with pytest.raises(CanaryBlockedError, match="tools environment"):
+        run_flow(runner, "owner", flow)
+    runner.exec_run.assert_not_called()
