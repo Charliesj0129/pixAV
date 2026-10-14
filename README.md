@@ -246,6 +246,8 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 
 [Android transport selector](src/pixav/pixel_injector/android_target.py) 讓 [Maestro flow／hierarchy](src/pixav/pixel_injector/canary_maestro.py) 明確接收 Windows server 與 exact emulator serial；提供 credentials 或操作 UI 前，拒絕與 runner `ADB_SERVER_SOCKET`／`ANDROID_SERIAL` 不一致或重複的設定。未指定 external target 的 caller 也不能默默接到 Windows runner。serial 仍不代表 runtime identity／ownership／fencing；managed callers、runtime migration 與失聯後 fencing 尚待驗收。transport 與帳號／owner UI 鎖變更的完整檢查為 1,874 passed／8 skipped，含身分核對的專用 PostgreSQL／Redis 核心整合；未執行的 live／restart drill 不列為通過。
 
+[022 expand migration](migrations/022_external_android_runtime.sql) 新增 `upload_runtimes` 與 `photos_ui_sessions`。原 `guest_runtimes` 不改動，登錄其原 identity 並維持待 reconciliation；runtime identity／tools binding 改變須建立新 generation。持久 session 綁定原 activity／operation／generation，帳號、device、runtime owner 與全域 upload slot 各自排他；連線結束或 DB-clock lease 到期都不授權新 writer 接手。過期 session 或 execution stage 已改變時 heartbeat 拒絕續租並維持 halt 要求。worker 可取得／heartbeat session，只有 authority 可登錄綁定原 identity 的 halt 收據，且登錄前仍須獨立核實原 runner／native writers 已停止。SQL 不會停止 Windows 裝置，也不會驗證外部 boolean 的真實性。當次 [17 項真 PostgreSQL 情境](tests/integration/test_external_android_runtime.py) 與完整 1,891 passed／8 skipped 通過，含 full dump／restore 後原 runtime／operation／generation 及 active fence 逐欄不變；caller 接入、Windows halt observer、當前資料的 migration／restore、live 故障恢復與 production apply 仍待驗收，不能據此宣告 Stage 2 完成。
+
 先在 Windows 安裝 Android SDK／Emulator、啟用 WHPX，透過 Device Manager 建立專用 AVD；依 host 架構選 system image，需 Photos／Play 的映像另驗登入及指定上傳能力。以下 PowerShell 的 SDK 路徑與 AVD 名稱是範例，使用前核對實際位置與版本：
 
 ```powershell
