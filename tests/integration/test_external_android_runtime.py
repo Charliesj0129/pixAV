@@ -1,5 +1,6 @@
 """Persistent UI fences survive connection loss and preserve original intents."""
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -7,6 +8,13 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from pixav.pixel_injector.android_target import AndroidTarget
+from pixav.pixel_injector.canary import CanaryBlockedError
+from pixav.pixel_injector.session import WindowsAndroidSession
+from pixav.shared.activity_context import activity_context
+from pixav.shared.photos_ui_ownership import photos_ui_ownership
+from pixav.shared.photos_ui_session import photos_ui_session
+from pixav.shared.workflow import ActivityRequest
 from scripts.backup_files import create_backup_file
 
 pytestmark = pytest.mark.integration
@@ -25,6 +33,43 @@ async def runtime_db(integration_db):
     await base_schema(integration_db)
     await integration_db.execute(EXPAND.read_text())
     return integration_db
+
+
+@pytest.fixture
+async def ui_session_db(runtime_db):
+    await runtime_db.execute(Path("migrations/023_photos_ui_halt_requests.sql").read_text())
+    return runtime_db
+
+
+def native_session(binding):
+    runtime_id, owner, account = binding
+    return WindowsAndroidSession(
+        runtime_id=runtime_id,
+        generation=1,
+        owner=owner,
+        account_id=account,
+        device_key="synthetic-avd",
+        identity_sha256="a" * 64,
+        avd_name="synthetic-avd",
+        boot_id=uuid.uuid4(),
+        tools_id="synthetic-tools",
+        tools_image="sha256:" + "b" * 64,
+        target=AndroidTarget("emulator-5554", "host.docker.internal"),
+    )
+
+
+async def envelope(pool, report):
+    return ActivityRequest(
+        task_id=await pool.fetchval("SELECT task_id FROM executions WHERE id=$1", uuid.UUID(report["execution_id"])),
+        execution_id=report["execution_id"],
+        attempt_id=report["attempt_id"],
+        operation_id=report["operation_id"],
+        owner=report["owner"],
+        generation=report["generation"],
+        stage="upload" if report["role"] == "upload" else "verify",
+        identity="original-operation",
+        account_id=report["account_id"],
+    )
 
 
 async def runtime(pool, *, account=None, device="synthetic-avd", owner=None):
@@ -282,3 +327,216 @@ async def test_full_dump_restore_preserves_active_fence_and_original_operation(r
     assert before == await runtime_db.fetchval("SELECT to_jsonb(s)::text FROM photos_ui_sessions s")
     assert identity == await runtime_db.fetchval("SELECT to_jsonb(r)::text FROM upload_runtimes r")
     assert not await claim(runtime_db, await request(runtime_db, binding))
+
+
+async def test_persistent_scope_records_halt_request_but_keeps_legacy_ui_fenced(ui_session_db):
+    pool = ui_session_db
+    binding = await runtime(pool)
+    report = await request(pool, binding)
+    stopped = []
+
+    async def halt(ticket):
+        stopped.append(ticket.id)
+        return {"schema": "synthetic-halt-observation"}
+
+    with activity_context(await envelope(pool, report), uuid.UUID(report["worker_token"])):
+        async with photos_ui_session(pool, native_session(binding), role="upload", halt=halt) as lease:
+            lease.check()
+            assert str(lease.ticket.token) not in repr(lease.ticket)
+            assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "ACTIVE"
+    assert stopped == [lease.ticket.id]
+    assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "HALT_REQUIRED"
+    assert await pool.fetchval("SELECT reason FROM photos_ui_halt_requests") == "UI_SCOPE_ENDED"
+    assert await pool.fetchval("SELECT operation_id FROM photos_ui_sessions") == uuid.UUID(report["operation_id"])
+    assert await pool.fetchval("SELECT generation FROM photos_ui_sessions") == report["generation"]
+    with pytest.raises(CanaryBlockedError, match="lease lost"):
+        lease.check()
+    for account, owner in [(binding[2], uuid.uuid4()), (uuid.uuid4(), binding[1])]:
+        with pytest.raises(RuntimeError, match="fenced"):
+            async with photos_ui_ownership(pool, account, str(owner)):
+                pytest.fail("legacy UI bypassed a persistent fence")
+
+
+async def test_persistent_scope_disconnect_halts_original_writer_and_keeps_row(ui_session_db):
+    pool = ui_session_db
+    binding = await runtime(pool)
+    report = await request(pool, binding)
+    original = await envelope(pool, report)
+    ready = asyncio.Event()
+    stopped = []
+    backend = None
+
+    async def halt(ticket):
+        stopped.append(ticket.id)
+        return {}
+
+    async def owner():
+        nonlocal backend
+        with activity_context(original, uuid.UUID(report["worker_token"])):
+            async with photos_ui_session(pool, native_session(binding), role="upload", halt=halt) as lease:
+                backend = await lease.guard.connection.fetchval("SELECT pg_backend_pid()")
+                ready.set()
+                await asyncio.Event().wait()
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        await pool.fetchval("SELECT pg_terminate_backend($1)", backend)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert len(stopped) == 1
+        assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "ACTIVE"
+        assert await pool.fetchval("SELECT count(*) FROM photos_ui_halt_requests") == 0
+        with pytest.raises(RuntimeError, match="fenced"):
+            async with photos_ui_ownership(pool, binding[2], str(binding[1])):
+                pytest.fail("DB disconnect released a native writer")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_persistent_heartbeat_loss_waits_for_original_native_halt(ui_session_db):
+    pool = ui_session_db
+    binding = await runtime(pool)
+    report = await request(pool, binding)
+    original = await envelope(pool, report)
+    ready, stopped = asyncio.Event(), asyncio.Event()
+
+    async def halt(ticket):
+        stopped.set()
+        return {}
+
+    async def owner():
+        with activity_context(original, uuid.UUID(report["worker_token"])):
+            async with photos_ui_session(
+                pool, native_session(binding), role="upload", halt=halt, heartbeat_seconds=0.02
+            ):
+                ready.set()
+                await asyncio.Event().wait()
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        await pool.execute("UPDATE executions SET state='WAITING_RETRY'")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert stopped.is_set()
+        assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "HALT_REQUIRED"
+        assert await pool.fetchval("SELECT reason FROM photos_ui_halt_requests") == "UI_GUARD_LOST"
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancellation_during_halt_waits_for_stop_completion(ui_session_db):
+    pool = ui_session_db
+    binding = await runtime(pool)
+    report = await request(pool, binding)
+    original = await envelope(pool, report)
+    halting, allow_stop, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def halt(ticket):
+        halting.set()
+        await allow_stop.wait()
+        stopped.set()
+        return {}
+
+    async def owner():
+        with activity_context(original, uuid.UUID(report["worker_token"])):
+            async with photos_ui_session(pool, native_session(binding), role="upload", halt=halt):
+                pass
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(halting.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not stopped.is_set()
+        allow_stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert stopped.is_set()
+        assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "HALT_REQUIRED"
+    finally:
+        allow_stop.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_worker_halt_request_is_idempotent_and_never_releases_fence(ui_session_db):
+    pool = ui_session_db
+    report = await request(pool, await runtime(pool))
+    assert await claim(pool, report)
+    body = {"id": str(uuid.uuid4()), "reason": "UI_SCOPE_ENDED", "evidence": {"schema": "synthetic"}}
+    async with pool.acquire() as conn:
+        await conn.execute("SET ROLE pixav_activity_worker")
+        try:
+            args = uuid.UUID(report["id"]), uuid.UUID(report["token"]), json.dumps(body)
+            assert not await conn.fetchval(
+                "SELECT request_photos_ui_halt($1,$2,$3::jsonb)", args[0], uuid.uuid4(), args[2]
+            )
+            assert await conn.fetchval("SELECT request_photos_ui_halt($1,$2,$3::jsonb)", *args)
+            assert await conn.fetchval("SELECT request_photos_ui_halt($1,$2,$3::jsonb)", *args)
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await conn.execute("UPDATE photos_ui_sessions SET state='STOPPED'")
+        finally:
+            await conn.execute("RESET ROLE")
+    assert await pool.fetchval("SELECT count(*) FROM photos_ui_halt_requests") == 1
+    assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "HALT_REQUIRED"
+
+
+async def test_scope_cannot_return_success_after_ui_deadline_expired(ui_session_db):
+    pool = ui_session_db
+    binding = await runtime(pool)
+    report = await request(pool, binding)
+    stopped = []
+
+    async def halt(ticket):
+        stopped.append(ticket.id)
+        return {}
+
+    with activity_context(await envelope(pool, report), uuid.UUID(report["worker_token"])):
+        with pytest.raises(CanaryBlockedError, match="lease lost"):
+            async with photos_ui_session(pool, native_session(binding), role="upload", halt=halt) as lease:
+                lease._valid_until = 0
+    assert stopped == [lease.ticket.id]
+    assert await pool.fetchval("SELECT reason FROM photos_ui_halt_requests") == "UI_GUARD_LOST"
+
+
+async def test_halt_request_audit_and_fence_survive_full_restore(ui_session_db, tmp_path):
+    from tests.integration.test_phase0_restore import postgres_tool
+
+    pool = ui_session_db
+    binding = await runtime(pool)
+    report = await request(pool, binding)
+    assert await claim(pool, report)
+    body = {"id": str(uuid.uuid4()), "reason": "NATIVE_HALT_UNCONFIRMED", "evidence": {"schema": "synthetic"}}
+    assert await pool.fetchval(
+        "SELECT request_photos_ui_halt($1,$2,$3::jsonb)",
+        uuid.UUID(report["id"]),
+        uuid.UUID(report["token"]),
+        json.dumps(body),
+    )
+    before = await pool.fetchval("SELECT to_jsonb(r)::text FROM photos_ui_halt_requests r")
+    database = await pool.fetchval("SELECT current_database()")
+    assert database.startswith("pixav_test_")
+    dump = tmp_path / "ui-halt-request-full.dump"
+    with create_backup_file(dump, binary=True) as handle:
+        handle.write(postgres_tool("pg_dump", "-U", "pixav_test", "-Fc", "-d", database))
+    postgres_tool(
+        "pg_restore",
+        "-U",
+        "pixav_test",
+        "--clean",
+        "--if-exists",
+        "--exit-on-error",
+        "-d",
+        database,
+        payload=dump.read_bytes(),
+    )
+    assert before == await pool.fetchval("SELECT to_jsonb(r)::text FROM photos_ui_halt_requests r")
+    assert await pool.fetchval("SELECT state FROM photos_ui_sessions") == "HALT_REQUIRED"
+    assert not await claim(pool, await request(pool, binding))

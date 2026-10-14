@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from pixav.pixel_injector.canary import CanaryBlockedError
 from pixav.pixel_injector.maestro_parts import UploadReviewRequiredError
 from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
+from pixav.shared.activity_context import activity_context
 from pixav.shared.exceptions import ReadbackUnavailableError, RedroidError, UploadError, VerificationError
 from pixav.shared.models import Account
 from pixav.shared.queue import TaskQueue
@@ -161,6 +162,10 @@ class StorageActivityWorker:
         return journal
 
     async def execute(self, request: ActivityRequest, token: UUID) -> ActivityResult:
+        with activity_context(request, token):
+            return await self._execute(request, token)
+
+    async def _execute(self, request: ActivityRequest, token: UUID) -> ActivityResult:
         fields = request.model_dump(exclude={"stage", "identity", "input_path", "share_url"})
         try:
             if request.asset_id is None or request.segment_index is None:

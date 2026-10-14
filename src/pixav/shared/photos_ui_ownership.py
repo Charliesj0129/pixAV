@@ -13,6 +13,24 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 
+class PhotosUIConnection:
+    """An advisory guard and the connection holding its resource locks."""
+
+    def __init__(self, connection: Any, check: Callable[[], None]) -> None:
+        self.connection, self._check = connection, check
+
+    def __call__(self) -> None:
+        self._check()
+
+    def connected(self) -> bool:
+        try:
+            self._check()
+        except Exception:
+            # asyncpg may release the proxy during its termination callback.
+            return False
+        return True
+
+
 def photos_ui_lock_key(account_id: object, owner: str) -> int:
     value = hashlib.sha256(f"pixav:photos-ui:{account_id}:{owner}".encode()).digest()[:8]
     return int.from_bytes(value, "big", signed=True)
@@ -23,8 +41,21 @@ def _resource_lock_key(kind: str, identity: object) -> int:
     return int.from_bytes(value, "big", signed=True)
 
 
+async def _require_unfenced(conn: Any, account_id: object, owner: str) -> None:
+    if await conn.fetchval("SELECT to_regclass('public.photos_ui_sessions') IS NOT NULL"):
+        blocked = await conn.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM photos_ui_sessions
+            WHERE state IN ('ACTIVE','HALT_REQUIRED')
+            AND (account_id::text=$1 OR runtime_owner::text=$2))""",
+            str(account_id),
+            owner,
+        )
+        if blocked:
+            raise RuntimeError("Photos UI remains fenced until verified writer halt")
+
+
 @asynccontextmanager
-async def photos_ui_ownership(pool: Any, account_id: object, owner: str) -> AsyncIterator[Callable[[], None]]:
+async def photos_ui_ownership(pool: Any, account_id: object, owner: str) -> AsyncIterator[PhotosUIConnection]:
     task = asyncio.current_task()
     if task is None:
         raise RuntimeError("Photos UI ownership requires a task")
@@ -56,7 +87,8 @@ async def photos_ui_ownership(pool: Any, account_id: object, owner: str) -> Asyn
                 acquired.append(key)
             conn.add_termination_listener(lost_connection)
             listening = True
-            yield check
+            await _require_unfenced(conn, account_id, owner)
+            yield PhotosUIConnection(conn, check)
         finally:
             if not disconnected and not conn.is_closed():
                 if listening:

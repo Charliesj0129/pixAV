@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from pixav.media_loader.video_parts import contained_file, sha256
 from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
 from pixav.pixel_injector.photos_storage import COLD_MOUNTS, ColdProcessError, PhotosColdReadback
+from pixav.shared.activity_context import activity_context
 from pixav.shared.playable_assets import playable_from_row
 from pixav.shared.playback_models import (
     CACHE_OBJECTS,
@@ -329,7 +330,8 @@ class PlaybackActivityWorker:
             )
             await queue.ack(receipt)
             return True
-        running = asyncio.create_task(self.execute(request))
+        with activity_context(request, token):
+            running = asyncio.create_task(self.execute(request))
         heartbeat = asyncio.create_task(self._heartbeat(request, token, running))
         try:
             try:

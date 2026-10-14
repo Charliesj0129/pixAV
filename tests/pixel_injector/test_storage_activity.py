@@ -15,6 +15,7 @@ import pytest
 from pixav.pixel_injector.maestro_parts import UploadReviewRequiredError, UserActionRequiredError
 from pixav.pixel_injector.photos_storage import MaestroSegmentUploader
 from pixav.pixel_injector.storage_activity import QuotaExhaustedError, StorageActivityWorker
+from pixav.shared.activity_context import require_activity_context
 from pixav.shared.exceptions import UploadError
 from pixav.shared.storage_models import RemoteAssetSegment
 from pixav.shared.workflow import ActivityRequest
@@ -139,6 +140,23 @@ async def test_upload_journals_intent_before_the_effect_bdd_003():
     result = await worker(pool).execute(request(), uuid.uuid4())
     assert result.outcome == "success"
     assert pool.journalled, "an external effect was attempted without a recorded intent"
+
+
+async def test_adapter_receives_original_activity_context_and_token_without_leaking_them():
+    original, token = request(), uuid.uuid4()
+
+    class ContextUploader(Uploader):
+        async def upload(self, segment, account, journal):
+            context = require_activity_context()
+            assert context.request is original and context.worker_token == token
+            assert str(token) not in repr(context)
+            assert str(original.account_id) not in repr(context)
+            return await super().upload(segment, account, journal)
+
+    result = await worker(FakePool(segment_row()), uploader=ContextUploader()).execute(original, token)
+    assert result.outcome == "success"
+    with pytest.raises(RuntimeError, match="original activity context"):
+        require_activity_context()
 
 
 async def test_upload_success_reports_the_share_location_bdd_046():
