@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shlex
 import struct
 import tempfile
 import time
@@ -21,11 +22,13 @@ import httpx
 import yaml
 
 from pixav.media_loader.video_parts import sha256
+from pixav.pixel_injector.android_target import CONTAINER_ANDROID_TARGET
 from pixav.pixel_injector.canary import OWNER_LABEL, CanaryBlockedError
 from pixav.pixel_injector.canary_acceptance import collect_item
 from pixav.pixel_injector.canary_maestro import hierarchy, run_flow
-from pixav.pixel_injector.session import RedroidSession
+from pixav.pixel_injector.session import RedroidSession, WindowsAndroidSession
 from pixav.pixel_injector.uploader import media_provider_scan_command
+from pixav.pixel_injector.windows_device import WindowsAndroidDevice
 from pixav.shared.logging import install_http_url_log_redaction
 from pixav.shared.models import Account
 from pixav.shared.storage_models import TransferableFile
@@ -49,7 +52,11 @@ class UploadReviewRequiredError(CanaryBlockedError):
     def __init__(
         self,
         code: Literal[
-            "GUEST_STAGE_HASH_MISMATCH", "PUBLISHED_COPY_HASH_MISMATCH", "WRONG_PROVIDER_ITEM", "REMOTE_OUTCOME_UNKNOWN"
+            "GUEST_STAGE_HASH_MISMATCH",
+            "PUBLISHED_COPY_HASH_MISMATCH",
+            "WRONG_PROVIDER_ITEM",
+            "REMOTE_OUTCOME_UNKNOWN",
+            "RUNTIME_BINDING_CHANGED",
         ],
         message: str,
     ) -> None:
@@ -58,6 +65,7 @@ class UploadReviewRequiredError(CanaryBlockedError):
             "PUBLISHED_COPY_HASH_MISMATCH",
             "WRONG_PROVIDER_ITEM",
             "REMOTE_OUTCOME_UNKNOWN",
+            "RUNTIME_BINDING_CHANGED",
         }:
             raise ValueError("unsupported upload review classification")
         super().__init__(message)
@@ -77,8 +85,15 @@ class MaestroPartUploader:
         source_root: str = "/parts",
         observation_clock: Callable[[], Awaitable[datetime]] | None = None,
         observation_binding: dict | None = None,
+        windows_device: WindowsAndroidDevice | None = None,
     ) -> None:
+        if windows_device is not None and (
+            guest is not None or runner is not windows_device.runner or str(windows_device.session.owner) != owner
+        ):
+            raise ValueError("Windows upload requires its bound tools and external device")
         self.guest, self.runner, self.owner = guest, runner, owner
+        self.windows_device = windows_device
+        self.target = windows_device.session.target if windows_device is not None else CONTAINER_ANDROID_TARGET
         self.part, self.recovery, self.save, self.flows = part, recovery, save, flows
         # Where the tools container sees this file. One isolated run mounts a
         # single video's parts directly; the managed worker mounts a staging
@@ -89,13 +104,48 @@ class MaestroPartUploader:
         self.backup_evidence: dict = {}
         self.check: Callable[[], None] | None = None
 
+    async def _bind_windows_runtime(self) -> None:
+        if self.windows_device is None:
+            return
+        session = self.windows_device.session
+        binding = {
+            "kind": "windows_android",
+            "runtime_id": str(session.runtime_id),
+            "runtime_generation": session.generation,
+            "device_key": session.device_key,
+            "identity_sha256": session.identity_sha256,
+            "boot_id": str(session.boot_id),
+            "tools_id": session.tools_id,
+            "serial": session.target.serial,
+            "adb_server_host": session.target.server_host,
+        }
+        original = self.recovery.get("runtime_binding")
+        if original == binding:
+            return
+        if self.recovery:
+            raise UploadReviewRequiredError(
+                "RUNTIME_BINDING_CHANGED", "original runtime outcome requires reconciliation before device migration"
+            )
+        # Commit the binding before it can accompany login, push or share effects.
+        # Failed journals leave no in-memory shortcut for a subsequent call.
+        await self.save({"runtime_binding": binding})
+        self.recovery["runtime_binding"] = binding
+
     async def _io(self, operation: Callable[[], Any]) -> Any:
         """Monitor long guest effects; a lost guard stops this run's writers."""
         if not self.check:
+            if self.windows_device is not None:
+                raise CanaryBlockedError("Windows Photos operations require persistent UI ownership")
             return await asyncio.to_thread(operation)
-        self.check()
-        task = asyncio.create_task(asyncio.to_thread(operation))
+        task = None
         try:
+            self.check()
+            if self.windows_device is not None:
+                await asyncio.to_thread(self.windows_device.verify, self.windows_device.session)
+                self.check()
+                await self._bind_windows_runtime()
+                self.check()
+            task = asyncio.create_task(asyncio.to_thread(operation))
             while True:
                 done, _ = await asyncio.wait({task}, timeout=1)
                 self.check()
@@ -104,16 +154,23 @@ class MaestroPartUploader:
         except BaseException:
             # Stopping only the CLI/ADB connection does not stop an in-guest cp.
             # Preserve both owned containers and /data, while halting their writes.
-            self.guard(RedroidSession(self.owner, self.guest.id, "127.0.0.1", 5555))
-            for item in (self.runner, self.guest):
-                await asyncio.to_thread(item.stop, timeout=10)
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                if self.windows_device is not None:
+                    await self.windows_device.halt()
+                else:
+                    self.guard(RedroidSession(self.owner, self.guest.id, "127.0.0.1", 5555))
+                    for item in (self.runner, self.guest):
+                        await asyncio.to_thread(item.stop, timeout=10)
+            finally:
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
             raise
 
     async def receipt(self, kind: str, *, complete: bool = False) -> None:
         """Persist only operation names, timestamps and verified identity facts."""
         if self.check:
             self.check()
+        await self._bind_windows_runtime()
         record = self.recovery.setdefault("operations", {}).setdefault(kind, {})
         field = "completed_at" if complete else "intent_at"
         record.setdefault(field, datetime.now(timezone.utc).isoformat())
@@ -121,7 +178,14 @@ class MaestroPartUploader:
             record["identity_verified"] = True
         await self.save(self.recovery)
 
-    def guard(self, session: RedroidSession) -> None:
+    def guard(self, session: RedroidSession | WindowsAndroidSession) -> None:
+        if self.windows_device is not None:
+            if not isinstance(session, WindowsAndroidSession) or str(session.owner) != self.owner:
+                raise CanaryBlockedError("Windows device session changed")
+            self.windows_device.verify(session)
+            return
+        if not isinstance(session, RedroidSession):
+            raise CanaryBlockedError("container guest session required")
         if session.container_id != self.guest.id:
             raise CanaryBlockedError("guest session changed")
         for container, role in ((self.guest, "guest"), (self.runner, "tools")):
@@ -142,15 +206,14 @@ class MaestroPartUploader:
         the package is there, and the answer belongs to the caller, not to this
         method's idea of a broken guest.
         """
-        if self.check:
-            self.check()
 
         def execute() -> str:
+            self.target.require_runner(self.runner)
             previous = self.runner.client.api.timeout
             self.runner.client.api.timeout = timeout + 30
             try:
                 result = self.runner.exec_run(
-                    ["timeout", "--kill-after=5s", str(timeout), "adb", "-s", "127.0.0.1:5555", *args]
+                    ["timeout", "--kill-after=5s", str(timeout), "adb", "-s", self.target.serial, *args]
                 )
                 if result.exit_code and not answers_with_exit_code:
                     raise CanaryBlockedError("ADB operation failed; retained guest requires reconciliation")
@@ -161,7 +224,7 @@ class MaestroPartUploader:
         return await self._io(execute)
 
     async def attributes(self) -> list[dict]:
-        attributes = await self._io(partial(hierarchy, self.runner, self.owner))
+        attributes = await self._io(partial(hierarchy, self.runner, self.owner, target=self.target))
         text = "\n".join(a.get("text", "") for a in attributes)
         if any(
             marker in text
@@ -173,21 +236,29 @@ class MaestroPartUploader:
         return attributes
 
     async def flow(self, name: str, *, credentials: dict | None = None) -> None:
-        if self.check:
-            self.check()
-        await self._io(partial(run_flow, self.runner, self.owner, self.flows / f"{name}.yaml", credentials=credentials))
+        await self._io(
+            partial(
+                run_flow,
+                self.runner,
+                self.owner,
+                self.flows / f"{name}.yaml",
+                credentials=credentials,
+                target=self.target,
+            )
+        )
 
     async def commands(self, commands: list[dict | str], *, app_id: str = PHOTOS_PACKAGE) -> None:
-        if self.check:
-            self.check()
         with tempfile.TemporaryDirectory(prefix="movie-flow-") as temporary:
             path = Path(temporary) / "flow.yaml"
             path.write_text(f"appId: {app_id}\n---\n" + yaml.safe_dump(commands))
-            await self._io(partial(run_flow, self.runner, self.owner, path))
+            await self._io(partial(run_flow, self.runner, self.owner, path, target=self.target))
 
-    async def login(self, session: RedroidSession, account: Account) -> None:
+    async def login(self, session: RedroidSession | WindowsAndroidSession, account: Account) -> None:
         self.guard(session)
-        await self.adb("connect", "127.0.0.1:5555")
+        if self.windows_device is None:
+            await self.adb("connect", self.target.serial)
+        elif self.windows_device.session.account_id != account.id:
+            raise CanaryBlockedError("Windows account binding changed")
         accounts = await self.adb("shell", "dumpsys", "account")
         if f"name={account.email}, type=com.google" not in accounts:
             await self._sign_in(account)
@@ -400,7 +471,7 @@ class MaestroPartUploader:
             )
         return result
 
-    async def push_file(self, session: RedroidSession, local_path: str) -> str:
+    async def push_file(self, session: RedroidSession | WindowsAndroidSession, local_path: str) -> str:
         self.guard(session)
         path = Path(local_path)
         if (
@@ -483,7 +554,7 @@ class MaestroPartUploader:
             self.recovery["media_id"] = ids[0]
             await self.save(self.recovery)
 
-    async def trigger_upload(self, session: RedroidSession, remote_path: str) -> None:
+    async def trigger_upload(self, session: RedroidSession | WindowsAndroidSession, remote_path: str) -> None:
         """Record the intent to back this part up, and nothing more.
 
         Backup is not something this process starts: it happens because Original
@@ -540,6 +611,24 @@ class MaestroPartUploader:
             await self.adb("shell", "input", "keyevent", "127")
 
     async def clipboard(self) -> str | None:
+        def parse(raw: str) -> str | None:
+            words = []
+            for line in raw.splitlines():
+                if re.search(r"0x[0-9a-f]+:", line):
+                    words.extend(re.findall(r"\b[0-9a-f]{8}\b", line.split(":", 1)[1].split("'")[0]))
+            text = b"".join(struct.pack("<I", int(w, 16)) for w in words).decode("utf-16le", errors="ignore")
+            urls = set(re.findall(r"https://photos\.app\.goo\.gl/[A-Za-z0-9_-]+", text))
+            return urls.pop() if len(urls) == 1 else None
+
+        if self.windows_device is not None:
+            output = await self.adb("shell", "cmd", "package", "list", "packages", "-U", PHOTOS_PACKAGE)
+            uid = re.search(r"uid:(\d+)", output)
+            if uid is None:
+                raise CanaryBlockedError("Photos UID unavailable")
+            command = f"service call clipboard 4 s16 {PHOTOS_PACKAGE} i32 0"
+            result = await self.adb("shell", f"/debug_ramdisk/su {uid[1]} -c {shlex.quote(command)}")
+            return parse(result)
+
         def read() -> str | None:
             output = self.guest.exec_run(["cmd", "package", "list", "packages", "-U", PHOTOS_PACKAGE])
             uid = re.search(r"uid:(\d+)", output.output.decode())
@@ -548,13 +637,7 @@ class MaestroPartUploader:
             result = self.guest.exec_run(
                 ["service", "call", "clipboard", "4", "s16", PHOTOS_PACKAGE, "i32", "0"], user=uid[1]
             )
-            words = []
-            for line in result.output.decode(errors="replace").splitlines():
-                if re.search(r"0x[0-9a-f]+:", line):
-                    words.extend(re.findall(r"\b[0-9a-f]{8}\b", line.split(":", 1)[1].split("'")[0]))
-            text = b"".join(struct.pack("<I", int(w, 16)) for w in words).decode("utf-16le", errors="ignore")
-            urls = set(re.findall(r"https://photos\.app\.goo\.gl/[A-Za-z0-9_-]+", text))
-            return urls.pop() if len(urls) == 1 else None
+            return parse(result.output.decode(errors="replace"))
 
         return await self._io(read)
 
@@ -567,7 +650,9 @@ class MaestroPartVerifier:
         install_http_url_log_redaction()
         self.uploader = uploader
 
-    async def share_selected_existing(self, session: RedroidSession, account: Account) -> tuple[str, dict]:
+    async def share_selected_existing(
+        self, session: RedroidSession | WindowsAndroidSession, account: Account
+    ) -> tuple[str, dict]:
         """Inspect the current exact item; never open a possibly corrupt local URI.
 
         The operator-selected details screen is a prerequisite. Missing/stale
@@ -610,7 +695,7 @@ class MaestroPartVerifier:
             collect_item(attrs, upload.part.filename, {**item, "sha256": upload.part.sha256})
         return await self._share(), item
 
-    async def wait_for_share_url(self, session: RedroidSession, timeout: int = 300) -> str:
+    async def wait_for_share_url(self, session: RedroidSession | WindowsAndroidSession, timeout: int = 300) -> str:
         upload = self.uploader
         upload.guard(session)
         deadline = time.monotonic() + min(timeout, 21600)

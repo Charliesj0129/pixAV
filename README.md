@@ -240,6 +240,8 @@ flowchart LR
 
 AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 AVD；這是 guest 配置，host RAM／GPU 開銷須另量測，開機與 UI timeout 也須實測。runner 的 `/tmp`、`/root`、`/work` 都是有限 tmpfs，CLI 狀態與報告不持久化；要保存 evidence 時另由操作者寫入私有 0700／0600 目錄。Windows SDK／新 AVD 與備份設在 D 槽；SDK 已搬到 `D:\Android\Sdk`，原 C 路徑僅為相容 junction。Windows AVD、WSL／Docker VHD 與 staging 所在實體分區各自檢查容量，不以 WSL `df` 代替 Windows 實體餘額。
 
+2026-10-14 當次隔離 AVD 已完成原生 emulator／QEMU 的 exact stop 與 cold start，保留 userdata、核對新的 Android boot epoch，原 SDK ramdisk 不變。重啟後 root UID 0、Magisk 30.7、Vector 2.2 build 3080／API 102、固定 Infinity 1.4.1 APK 與僅限 Photos／user 0 的 scope 均核對；新 Photos process 有 Pixel XL `VERIFY OK` 且 native ready 的兩筆日誌，無 VERIFY failure。診斷頁 ContentProvider IPC 回報仍有缺口，此處以新 process 的實際 hook 日誌驗證。重啟後 exact ADB／Maestro Settings launch／Home smoke exit 0，runner 實際唯讀 bind 的 device／inode／內容與 host 相符；同次 smoke 執行至結束的 23 次 Windows ADB listener 取樣均為 loopback，5037 owner 與原 server 相符。這些證明本機工具與注入契約，Photos 原始品質／容量、managed fencing 與 production 尚待驗收。
+
 ### Docker Runner 開發入口
 
 [docker-compose.android-runner.yml](docker-compose.android-runner.yml) **獨立使用**，不與 base／prod／direct／acceptance 合併；它只宣告一個工具容器，不啟動應用 worker，也不自動登入、push 或 upload。[`.env.example`](.env.example) 的 `PIXAV_ANDROID_*` 鍵只供這份 Compose 使用，未增加可用的 `PIXAV_PIXEL_INJECTOR_MODE`。
@@ -247,6 +249,10 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 [Android transport selector](src/pixav/pixel_injector/android_target.py) 讓 [Maestro flow／hierarchy](src/pixav/pixel_injector/canary_maestro.py) 明確接收 Windows server 與 exact emulator serial；提供 credentials 或操作 UI 前，拒絕與 runner `ADB_SERVER_SOCKET`／`ANDROID_SERIAL` 不一致或重複的設定。未指定 external target 的 caller 也不能默默接到 Windows runner。serial 仍不代表 runtime identity／ownership／fencing；managed callers、runtime migration 與失聯後 fencing 尚待驗收。transport 與帳號／owner UI 鎖變更的完整檢查為 1,874 passed／8 skipped，含身分核對的專用 PostgreSQL／Redis 核心整合；未執行的 live／restart drill 不列為通過。
 
 [022 expand migration](migrations/022_external_android_runtime.sql) 新增 `upload_runtimes` 與 `photos_ui_sessions`。原 `guest_runtimes` 不改動，登錄其原 identity 並維持待 reconciliation；runtime identity／tools binding 改變須建立新 generation。持久 session 綁定原 activity／operation／generation，帳號、device、runtime owner 與全域 upload slot 各自排他；連線結束或 DB-clock lease 到期都不授權新 writer 接手。過期 session 或 execution stage 已改變時 heartbeat 拒絕續租並維持 halt 要求。worker 可取得／heartbeat session，只有 authority 可登錄綁定原 identity 的 halt 收據，且登錄前仍須獨立核實原 runner／native writers 已停止。SQL 不會停止 Windows 裝置，也不會驗證外部 boolean 的真實性。當次 [17 項真 PostgreSQL 情境](tests/integration/test_external_android_runtime.py) 與完整 1,891 passed／8 skipped 通過，含 full dump／restore 後原 runtime／operation／generation 及 active fence 逐欄不變；caller 接入、Windows halt observer、當前資料的 migration／restore、live 故障恢復與 production apply 仍待驗收，不能據此宣告 Stage 2 完成。
+
+[Windows session](src/pixav/pixel_injector/session.py) 與 [device binding](src/pixav/pixel_injector/windows_device.py) 已供 [Maestro uploader](src/pixav/pixel_injector/maestro_parts.py) 明確選擇外部 target，不把 serial 填入 container identity。首次效果前先 journal runtime／generation／boot／tools binding；未 reconciliation 的舊 recovery 或改變的 binding 進 `RUNTIME_BINDING_CHANGED` 人工處理，不能移到另一裝置重做。ADB、flow、hierarchy 與 Photos UID clipboard 走同一 selector；Windows 分支不執行 redroid `adb connect` 或 guest `exec_run`。每次效果須有 UI guard 並核對 tools identity 及 native observer；guard 失效停止 exact tools 並要求停止原 native writers，任何 halt 不明仍保留 DB fence。worker 尚未接上持久 session／host observer，不能把 callable guard 或測試 fake 當成已完成 fencing。[24 項 driver 邊界測試](tests/pixel_injector/test_windows_device.py) 及 storage 人工處理契約已通過，完整檢查為 1,916 passed／8 skipped，含專用 PostgreSQL／Redis；Ruff／Black／isort／mypy 亦通過。
+
+driver 沿用 ADB 預設 120 秒、push／hash 最長六小時與 Maestro flow／hierarchy 90 秒，guard 每秒核對；tools stop timeout 10 秒。native observer／stop 尚待受控 host adapter 實作與實測 deadline；沒有新的 host health／metrics endpoint。版本／license、runner 唯讀 staging 與有限 tmpfs、secret 的 per-call 傳遞沿用前述工具契約；不將帳密放進 session。runtime／UI session journal 納入完整 DB 備份還原；切換與 rollback 仍需相容 authority／worker 成對驗證，舊程序不能忽略持久 fence。
 
 先在 Windows 安裝 Android SDK／Emulator、啟用 WHPX，透過 Device Manager 建立專用 AVD；依 host 架構選 system image，需 Photos／Play 的映像另驗登入及指定上傳能力。以下 PowerShell 的 SDK 路徑與 AVD 名稱是範例，使用前核對實際位置與版本：
 
@@ -306,7 +312,7 @@ ADB server port 是 **5037**；`adb connect HOST:5555` 連的是裝置 adbd，�
 
 ### managed 上傳的遷移契約與驗收
 
-目前 [Settings](src/pixav/config.py)、[storage caller](src/pixav/pixel_injector/storage_worker.py)、[ManagedRuntime](src/pixav/pixel_injector/managed_runtime.py)、[Maestro upload](src/pixav/pixel_injector/maestro_parts.py) 與 [canary Maestro](src/pixav/pixel_injector/canary_maestro.py) 仍採 redroid guest／container identity、`network_mode=container:<guest>` 與 `127.0.0.1:5555`。本次只交付設計與開發工具入口，**尚未將 managed 上傳接到 Windows Emulator**。`PIXAV_PIXEL_INJECTOR_MODE` 的現有 `redroid/local` 值保持原義，不能設一個未實作的 Emulator mode 並宣稱完成。
+目前 [Settings](src/pixav/config.py)、[storage caller](src/pixav/pixel_injector/storage_worker.py) 與 [ManagedRuntime](src/pixav/pixel_injector/managed_runtime.py) 的組裝仍採 redroid guest／container identity 與 `network_mode=container:<guest>`。[Maestro upload](src/pixav/pixel_injector/maestro_parts.py) 及 [canary Maestro](src/pixav/pixel_injector/canary_maestro.py) 已有明確的外部 target 分支，legacy 預設仍為 `127.0.0.1:5555`；**尚未將 managed 上傳接到 Windows Emulator**。`PIXAV_PIXEL_INJECTOR_MODE` 的現有 `redroid/local` 值保持原義，不能設一個未實作的 Emulator mode 並宣稱完成。
 
 後續實作依下列順序接入，沿用原 domain／execution 契約：
 
@@ -320,9 +326,9 @@ AVD userdata、system image／SDK rebuild manifest、設定、ADB keys、runtime
 
 | 新方案需證明的關卡 | BDD 對應 | 本次交付界線 |
 | --- | --- | --- |
-| Microsoft kernel 下 Docker／WSL 與 Windows WHPX Emulator 共存；原 daemon／mounts 不變 | BDD-044、141–142 | 設計限制；主機相容性 live OPEN |
-| exact AVD／帳號／owner；多裝置不誤選；ADB／Maestro forwarding／UI 失聯安全停止 | BDD-040–045、127、141 | runner Compose／smoke 入口；live OPEN |
-| 切換／crash 沿用 intent，未知結果不重傳、成功用量不重扣 | BDD-003、048–049、113、128 | 既有守衛保留；新 adapter／migration 待實作 |
+| Microsoft kernel 下 Docker／WSL 與 Windows WHPX Emulator 共存；原 daemon／mounts 不變 | BDD-044、141–142 | 當次原 daemon／保留 volumes 已核對；本機 Emulator／runner 共存，退休 bind 的缺口與新部署驗收仍 OPEN |
+| exact AVD／帳號／owner；多裝置不誤選；ADB／Maestro forwarding／UI 失聯安全停止 | BDD-040–045、127、141 | exact ADB／Maestro smoke 與 cold start 後 root／Photos hook 已驗；帳號／多裝置與 managed fencing live OPEN |
+| 切換／crash 沿用 intent，未知結果不重傳、成功用量不重扣 | BDD-003、048–049、113、128 | expand／隔離 restore 與 Windows driver 邊界已驗；相容 caller／host observer 與 live recovery OPEN |
 | 原始品質、quota、cold read-back、READY／publication、刪 staging 與清 cache 後恢復 | BDD-047–063、109–118、130–143 | 完整新環境驗收 OPEN，不能沿用舊 runtime PASS |
 
 ## 部署與資料操作

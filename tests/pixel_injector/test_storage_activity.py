@@ -172,7 +172,13 @@ async def test_login_challenge_stops_automatic_submission_bdd_045():
 
 @pytest.mark.parametrize(
     "code",
-    ["GUEST_STAGE_HASH_MISMATCH", "PUBLISHED_COPY_HASH_MISMATCH", "WRONG_PROVIDER_ITEM", "REMOTE_OUTCOME_UNKNOWN"],
+    [
+        "GUEST_STAGE_HASH_MISMATCH",
+        "PUBLISHED_COPY_HASH_MISMATCH",
+        "WRONG_PROVIDER_ITEM",
+        "REMOTE_OUTCOME_UNKNOWN",
+        "RUNTIME_BINDING_CHANGED",
+    ],
 )
 async def test_upload_review_codes_are_fixed_and_do_not_expose_private_exception(code):
     activity = worker(FakePool(segment_row()), uploader=Uploader(UploadReviewRequiredError(code, "private detail")))
