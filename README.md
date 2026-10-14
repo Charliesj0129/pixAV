@@ -42,7 +42,7 @@ repository 只保留 [Windows Android 工具入口](docker-compose.android-runne
 
 當前 Windows Docker Desktop 資料磁碟為 `D:\DockerDesktopData\disk\docker_data.vhdx`，其開機 distro 亦位於同一 D 槽根目錄；Ubuntu-24.04 的 Docker WSL 整合已核對。Android SDK 位於 `D:\Android\Sdk`，原 C 槽 SDK 路徑只是相容 junction。專案、保留 guest、備份及還原均實際位於 D 槽。不能沿用已不存在的 `docker-desktop-data` registration 或舊 `wsl/data/ext4.vhdx` 搬移腳本；每次操作仍核對當前 daemon 與實體位置。
 
-2026-10-13 操作者確認已人工移除十四個 pixAV 舊容器；當次核對原 daemon、五十九個保留 volumes、離線 DB system identifier、當前 DB 三十張表的內容與完整 roles／認證、保留資料內容及十四個可定位的實際 bind；隔離查詢使用原 DB volume 的唯讀 tmpfs 複本，原檔案 fingerprint 不變。舊播放 cache／tools staging 的三個 binding 已失去原暫時路徑，維持未核實；新部署須重新核對其 host／container device、inode 與內容。保留 guest 資料、journal、operation／generation，缺失容器引用先 reconciliation；刪除容器不能授權重傳。2026-10-14 重查時另有其他專案的既有服務運行，保留當前狀態，不沿用舊停機集合操作。WSL 內刪檔與 trim 不代表 Windows D 槽已回收同量實體空間，未取得實體容量證據不得宣稱。
+2026-10-13 盤點發現十四個 pixAV 舊容器已被移除，2026-10-14 操作者確認因認為不再需要而人工刪除；當次核對原 daemon、五十九個保留 volumes、離線 DB system identifier、當前 DB 三十張表的內容與完整 roles／認證、保留資料內容及十四個可定位的實際 bind；隔離查詢使用原 DB volume 的唯讀 tmpfs 複本，原檔案 fingerprint 不變。舊播放 cache／tools staging 的三個 binding 已失去原暫時路徑，維持未核實；新部署須重新核對其 host／container device、inode 與內容。保留 guest 資料、journal、operation／generation，缺失容器引用先 reconciliation；刪除容器不能授權重傳。2026-10-14 重查時另有其他專案的既有服務運行，保留當前狀態，不沿用舊停機集合操作。WSL 內刪檔與 trim 不代表 Windows D 槽已回收同量實體空間，未取得實體容量證據不得宣稱。
 
 搬移前核對當前 daemon、原容器／volume 集合、DB identifier／ledger、queue checkpoint 與實際 bind 身分；一致離線加密備份和獨立完整還原通過後，才改變資料位置並精確清除原 C 副本。目的地、備份、還原及 staging 均核對底層實體磁碟，保留 100 GiB／10% reserve。全 WSL 釋鎖若新增其他專案中斷範圍，須取得當次授權。搬移成功、刪檔與 Windows 實體容量釋放各自以收據判定。
 
