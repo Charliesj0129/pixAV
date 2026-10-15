@@ -1,6 +1,7 @@
 """Host ownership survives failures and cannot be reopened by stale requests."""
 
 import asyncio
+import hashlib
 import json
 import threading
 import uuid
@@ -10,13 +11,14 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from pixav.pixel_injector.windows_host import NativeControlError, WindowsHost, create_app
+from pixav.pixel_injector.windows_host import NativeControl, NativeControlError, WindowsHost, create_app
 from pixav.pixel_injector.windows_host_models import (
     HostUIRequest,
     NativeIdentity,
     WindowsHostManifest,
     canonical_digest,
 )
+from tests.pixel_injector.test_windows_environment import environment_data
 
 
 @pytest.fixture
@@ -31,6 +33,9 @@ def manifest():
             "boot_id": str(uuid.uuid4()),
             "processes": {"adb": process, "emulator": {**process, "pid": 104}, "qemu": {**process, "pid": 108}},
         }
+    )
+    native = NativeIdentity.model_validate(
+        {**native.payload(), "environment": environment_data(native.boot_id, native.avd_name)}
     )
     return WindowsHostManifest(
         runtime_id=uuid.uuid4(),
@@ -194,5 +199,102 @@ async def test_http_contract_rejects_unbounded_and_secret_echoing_payloads(host)
 def test_manifest_cannot_bind_a_different_native_identity(manifest):
     value = deepcopy(manifest.model_dump(mode="json"))
     value["native"]["boot_id"] = str(uuid.uuid4())
+    value["native"]["environment"]["boot_id"] = value["native"]["boot_id"]
     with pytest.raises(ValueError, match="digest mismatch"):
         WindowsHostManifest.model_validate(value)
+
+
+async def test_process_only_registration_cannot_admit_new_host_ticket(host):
+    native = host.manifest.native.model_copy(update={"environment": None})
+    host.manifest = host.manifest.model_copy(
+        update={"native": native, "identity_sha256": canonical_digest(native.payload())}
+    )
+    with pytest.raises(NativeControlError, match="ENVIRONMENT"):
+        await host.claim(request(host.manifest))
+    assert not host.journal.exists()
+
+
+def test_native_observation_requires_actual_environment_verification(manifest):
+    control = object.__new__(NativeControl)
+    control.manifest = manifest
+    response = {**manifest.native.payload(), "result": "NATIVE_IDENTITY_OBSERVED"}
+    with pytest.raises(NativeControlError, match="ENVIRONMENT_UNCONFIRMED"):
+        control._validate_response("observe", response)
+    response["environment_verified"] = True
+    control._validate_response("observe", response)
+
+
+async def test_legacy_process_identity_can_still_reconcile_original_halt(host):
+    native = host.manifest.native.model_copy(update={"environment": None})
+    legacy = host.manifest.model_copy(update={"native": native, "identity_sha256": canonical_digest(native.payload())})
+    original = request(legacy)
+    host._persist(
+        {
+            "state": "ACTIVE",
+            "binding": original.public_binding(),
+            "token_sha256": hashlib.sha256(original.session_token.bytes).hexdigest(),
+        }
+    )
+    restarted = WindowsHost(legacy, host.control, host.journal)
+    receipt = await restarted.halt(original)
+    assert receipt["operation_id"] == str(original.operation_id)
+    assert receipt["generation"] == original.generation
+    assert await restarted.verify_halt(original) == receipt
+
+
+def test_broken_environment_blocks_observation_but_retains_exact_emergency_halt(manifest, tmp_path, monkeypatch):
+    import pixav.pixel_injector.windows_host as module
+
+    def unavailable(*_):
+        raise OSError("synthetic missing environment file")
+
+    monkeypatch.setattr(module, "EnvironmentFiles", unavailable)
+    script = tmp_path / "control.ps1"
+    script.write_text("# synthetic pinned script")
+    control = NativeControl(script, manifest, script_sha256=hashlib.sha256(script.read_bytes()).hexdigest())
+    original = request(manifest, cold=True)
+    with pytest.raises(NativeControlError, match="ENVIRONMENT_REVIEW_REQUIRED"):
+        control.run("observe", original)
+    response = manifest.native.payload()
+    response["processes"].pop("adb")
+    response["result"] = "ORIGINAL_NATIVE_WRITERS_STOPPED"
+    for process in response["processes"].values():
+        process["original_process_absent"] = True
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    monkeypatch.setattr(
+        module.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json.dumps(response).encode())
+    )
+    assert control.run("halt", original)["result"] == "ORIGINAL_NATIVE_WRITERS_STOPPED"
+
+
+def test_legacy_native_digest_does_not_gain_a_null_environment_field(manifest):
+    value = manifest.native.payload()
+    value.pop("environment")
+    legacy = NativeIdentity.model_validate(value)
+    assert legacy.payload() == value
+    assert canonical_digest(legacy.payload()) == canonical_digest(value)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (b'{"code":"NATIVE_LAUNCH_BINDING_MISMATCH"}', "NATIVE_LAUNCH_BINDING_MISMATCH"),
+        (b'{"code":"synthetic private payload"}', "NATIVE_OBSERVATION_REJECTED"),
+        (b"synthetic private payload", "NATIVE_OBSERVATION_REJECTED"),
+        (b"[]", "NATIVE_OBSERVATION_REJECTED"),
+        (b"x" * 4097, "NATIVE_OBSERVATION_REJECTED"),
+    ],
+)
+def test_only_bounded_native_error_codes_cross_host_boundary(manifest, tmp_path, monkeypatch, stderr, expected):
+    import pixav.pixel_injector.windows_host as module
+
+    script = tmp_path / "control.ps1"
+    script.write_text("# synthetic pinned script")
+    control = NativeControl(script, manifest, script_sha256=hashlib.sha256(script.read_bytes()).hexdigest())
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    monkeypatch.setattr(
+        module.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=1, stdout=b"", stderr=stderr)
+    )
+    with pytest.raises(NativeControlError) as error:
+        control.run("halt", request(manifest, cold=True))
+    assert str(error.value) == expected

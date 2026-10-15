@@ -12,11 +12,13 @@ from docker.errors import NotFound
 
 from pixav.maxwell_core.windows_ui_reconciliation import WindowsUIReconciler
 from pixav.pixel_injector.canary import OWNER_LABEL, CanaryBlockedError
+from pixav.pixel_injector.windows_environment import WindowsEnvironment
 from pixav.pixel_injector.windows_host import WindowsHost
 from pixav.pixel_injector.windows_host_models import NativeIdentity, WindowsHostManifest, canonical_digest
 from pixav.pixel_injector.windows_managed_runtime import WindowsManagedRuntime
 from pixav.shared.activity_context import activity_context
 from tests.integration.test_external_android_runtime import envelope, request
+from tests.pixel_injector.test_windows_environment import environment_data
 
 pytestmark = pytest.mark.integration
 
@@ -38,6 +40,9 @@ async def managed(integration_db, tmp_path):
             "processes": {"adb": process, "emulator": {**process, "pid": 104}, "qemu": {**process, "pid": 108}},
         }
     )
+    native = native.model_copy(
+        update={"environment": WindowsEnvironment.model_validate(environment_data(native.boot_id, native.avd_name))}
+    )
     digest = canonical_digest(native.payload())
     image = "sha256:" + "b" * 64
     staging = tmp_path / "staging"
@@ -45,7 +50,7 @@ async def managed(integration_db, tmp_path):
     await pool.execute(
         """INSERT INTO upload_runtimes(runtime_id,generation,owner,kind,account_id,device_key,profile,
       identity,identity_sha256,tools_id,tools_image,staging_root,state)
-      VALUES($1,1,$2,'windows_android',$3,'synthetic-avd','synthetic-profile',$4::jsonb,$5,'synthetic-tools',$6,$7,'READY')""",
+      VALUES($1,1,$2,'windows_android',$3,'synthetic-avd','gphotos_pixel_xl_infinity_v1',$4::jsonb,$5,'synthetic-tools',$6,$7,'READY')""",
         runtime_id,
         owner,
         account,
@@ -114,7 +119,7 @@ async def managed(integration_db, tmp_path):
         generation=1,
         owner=owner,
         staging_root=staging,
-        profile="synthetic-profile",
+        profile="gphotos_pixel_xl_infinity_v1",
         docker_daemon_id="synthetic-daemon",
     )
     return SimpleNamespace(
@@ -161,6 +166,28 @@ async def test_changed_daemon_cannot_attach_or_start_tools(managed):
     with pytest.raises(CanaryBlockedError, match="daemon identity"):
         async with state.runtime.acquire(state.binding[2]):
             pytest.fail("attached to a different daemon")
+    state.docker.containers.get.assert_not_called()
+    state.runner.start.assert_not_called()
+    assert await state.pool.fetchval("SELECT count(*) FROM photos_ui_sessions") == 0
+
+
+async def test_process_only_registration_cannot_start_managed_tools(managed):
+    state = managed
+    native = state.host.manifest.native.model_copy(update={"environment": None})
+    await state.pool.execute(
+        """INSERT INTO upload_runtimes(runtime_id,generation,owner,kind,account_id,device_key,profile,
+        identity,identity_sha256,tools_id,tools_image,staging_root,state)
+        SELECT runtime_id,2,owner,kind,account_id,device_key,profile,
+               $1::jsonb,$2,tools_id,tools_image,staging_root,state
+          FROM upload_runtimes WHERE runtime_id=$3 AND generation=1""",
+        json.dumps(native.payload()),
+        canonical_digest(native.payload()),
+        state.binding[0],
+    )
+    state.runtime.generation = 2
+    with pytest.raises(CanaryBlockedError, match="identity invalid"):
+        async with state.runtime.acquire(state.binding[2]):
+            pytest.fail("admitted process-only runtime")
     state.docker.containers.get.assert_not_called()
     state.runner.start.assert_not_called()
     assert await state.pool.fetchval("SELECT count(*) FROM photos_ui_sessions") == 0

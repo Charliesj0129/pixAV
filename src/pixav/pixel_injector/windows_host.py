@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import ssl
 import subprocess
 import tempfile
@@ -21,6 +22,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
+from pixav.pixel_injector.windows_environment import EnvironmentFiles
 from pixav.pixel_injector.windows_host_models import (
     HostHaltReceipt,
     HostUIRequest,
@@ -39,10 +41,33 @@ class NativeControl:
             raise NativeControlError("NATIVE_SCRIPT_IDENTITY_MISMATCH")
         self.script, self.manifest, self.timeout = script, manifest, timeout
         self.script_sha256 = script_sha256
+        self.environment_files = None
+        self.environment_error = False
+        if manifest.native.environment is not None:
+            try:
+                self.environment_files = EnvironmentFiles(manifest.native.environment, manifest.native.sdk_root)
+            except (OSError, ValueError, RuntimeError):
+                # Retain the original process identity so emergency halt remains
+                # possible. Admission/readiness cannot use a broken environment.
+                self.environment_error = True
 
     def run(self, mode: str, subject: HostUIRequest) -> dict:
+        self._verify_environment(mode)
         if not hmac.compare_digest(hashlib.sha256(self.script.read_bytes()).hexdigest(), self.script_sha256):
             raise NativeControlError("NATIVE_SCRIPT_IDENTITY_MISMATCH")
+        return self._invoke(mode, subject)
+
+    def _verify_environment(self, mode: str) -> None:
+        if mode not in {"halt", "stopped"}:
+            if self.environment_error:
+                raise NativeControlError("NATIVE_ENVIRONMENT_REVIEW_REQUIRED")
+            if self.environment_files is not None:
+                try:
+                    self.environment_files.verify()
+                except (OSError, ValueError):
+                    raise NativeControlError("NATIVE_ENVIRONMENT_BINDING_CHANGED") from None
+
+    def _invoke(self, mode: str, subject: HostUIRequest) -> dict:
         payload = {**self.manifest.native.payload(), "session_id": str(subject.session_id)}
         try:
             result = subprocess.run(  # noqa: S603 - fixed executable and digest-pinned local script; JSON only on stdin
@@ -63,7 +88,9 @@ class NativeControl:
             )
         except (OSError, subprocess.TimeoutExpired):
             raise NativeControlError("NATIVE_OBSERVATION_UNCONFIRMED") from None
-        if result.returncode != 0 or len(result.stdout) > 16384:
+        if result.returncode != 0:
+            raise NativeControlError(self._failure_code(result.stderr))
+        if len(result.stdout) > 16384:
             raise NativeControlError("NATIVE_OBSERVATION_REJECTED")
         try:
             response = json.loads(result.stdout.decode("utf-8-sig"))
@@ -74,10 +101,27 @@ class NativeControl:
         self._validate_response(mode, response)
         return response
 
+    @staticmethod
+    def _failure_code(stderr: bytes) -> str:
+        try:
+            error = json.loads(stderr) if len(stderr) <= 4096 else {}
+            code = error.get("code") if isinstance(error, dict) else None
+        except (ValueError, UnicodeError):
+            code = None
+        if isinstance(code, str) and re.fullmatch(r"NATIVE_[A-Z_]{1,80}", code):
+            return code
+        return "NATIVE_OBSERVATION_REJECTED"
+
     def _validate_response(self, mode: str, response: dict) -> None:
         expected = self.manifest.native.payload()
         if any(response.get(key) != expected[key] for key in ("schema", "sdk_root", "serial", "avd_name", "boot_id")):
             raise NativeControlError("NATIVE_RESPONSE_BINDING_CHANGED")
+        if (
+            self.manifest.native.environment is not None
+            and mode not in {"halt", "stopped"}
+            and response.get("environment_verified") is not True
+        ):
+            raise NativeControlError("NATIVE_RESPONSE_ENVIRONMENT_UNCONFIRMED")
         processes = response.get("processes")
         roles = {"emulator", "qemu"} if mode in {"halt", "stopped"} else {"adb", "emulator", "qemu"}
         if not isinstance(processes, dict) or set(processes) != roles:
@@ -149,6 +193,8 @@ class WindowsHost:
     async def claim(self, request: HostUIRequest) -> dict:
         async with self.lock:
             self._binding(request)
+            if self.manifest.native.environment is None:
+                raise NativeControlError("NATIVE_ENVIRONMENT_REVIEW_REQUIRED")
             repeated = False
             if str(request.session_id) in (self.state or {}).get("closed_sessions", []):
                 raise NativeControlError("NATIVE_RESOURCE_TICKET_RETIRED")

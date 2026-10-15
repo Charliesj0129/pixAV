@@ -9,6 +9,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from pixav.pixel_injector.windows_environment import WindowsEnvironment
+
 
 def canonical_digest(value: dict) -> str:
     return hashlib.sha256(
@@ -40,16 +42,21 @@ class NativeIdentity(BaseModel):
     boot_id: UUID
     processes: NativeProcesses
     result: Literal["NATIVE_IDENTITY_OBSERVED"] = "NATIVE_IDENTITY_OBSERVED"
+    environment: WindowsEnvironment | None = None
 
     @model_validator(mode="after")
     def validate_serial(self) -> NativeIdentity:
         port = int(self.serial.split("-")[1])
         if port < 5554 or port > 5682 or port % 2:
             raise ValueError("invalid native emulator port")
+        if self.environment is not None and (
+            self.environment.boot_id != self.boot_id or self.environment.avd_name != self.avd_name
+        ):
+            raise ValueError("environment evidence belongs to a different boot or AVD")
         return self
 
     def payload(self) -> dict:
-        return self.model_dump(mode="json", by_alias=True)
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
 class WindowsHostManifest(BaseModel):

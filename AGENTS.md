@@ -32,6 +32,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - 資料操作、備份、cleanup、migration、replay 前核對 Docker daemon/context、DB identifier/database、Redis run ID；localhost、container name 與歷史值不是 identity 證明。 主機／daemon 恢復後亦核對必要 bind mount 的 host／container 實際目錄、device／inode 與內容；inspect 的 Source 字串相同不足以證明掛載正確，空掛載不可誤當資料遺失而覆寫。
 - 破壞性資料 script 預設 dry-run；dry-run 不改資料、queue 或檔案。apply 要同實例 full backup/sidecar、exact target/count、selected-row/queue backup。備份從建立起 0600、目錄 0700，離機加密保存並驗證 restore；此規則適用資料，不要求文件備份。
 - 本次階段 3–5 隔離驗收依操作者授權，允許本機加密完整備份加同機獨立完整還原，作為本輪 cleanup 的備份前置例外；仍須通過一致快照、roles／ledger／queue／guest／觀看紀錄及精確刪除守衛。例外不代表離機備份、整機故障恢復或 production promotion 通過。
+- 2026-10-15 操作者指示本輪略過離機備份規則，停止新增備份；保留已建立的本機備份與獨立還原資料。後續沿用此授權，不再次要求離機目的地；其他資料操作與驗收守衛仍適用。
 - `.env`、`secrets/`、`backups/` 不進版控；credential 不進 log、model repr、metrics、fixture、projection 或 Maestro YAML。private playback 必須驗收未授權 client 與撤銷裝置被拒絕。
 - 新 cohort 的真實影音採版本化 evidence，完整 manifest／reference／錄影與全部交界須可重算；自動 capture 不能代替操作者實看實聽，舊版人工證據不自動升級。
 - 2026-10-12 操作者授權設計 checkpoint 重置：舊隔離影片／分段／回載／播放 cache／影音錄影可依 exact-target manifest 人工丟棄且不備份影片本體。先保留並驗證 D 槽的程式／設定／DB／roles／ledger／queue／guest／未知上傳紀錄與認證；此為一次性人工重置，不記 Golden Path PASS，不放寬正式 cleanup 或未知副作用 reconciliation。舊 cohort 的已刪媒體與錄影不抵新驗收，下一輪用新 cohort 重跑全部 gate。

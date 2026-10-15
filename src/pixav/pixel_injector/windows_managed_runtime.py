@@ -53,6 +53,8 @@ class WindowsManagedRuntime:
         raw = json.loads(row["identity"]) if isinstance(row["identity"], str) else row["identity"]
         try:
             identity = NativeIdentity.model_validate(raw)
+            if identity.environment is None or identity.environment.profile != row["profile"]:
+                raise ValueError("managed admission requires complete environment evidence")
             if canonical_digest(identity.payload()) != row["identity_sha256"]:
                 raise ValueError("identity digest changed")
             return WindowsAndroidSession(

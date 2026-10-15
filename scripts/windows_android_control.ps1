@@ -22,6 +22,10 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class PixavNativeProcess {
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern IntPtr CommandLineToArgvW(string commandLine, out int argc);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr memory);
     [DllImport("kernel32.dll", SetLastError=true)]
     public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError=true)]
@@ -39,6 +43,25 @@ public static class PixavNativeProcess {
 
 $pixavHandles = @{}
 $pixavRecords = @{}
+function Assert-PixavLaunch([string] $CommandLine) {
+    if (!$pixavSpec.environment) {return}
+    [int]$pixavCount=0
+    $pixavArgv=[PixavNativeProcess]::CommandLineToArgvW($CommandLine,[ref]$pixavCount)
+    if ($pixavArgv -eq [IntPtr]::Zero) {throw 'NATIVE_LAUNCH_ARGUMENTS_UNAVAILABLE'}
+    try {
+        $pixavArguments=@()
+        for ($pixavIndex=1;$pixavIndex -lt $pixavCount;$pixavIndex++) {
+            $pixavPointer=[Runtime.InteropServices.Marshal]::ReadIntPtr($pixavArgv,$pixavIndex*[IntPtr]::Size)
+            $pixavArguments += [Runtime.InteropServices.Marshal]::PtrToStringUni($pixavPointer)
+        }
+        $pixavExpected=@('-avd',$pixavSpec.avd_name,'-datadir',$pixavSpec.environment.avd_path,'-sysdir',(Join-Path $pixavSdk 'system-images\android-35\google_apis_playstore\x86_64'),'-port',$pixavPort.ToString(),'-cores','2','-memory','4096','-gpu','swiftshader_indirect','-no-window','-no-snapshot-load','-no-snapshot-save','-no-boot-anim','-ramdisk',$pixavSpec.environment.private_ramdisk.path)
+        if ($pixavArguments.Count -ne $pixavExpected.Count) {throw 'NATIVE_LAUNCH_BINDING_MISMATCH'}
+        for ($pixavIndex=0;$pixavIndex -lt $pixavExpected.Count;$pixavIndex++) {
+            if (![string]::Equals($pixavArguments[$pixavIndex],$pixavExpected[$pixavIndex],[StringComparison]::OrdinalIgnoreCase)) {throw 'NATIVE_LAUNCH_BINDING_MISMATCH'}
+        }
+    } finally {[void][PixavNativeProcess]::LocalFree($pixavArgv)}
+}
+
 function Open-PixavProcess([string] $Role, [string] $ExpectedPath) {
     $pixavEntry = $pixavSpec.processes.$Role
     if (!$pixavEntry -or [long]$pixavEntry.pid -le 0) { throw 'NATIVE_PROCESS_BINDING_MISSING' }
@@ -82,6 +105,53 @@ function Invoke-PixavRead([string] $Arguments) {
     return $pixavOutput.Result.Trim()
 }
 
+function Invoke-PixavRoot([string] $Script, [ValidateSet('ROOT','FRAMEWORK','MODULES','SCOPE','PACKAGE','QUIESCENCE')][string] $Operation = 'ROOT') {
+    $pixavInfo=New-Object Diagnostics.ProcessStartInfo
+    $pixavInfo.FileName=$pixavAdb
+    $pixavInfo.Arguments='-s '+$pixavSpec.serial+' shell /debug_ramdisk/su -p -c /system/bin/sh'
+    $pixavInfo.UseShellExecute=$false
+    $pixavInfo.CreateNoWindow=$true
+    $pixavInfo.RedirectStandardInput=$true
+    $pixavInfo.RedirectStandardOutput=$true
+    $pixavInfo.RedirectStandardError=$true
+    $pixavClient=[Diagnostics.Process]::Start($pixavInfo)
+    $pixavOutput=$pixavClient.StandardOutput.ReadToEndAsync()
+    $pixavError=$pixavClient.StandardError.ReadToEndAsync()
+    $pixavClient.StandardInput.WriteLine($Script)
+    $pixavClient.StandardInput.Close()
+    if (!$pixavClient.WaitForExit(10000)) {$pixavClient.Kill();throw ('NATIVE_'+$Operation+'_OBSERVATION_TIMEOUT')}
+    if ($pixavClient.ExitCode -ne 0) {throw 'NATIVE_ROOT_OBSERVATION_REJECTED'}
+    return $pixavOutput.Result.Trim()
+}
+
+function Assert-PixavEnvironment {
+    $pixavEnvironment=$pixavSpec.environment
+    if (!$pixavEnvironment) {return}
+    if ($pixavEnvironment.profile -ne 'gphotos_pixel_xl_infinity_v1' -or $pixavEnvironment.boot_id -ne $pixavSpec.boot_id) {throw 'NATIVE_ENVIRONMENT_BINDING_MISMATCH'}
+    $pixavStatusScript=@'
+test "$(cat /proc/sys/kernel/random/boot_id)" = '__BOOT__' || exit 73
+test "$(id -u)" = 0 || exit 74
+test "$(/debug_ramdisk/magisk -V)" = 30700 || exit 75
+/data/adb/modules/zygisk_vector/cli --json status
+'@
+    $pixavStatus=(Invoke-PixavRoot ($pixavStatusScript.Replace('__BOOT__',$pixavSpec.boot_id)) 'FRAMEWORK')|ConvertFrom-Json
+    if (!$pixavStatus.success -or $pixavStatus.data.'Version Code' -ne 3080 -or $pixavStatus.data.'API Version' -ne 102) {throw 'NATIVE_FRAMEWORK_CHANGED'}
+    $pixavModules=(Invoke-PixavRoot '/data/adb/modules/zygisk_vector/cli --json modules ls' 'MODULES')|ConvertFrom-Json
+    $pixavEnabled=@($pixavModules.data|Where-Object {$_.STATUS -eq 'enabled'})
+    if (!$pixavModules.success -or $pixavEnabled.Count -ne 1 -or $pixavEnabled[0].PACKAGE -ne 'io.github.samson910022.pixelifyphotos') {throw 'NATIVE_MODULE_SET_CHANGED'}
+    $pixavScope=(Invoke-PixavRoot '/data/adb/modules/zygisk_vector/cli --json scope ls io.github.samson910022.pixelifyphotos' 'SCOPE')|ConvertFrom-Json
+    if (!$pixavScope.success -or @($pixavScope.data).Count -ne 1 -or $pixavScope.data[0].APP_PACKAGE -ne 'com.google.android.apps.photos' -or $pixavScope.data[0].USER_ID -ne 0) {throw 'NATIVE_PHOTOS_SCOPE_CHANGED'}
+    foreach ($pixavPackage in @('io.github.samson910022.pixelifyphotos','com.google.android.apps.photos')) {
+        $pixavApk=Invoke-PixavRead ('shell pm path '+$pixavPackage)
+        if ($pixavApk -notmatch '^package:(/[A-Za-z0-9_./=+~-]+\.apk)$') {throw 'NATIVE_PACKAGE_PATH_UNCONFIRMED'}
+        $pixavHash=(Invoke-PixavRead ('shell sha256sum '+$matches[1])).Split(' ')[0]
+        $pixavVersion=(Invoke-PixavRoot ('dumpsys package '+$pixavPackage+' | grep -m1 versionName=') 'PACKAGE').Trim() -replace '^versionName=',''
+        if ($pixavPackage -eq 'com.google.android.apps.photos') {
+            if ($pixavHash -ne $pixavEnvironment.photos_apk_sha256 -or $pixavVersion -ne $pixavEnvironment.photos_version) {throw 'NATIVE_PHOTOS_PACKAGE_CHANGED'}
+        } elseif ($pixavHash -ne '6cac6601adbfb2e27ff4596c8d38735a7a7d0cbf228f646c5e73dbfc8b74203a' -or $pixavVersion -ne '1.4.1') {throw 'NATIVE_MODULE_PACKAGE_CHANGED'}
+    }
+}
+
 function Get-PixavQuiescence {
     if ($pixavSpec.session_id -notmatch '^[a-f0-9-]{36}$' -or $pixavSpec.boot_id -notmatch '^[a-f0-9-]{36}$') {throw 'NATIVE_SESSION_MARKER_INVALID'}
     $pixavShell=@'
@@ -99,21 +169,8 @@ printf '%s %s\n' "$tagged" "$apps"
     $pixavStop=''
     if ($Mode -eq 'quiesce') {$pixavStop='am force-stop com.google.android.apps.photos; am force-stop dev.mobile.maestro; am force-stop dev.mobile.maestro.test'}
     $pixavShell=$pixavShell.Replace('__BOOT__',$pixavSpec.boot_id).Replace('__SESSION__',$pixavSpec.session_id).Replace('__STOP_APPS__',$pixavStop)
-    $pixavInfo=New-Object Diagnostics.ProcessStartInfo
-    $pixavInfo.FileName=$pixavAdb
-    $pixavInfo.Arguments='-s '+$pixavSpec.serial+' shell /debug_ramdisk/su -p -c /system/bin/sh'
-    $pixavInfo.UseShellExecute=$false
-    $pixavInfo.CreateNoWindow=$true
-    $pixavInfo.RedirectStandardInput=$true
-    $pixavInfo.RedirectStandardOutput=$true
-    $pixavInfo.RedirectStandardError=$true
-    $pixavClient=[Diagnostics.Process]::Start($pixavInfo)
-    $pixavOutput=$pixavClient.StandardOutput.ReadToEndAsync()
-    $pixavError=$pixavClient.StandardError.ReadToEndAsync()
-    $pixavClient.StandardInput.Write($pixavShell)
-    $pixavClient.StandardInput.Close()
-    if (!$pixavClient.WaitForExit(10000)) {$pixavClient.Kill();throw 'NATIVE_QUIESCENCE_TIMEOUT'}
-    if ($pixavClient.ExitCode -ne 0 -or $pixavOutput.Result.Trim() -notmatch '^([0-9]+) ([0-9]+)$') {throw 'NATIVE_QUIESCENCE_UNCONFIRMED'}
+    $pixavOutput=Invoke-PixavRoot $pixavShell 'QUIESCENCE'
+    if ($pixavOutput -notmatch '^([0-9]+) ([0-9]+)$') {throw 'NATIVE_QUIESCENCE_UNCONFIRMED'}
     return [int]$matches[1] -eq 0 -and [int]$matches[2] -eq 0
 }
 
@@ -128,9 +185,11 @@ try {
     $pixavEmulatorCim=Get-CimInstance Win32_Process -Filter ('ProcessId='+$pixavSpec.processes.emulator.pid)
     if (!$pixavRecords.emulator.original_process_absent) {
         if (!$pixavEmulatorCim -or $pixavEmulatorCim.CommandLine -notmatch ('-avd\s+'+[regex]::Escape($pixavSpec.avd_name)+'(?:\s|$)') -or $pixavEmulatorCim.CommandLine -notmatch ('-port\s+'+$pixavPort+'(?:\s|$)')) {throw 'NATIVE_AVD_PROCESS_BINDING_MISMATCH'}
+        if ($Mode -notin @('halt','stopped')) {Assert-PixavLaunch $pixavEmulatorCim.CommandLine}
     }
     $pixavQemuCim=Get-CimInstance Win32_Process -Filter ('ProcessId='+$pixavSpec.processes.qemu.pid)
     if (!$pixavRecords.qemu.original_process_absent -and (!$pixavQemuCim -or $pixavQemuCim.ParentProcessId -ne $pixavSpec.processes.emulator.pid)) {throw 'NATIVE_QEMU_PARENT_MISMATCH'}
+    if ($Mode -notin @('halt','stopped')) {Assert-PixavLaunch $pixavQemuCim.CommandLine}
     $pixavChildren=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$pixavSpec.processes.emulator.pid)|Where-Object {$_.Name -eq 'qemu-system-x86_64-headless.exe'})
     if (@($pixavChildren|Where-Object {$_.ProcessId -ne $pixavSpec.processes.qemu.pid}).Count -ne 0) {throw 'NATIVE_CHILD_SET_MISMATCH'}
     if ($Mode -in @('halt','stopped')) {
@@ -154,12 +213,20 @@ try {
         $pixavBoot=Invoke-PixavRead 'shell cat /proc/sys/kernel/random/boot_id'
         if ($pixavName -ne $pixavSpec.avd_name -or $pixavBoot -notmatch '^[a-f0-9-]{36}$') {throw 'NATIVE_ANDROID_IDENTITY_MISMATCH'}
         if ($Mode -eq 'observe' -and $pixavBoot -ne $pixavSpec.boot_id) {throw 'NATIVE_BOOT_IDENTITY_MISMATCH'}
+        Assert-PixavEnvironment
         $pixavResult='NATIVE_IDENTITY_OBSERVED'
         if ($Mode -in @('quiesce','quiescence')) {
             if (Get-PixavQuiescence) {$pixavResult='NATIVE_UI_QUIESCENT'} else {$pixavResult='NATIVE_UI_WRITERS_ACTIVE'}
         }
     }
-    [ordered]@{schema='windows-native-control-v1'; sdk_root=$pixavSdk; serial=$pixavSpec.serial; avd_name=$pixavSpec.avd_name; boot_id=$pixavBoot; processes=$pixavRecords; result=$pixavResult}|ConvertTo-Json -Depth 5 -Compress
+    $pixavResponse=[ordered]@{schema='windows-native-control-v1'; sdk_root=$pixavSdk; serial=$pixavSpec.serial; avd_name=$pixavSpec.avd_name; boot_id=$pixavBoot; processes=$pixavRecords; result=$pixavResult}
+    if ($pixavSpec.environment -and $Mode -notin @('halt','stopped')) {$pixavResponse.environment_verified=$true}
+    $pixavResponse|ConvertTo-Json -Depth 5 -Compress
+} catch {
+    $pixavCode=$_.Exception.Message
+    if ($pixavCode -notmatch '^NATIVE_[A-Z_]{1,80}$') {$pixavCode='NATIVE_CONTROL_UNCONFIRMED'}
+    [Console]::Error.WriteLine((@{code=$pixavCode}|ConvertTo-Json -Compress))
+    exit 1
 } finally {
     foreach ($pixavHandle in $pixavHandles.Values) {[void][PixavNativeProcess]::CloseHandle($pixavHandle)}
 }
