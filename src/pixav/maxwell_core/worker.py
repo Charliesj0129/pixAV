@@ -245,6 +245,7 @@ async def run_loop(  # noqa: C901
 
     try:
         managed = None
+        windows_ui = None
         managed_queue = None
         storage_queue = None
         playback_queue = None
@@ -263,6 +264,20 @@ async def run_loop(  # noqa: C901
             from pixav.shared.authority_ownership import execution_authority_ownership
 
             await ownership.enter_async_context(execution_authority_ownership(pool))
+            if settings.pixel_injector_mode == "windows_android":
+                from pixav.maxwell_core.windows_ui_reconciliation import WindowsUIReconciler
+                from pixav.pixel_injector.storage_worker import _owner, windows_runtime
+
+                native = windows_runtime(pool, settings, owner=_owner(settings))
+                ownership.callback(native.control.close)
+                ownership.callback(native.docker.close)
+                windows_ui = WindowsUIReconciler(
+                    pool,
+                    native.docker,
+                    native.control,
+                    docker_daemon_id=settings.windows_control_docker_daemon_id,
+                    cold_image=settings.storage_readback_image,
+                )
             managed = MediaWorkflow(
                 pool,
                 local_retention_hours=settings.local_cleanup_success_hours,
@@ -342,6 +357,8 @@ async def run_loop(  # noqa: C901
 
         while True:
             try:
+                if windows_ui is not None:
+                    await windows_ui.tick()
                 if await _is_paused(redis, settings.system_pause_key):
                     logger.info("system paused via redis key %s; skip tick", settings.system_pause_key)
                     await asyncio.sleep(min(interval, 5))

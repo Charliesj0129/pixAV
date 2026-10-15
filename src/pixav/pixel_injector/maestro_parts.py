@@ -209,11 +209,20 @@ class MaestroPartUploader:
 
         def execute() -> str:
             self.target.require_runner(self.runner)
+            arguments = list(args)
+            if self.windows_device is not None and self.windows_device.ui_session_id and arguments[:1] == ["shell"]:
+                # Bind shell children to this opaque resource session. The host
+                # observes the marker before allowing a normal warm handoff.
+                command = arguments[1] if len(arguments) == 2 else shlex.join(arguments[1:])
+                arguments = [
+                    "shell",
+                    f"env PIXAV_PHOTOS_UI_SESSION={self.windows_device.ui_session_id} /system/bin/sh -c {shlex.quote(command)}",
+                ]
             previous = self.runner.client.api.timeout
             self.runner.client.api.timeout = timeout + 30
             try:
                 result = self.runner.exec_run(
-                    ["timeout", "--kill-after=5s", str(timeout), "adb", "-s", self.target.serial, *args]
+                    ["timeout", "--kill-after=5s", str(timeout), "adb", "-s", self.target.serial, *arguments]
                 )
                 if result.exit_code and not answers_with_exit_code:
                     raise CanaryBlockedError("ADB operation failed; retained guest requires reconciliation")

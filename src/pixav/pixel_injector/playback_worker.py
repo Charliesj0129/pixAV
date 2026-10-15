@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 
 def build_worker(pool: asyncpg.Pool, settings: Settings) -> PlaybackActivityWorker:
+    native = None
+    if settings.pixel_injector_mode == "windows_android":
+        from pixav.pixel_injector.storage_worker import _owner, windows_runtime
+
+        native = windows_runtime(pool, settings, owner=_owner(settings))
     cache_root = Path(settings.playback_cache_dir)
     materializer = PhotosPlaybackMaterializer(
         cache_root,
@@ -34,6 +39,7 @@ def build_worker(pool: asyncpg.Pool, settings: Settings) -> PlaybackActivityWork
         authentication_secret=settings.photos_cold_auth_secret,
         ui_pool=pool,
         owner=settings.storage_worker_owner,
+        windows_runtime=native,
     )
     return PlaybackActivityWorker(
         pool,

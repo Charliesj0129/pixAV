@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -33,6 +33,7 @@ from pixav.shared.exceptions import ReadbackUnavailableError, UploadError, Verif
 from pixav.shared.host_paths import host_path
 from pixav.shared.models import Account
 from pixav.shared.photos_ui_ownership import photos_ui_ownership
+from pixav.shared.photos_ui_session import current_photos_ui_lease
 from pixav.shared.storage_models import RemoteAssetSegment
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,7 @@ class PhotosColdReadback:
         authentication_secret: str = "",
         ui_pool: Any = None,
         owner: str = "",
+        windows_runtime: Any = None,
     ) -> None:
         self._root = root
         self._client_factory = client_factory
@@ -202,6 +204,19 @@ class PhotosColdReadback:
         self._authentication_secret = authentication_secret
         self._ui_pool = ui_pool
         self._owner = owner
+        self._windows_runtime = windows_runtime
+
+    @asynccontextmanager
+    async def _ownership(self, account_id):
+        if self._windows_runtime is not None:
+            async with self._windows_runtime.cold(account_id) as lease:
+                yield lease.check
+        else:
+            owner = await self._ui_pool.fetchval("SELECT owner FROM guest_runtimes WHERE account_id=$1", account_id)
+            if str(owner) != self._owner:
+                raise AccountSessionRequiredError("cold guest ownership changed")
+            async with photos_ui_ownership(self._ui_pool, account_id, self._owner) as check:
+                yield check
 
     @property
     def requires_fresh_work(self) -> bool:
@@ -218,11 +233,8 @@ class PhotosColdReadback:
         email = await self._ui_pool.fetchval("SELECT email FROM accounts WHERE id=$1", account_id)
         if not email or hashlib.sha256(email.strip().lower().encode()).hexdigest() != secret.account_email_sha256:
             raise AccountSessionRequiredError("cold account identity changed")
-        owner = await self._ui_pool.fetchval("SELECT owner FROM guest_runtimes WHERE account_id=$1", account_id)
-        if str(owner) != self._owner:
-            raise AccountSessionRequiredError("cold guest ownership changed")
         stopped = threading.Event()
-        async with photos_ui_ownership(self._ui_pool, account_id, self._owner) as check:
+        async with self._ownership(account_id) as check:
             check()
             payload = json.dumps({**manifest, "authentication": secret.model_dump(mode="json")}).encode()
             task = asyncio.create_task(
@@ -249,11 +261,21 @@ class PhotosColdReadback:
                 return receipt
             except asyncio.CancelledError:
                 stopped.set()
-                with suppress(Exception):
-                    await asyncio.shield(task)
+                await self._wait_cancelled_child(task)
                 raise
 
+    @staticmethod
+    async def _wait_cancelled_child(task: asyncio.Task) -> None:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                if task.done():
+                    break
+
     def _client(self) -> Any:
+        if self._windows_runtime is not None:
+            return self._windows_runtime.docker
         if self._client_factory is not None:
             return self._client_factory()
         import docker
@@ -304,6 +326,39 @@ class PhotosColdReadback:
             "provider_share_sha256": hashlib.sha256((segment.share_url or "").encode()).hexdigest(),
         }
 
+    def _create_cold_child(self, client, destination, stopped, lease):
+        labels = {"pixav.photos_canary.role": self.LABEL}
+        extra = {}
+        if lease is not None:
+            labels.update(
+                {"pixav.photos_ui.session_id": str(lease.ticket.id), "pixav.photos_canary.owner": self._owner}
+            )
+            extra["name"] = "pixav-cold-" + lease.ticket.id.hex
+            lease.child_phase = "CREATE_REQUESTED"
+        try:
+            container = client.containers.create(
+                self._image,
+                command=["python", "-m", self.ENTRY],
+                stdin_open=True,
+                user=f"{os.getuid()}:{os.getgid()}",
+                labels=labels,
+                environment={"PYTHONPATH": COLD_SOURCE_MOUNT, "HOME": COLD_WORK_MOUNT},
+                volumes={
+                    self._host(destination): {"bind": COLD_WORK_MOUNT, "mode": "rw"},
+                },
+                working_dir=COLD_WORK_MOUNT,
+                **({"mem_limit": "4g", "nano_cpus": 2_000_000_000} if stopped is not None else {}),
+                **extra,
+            )
+        except BaseException:
+            if lease is not None:
+                lease.child_phase = "CREATE_UNKNOWN"
+            raise
+        if lease is not None:
+            lease.child_container_id = container.id
+            lease.child_phase = "CREATED"
+        return container
+
     def _run(
         self,
         destination: Path,
@@ -313,19 +368,8 @@ class PhotosColdReadback:
         stopped: threading.Event | None = None,
     ) -> dict:
         client = self._client()
-        container = client.containers.create(
-            self._image,
-            command=["python", "-m", self.ENTRY],
-            stdin_open=True,
-            user=f"{os.getuid()}:{os.getgid()}",
-            labels={"pixav.photos_canary.role": self.LABEL},
-            environment={"PYTHONPATH": COLD_SOURCE_MOUNT, "HOME": COLD_WORK_MOUNT},
-            volumes={
-                self._host(destination): {"bind": COLD_WORK_MOUNT, "mode": "rw"},
-            },
-            working_dir=COLD_WORK_MOUNT,
-            **({"mem_limit": "4g", "nano_cpus": 2_000_000_000} if stopped is not None else {}),
-        )
+        lease = current_photos_ui_lease()
+        container = self._create_cold_child(client, destination, stopped, lease)
         try:
             self._assert_isolated(container)
             stream = container.attach_socket(params={"stdin": 1, "stream": 1})
@@ -352,6 +396,8 @@ class PhotosColdReadback:
             return self._receipt(container, status)
         finally:
             container.remove(force=True)
+            if lease is not None:
+                lease.child_phase = "REMOVED"
 
     @staticmethod
     def _assert_isolated(container: Any) -> None:

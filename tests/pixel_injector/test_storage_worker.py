@@ -28,33 +28,31 @@ def test_other_upload_environments_refuse_to_start_bdd_043_044(mode):
         build_worker(object(), settings(pixel_injector_mode=mode), lambda account_id: None, owner="owner-1")
 
 
-def test_omitting_a_runtime_uses_the_journalled_managed_guest(monkeypatch):
-    """No caller has to supply an environment for the real runner to be correct."""
-    built: dict = {}
+def test_omitting_a_legacy_runtime_cannot_provision_retired_redroid(monkeypatch):
+    monkeypatch.setattr("docker.from_env", lambda: pytest.fail("retired guest must not be provisioned"), raising=False)
+    with pytest.raises(RuntimeError, match="retired"):
+        build_worker(object(), settings(), owner="owner-1")
 
-    class Runtime:
-        def __init__(self, pool, client, **kwargs):
-            built.update(kwargs)
 
-        async def acquire(self, account_id=None):  # pragma: no cover - never called here
-            raise AssertionError("acquire is not part of assembly")
+def test_windows_worker_requires_registered_runtime_and_mutual_tls():
+    with pytest.raises(RuntimeError, match="registered runtime"):
+        build_worker(object(), settings(pixel_injector_mode="windows_android"), owner=OWNER)
+    with pytest.raises(RuntimeError, match="transport is not configured"):
+        build_worker(
+            object(), settings(pixel_injector_mode="windows_android", storage_windows_runtime_id=OWNER), owner=OWNER
+        )
 
-        async def acquire_existing(self, account_id):  # pragma: no cover - never called here
-            raise AssertionError("existing acquisition is not part of assembly")
 
-    monkeypatch.setattr("pixav.pixel_injector.storage_worker.ManagedRuntime", Runtime)
-    monkeypatch.setattr("docker.from_env", lambda: object(), raising=False)
+def test_windows_worker_selects_registered_factory_without_guest_fallback(monkeypatch):
+    from types import SimpleNamespace
 
-    worker = build_worker(object(), settings(), owner="owner-1")
+    from pixav.pixel_injector.windows_storage import WindowsSegmentUploader
 
-    assert worker.uploader is not None
-    assert built["staging_root"] == Path(settings().storage_staging_dir)
-    assert built["profile_name"] == settings().redroid_profile
-    assert built["tools_image"] == settings().storage_upload_tools_image
-    assert built["guest_cpus"] == settings().storage_guest_cpus
-    assert built["guest_memory_mb"] == settings().storage_guest_memory_mb
-    assert built["tools_cpus"] == settings().storage_tools_cpus
-    assert built["tools_memory_mb"] == settings().storage_tools_memory_mb
+    native = SimpleNamespace(owner=OWNER, staging_root=Path("synthetic"))
+    monkeypatch.setattr("pixav.pixel_injector.storage_worker.windows_runtime", lambda *a, **kw: native)
+    worker = build_worker(object(), settings(pixel_injector_mode="windows_android"), owner=OWNER)
+    assert isinstance(worker.uploader, WindowsSegmentUploader)
+    assert worker.readback._windows_runtime is native
 
 
 def test_the_readback_is_configured_with_its_own_isolated_image(monkeypatch):

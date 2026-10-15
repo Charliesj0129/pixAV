@@ -24,11 +24,14 @@ class WindowsAndroidDevice:
         *,
         verify_native: Callable[[WindowsAndroidSession], None],
         stop_native: Callable[[WindowsAndroidSession], Awaitable[None]],
+        quiesce_native: Callable[[WindowsAndroidSession], Awaitable[None]] | None = None,
     ) -> None:
         if not callable(verify_native) or not callable(stop_native):
             raise ValueError("Windows device requires native identity and halt observers")
         self.session, self.runner = session, runner
         self._verify_native, self._stop_native = verify_native, stop_native
+        self._quiesce_native = quiesce_native or stop_native
+        self.ui_session_id: str | None = None
 
     def _runner_identity(self) -> None:
         self.runner.reload()
@@ -54,6 +57,12 @@ class WindowsAndroidDevice:
         self._verify_native(self.session)
 
     async def halt(self) -> None:
+        await self._stop(self._stop_native)
+
+    async def quiesce(self) -> None:
+        await self._stop(self._quiesce_native)
+
+    async def _stop(self, stop_native: Callable[[WindowsAndroidSession], Awaitable[None]]) -> None:
         """Attempt both stops even when one fails; retain the persistent fence."""
         runner_stopped = False
         try:
@@ -64,6 +73,6 @@ class WindowsAndroidDevice:
         finally:
             # The original native identity, including its boot epoch, is used
             # even if the tools container has vanished or its stop failed.
-            await self._stop_native(self.session)
+            await stop_native(self.session)
         if not runner_stopped:
             raise CanaryBlockedError("Windows writer halt unconfirmed; retain UI fence")

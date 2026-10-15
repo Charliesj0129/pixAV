@@ -138,6 +138,15 @@ class Settings(BaseSettings):
     # survive a restart. A fresh UUID each time would leave the previous guest
     # unclaimed and provision a second one carrying the same Google session.
     storage_worker_owner: str = ""
+    storage_windows_runtime_id: str = ""
+    storage_windows_runtime_generation: int = Field(default=1, gt=0)
+    storage_windows_profile: str = "gphotos_pixel_xl_infinity_v1"
+    storage_android_adb_server_host: str = "host.docker.internal"
+    windows_control_url: str = ""
+    windows_control_ca: str = ""
+    windows_control_certificate: str = ""
+    windows_control_key: str = ""
+    windows_control_docker_daemon_id: str = ""
 
     # VPN egress detection (secondary to gluetun's kill switch, never a latch)
     # Empty URL disables the check: both observers must agree on one endpoint,

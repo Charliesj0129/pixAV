@@ -1,11 +1,7 @@
-"""Runner for the managed storage activity worker.
+"""Managed storage entry for a registered Windows device and persistent UI fence.
 
-The Photos guest is a retained, owned runtime: creating one is an external side
-effect that is journalled before it happens, exactly like an upload. That
-reconciliation lives in :mod:`pixav.pixel_injector.managed_runtime`, which this
-runner uses by default. A caller may still inject its own runtime factory — the
-contract tests do — but no path here substitutes a different upload environment
-for the configured Pixel-compatible one.
+Legacy dependency injection remains available to contract tests. The deployed
+entry cannot provision redroid or replace a missing retained device/tools.
 """
 
 from __future__ import annotations
@@ -21,13 +17,15 @@ import asyncpg
 import redis.asyncio as aioredis
 
 from pixav.config import Settings
-from pixav.pixel_injector.managed_runtime import ManagedRuntime
 from pixav.pixel_injector.photos_storage import (
     PIXEL_COMPATIBLE_MODE,
     MaestroSegmentUploader,
     PhotosColdReadback,
 )
-from pixav.pixel_injector.storage_activity import StorageActivityWorker
+from pixav.pixel_injector.storage_activity import SegmentUploader, StorageActivityWorker
+from pixav.pixel_injector.windows_control import WindowsHostClient
+from pixav.pixel_injector.windows_managed_runtime import WindowsManagedRuntime
+from pixav.pixel_injector.windows_storage import WINDOWS_PIXEL_MODE, WindowsSegmentUploader
 from pixav.shared.pause import is_paused_value
 from pixav.shared.queue import TaskQueue
 from pixav.shared.workflow import STORAGE_QUEUE, require_workflow_role
@@ -38,25 +36,45 @@ logger = logging.getLogger(__name__)
 def default_runtime(
     pool: asyncpg.Pool, settings: Settings, *, owner: str, existing: bool = False
 ) -> Callable[[Any], Any]:
-    """The journalled retained guest this worker owns."""
+    """The retired managed redroid entry cannot provision a replacement guest."""
+    raise RuntimeError("managed redroid provisioning is retired; configure the registered Windows runtime")
+
+
+def windows_runtime(pool: asyncpg.Pool, settings: Settings, *, owner: str) -> WindowsManagedRuntime:
     import docker
 
-    managed = ManagedRuntime(
+    try:
+        runtime_id, runtime_owner = uuid.UUID(settings.storage_windows_runtime_id), uuid.UUID(owner)
+    except ValueError:
+        raise RuntimeError("Windows managed storage requires registered runtime and owner UUIDs") from None
+    if not all(
+        (
+            settings.windows_control_url,
+            settings.windows_control_ca,
+            settings.windows_control_certificate,
+            settings.windows_control_key,
+            settings.windows_control_docker_daemon_id,
+        )
+    ):
+        raise RuntimeError("Windows native mutual-TLS transport is not configured")
+    control = WindowsHostClient(
+        settings.windows_control_url,
+        ca=Path(settings.windows_control_ca),
+        certificate=Path(settings.windows_control_certificate),
+        key=Path(settings.windows_control_key),
+    )
+    return WindowsManagedRuntime(
         pool,
         cast(Any, docker).from_env(),
-        owner=owner,
+        control,
+        runtime_id=runtime_id,
+        generation=settings.storage_windows_runtime_generation,
+        owner=runtime_owner,
         staging_root=Path(settings.storage_staging_dir),
-        guest_data_root=Path(settings.storage_guest_data_dir),
-        profile_name=settings.redroid_profile,
-        profiles_path=settings.redroid_profiles_path or None,
-        tools_image=settings.storage_upload_tools_image,
-        host_project_root=settings.host_project_root,
-        guest_cpus=settings.storage_guest_cpus,
-        guest_memory_mb=settings.storage_guest_memory_mb,
-        tools_cpus=settings.storage_tools_cpus,
-        tools_memory_mb=settings.storage_tools_memory_mb,
+        profile=settings.storage_windows_profile,
+        server_host=settings.storage_android_adb_server_host,
+        docker_daemon_id=settings.windows_control_docker_daemon_id,
     )
-    return managed.acquire_existing if existing else managed.acquire
 
 
 def build_worker(
@@ -67,24 +85,34 @@ def build_worker(
     owner: str,
 ) -> StorageActivityWorker:
     """Assemble the worker around the configured Pixel-compatible environment."""
-    if settings.pixel_injector_mode != PIXEL_COMPATIBLE_MODE:
+    if settings.pixel_injector_mode not in {PIXEL_COMPATIBLE_MODE, WINDOWS_PIXEL_MODE}:
         raise RuntimeError("managed storage requires the Pixel-compatible upload environment")
 
     async def observation_clock():
         return await pool.fetchval("SELECT clock_timestamp()")
 
-    uploader = MaestroSegmentUploader(
-        runtime if runtime is not None else default_runtime(pool, settings, owner=owner),
-        owner=owner,
-        flows=Path(settings.storage_flows_dir),
-        mode=settings.pixel_injector_mode,
-        staging_root=Path(settings.storage_staging_dir),
-        observation_clock=observation_clock,
-        ui_pool=pool,
-        existing_runtime=(
-            runtime if runtime is not None else default_runtime(pool, settings, owner=owner, existing=True)
-        ),
-    )
+    uploader: SegmentUploader
+    managed = None
+    if settings.pixel_injector_mode == WINDOWS_PIXEL_MODE:
+        if runtime is not None:
+            raise RuntimeError("Windows managed storage requires its registered runtime factory")
+        managed = windows_runtime(pool, settings, owner=owner)
+        uploader = WindowsSegmentUploader(
+            managed, flows=Path(settings.storage_flows_dir), observation_clock=observation_clock
+        )
+    else:
+        uploader = MaestroSegmentUploader(
+            runtime if runtime is not None else default_runtime(pool, settings, owner=owner),
+            owner=owner,
+            flows=Path(settings.storage_flows_dir),
+            mode=settings.pixel_injector_mode,
+            staging_root=Path(settings.storage_staging_dir),
+            observation_clock=observation_clock,
+            ui_pool=pool,
+            existing_runtime=(
+                runtime if runtime is not None else default_runtime(pool, settings, owner=owner, existing=True)
+            ),
+        )
     readback = PhotosColdReadback(
         Path(settings.storage_readback_dir),
         image=settings.storage_readback_image,
@@ -92,6 +120,7 @@ def build_worker(
         authentication_secret=settings.photos_cold_auth_secret,
         ui_pool=pool,
         owner=owner,
+        windows_runtime=managed if settings.pixel_injector_mode == WINDOWS_PIXEL_MODE else None,
     )
     return StorageActivityWorker(pool, uploader, readback)
 
@@ -111,23 +140,24 @@ async def run_storage_activity_worker(
     queue = TaskQueue(redis=redis, queue_name=STORAGE_QUEUE)
     await queue.requeue_inflight()
     logger.info("managed storage worker started on %s", STORAGE_QUEUE)
-    while True:
-        if is_paused_value(await redis.get(settings.system_pause_key)):
-            await asyncio.sleep(5)
-            continue
-        await worker.run_one(queue)
-        await asyncio.sleep(poll_seconds)
+    try:
+        while True:
+            if is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            await worker.run_one(queue)
+            await asyncio.sleep(poll_seconds)
+    finally:
+        if isinstance(worker.uploader, WindowsSegmentUploader):
+            worker.uploader.runtime.control.close()
 
 
 def _owner(settings: Settings) -> str:
-    """The stable identity of the guest this deployment retains."""
+    """The stable owner of the registered runtime this deployment retains."""
     try:
         return str(uuid.UUID(settings.storage_worker_owner.strip()))
     except (AttributeError, ValueError):
-        raise RuntimeError(
-            "PIXAV_STORAGE_WORKER_OWNER must be a UUID; the retained guest is keyed by it "
-            "and a new value each start would provision a second signed-in device"
-        ) from None
+        raise RuntimeError("PIXAV_STORAGE_WORKER_OWNER must be a stable UUID matching the registered runtime") from None
 
 
 async def run_from_settings(settings: Settings, *, health_state: Any = None) -> None:

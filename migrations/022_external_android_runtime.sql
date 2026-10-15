@@ -118,7 +118,8 @@ BEGIN
        AND e.state='RUNNING' AND e.lease_until > clock_timestamp()
        AND a.stage=e.stage AND o.stage=e.stage
        AND ((report->>'role'='upload' AND e.stage='upload')
-            OR (report->>'role' IN ('cold_read','observe') AND e.stage='verify'))
+            OR (report->>'role' IN ('cold_read','observe') AND e.stage='verify')
+            OR (report->>'role'='cold_read' AND e.stage='playback'))
      FOR UPDATE OF e;
     IF NOT FOUND THEN RETURN false; END IF;
     SELECT * INTO existing FROM photos_ui_sessions WHERE id=(report->>'id')::uuid;
@@ -165,7 +166,8 @@ BEGIN
        AND r.state='READY' AND r.kind='windows_android'
        AND r.owner=s.runtime_owner AND r.account_id=s.account_id AND r.device_key=s.device_key
        AND ((s.role='upload' AND e.stage='upload')
-            OR (s.role IN ('cold_read','observe') AND e.stage='verify'))
+            OR (s.role IN ('cold_read','observe') AND e.stage='verify')
+            OR (s.role='cold_read' AND e.stage='playback'))
        AND e.state='RUNNING' AND e.lease_until > clock_timestamp();
     GET DIAGNOSTICS changed=ROW_COUNT;
     IF changed=0 THEN

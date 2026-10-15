@@ -12,6 +12,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -33,6 +34,8 @@ class PhotosUILease:
         self.guard, self.ticket = guard, ticket
         self._valid_until = 0.0
         self._lost = False
+        self.child_phase = "NOT_STARTED"
+        self.child_container_id: str | None = None
 
     def check(self) -> None:
         if self._lost or time.monotonic() >= self._valid_until:
@@ -99,6 +102,13 @@ class PhotosUILease:
             raise asyncio.CancelledError
 
 
+_CURRENT_UI: ContextVar[PhotosUILease | None] = ContextVar("pixav_photos_ui", default=None)
+
+
+def current_photos_ui_lease() -> PhotosUILease | None:
+    return _CURRENT_UI.get()
+
+
 @asynccontextmanager
 async def photos_ui_session(
     pool: Any,
@@ -110,7 +120,17 @@ async def photos_ui_session(
 ) -> AsyncIterator[PhotosUILease]:
     context = require_activity_context()
     request = context.request
-    if request.account_id != runtime.account_id or (role == "upload") != (request.stage == "upload"):
+    account_matches = request.account_id == runtime.account_id
+    if role == "cold_read" and request.stage == "playback" and request.account_id is None:
+        account_matches = bool(
+            await pool.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM playable_assets p JOIN remote_asset_segments s
+            ON s.asset_id=p.remote_asset_id WHERE p.id=$1 AND s.account_id=$2)""",
+                request.playable_asset_id,
+                runtime.account_id,
+            )
+        )
+    if not account_matches or (role == "upload") != (request.stage == "upload"):
         raise CanaryBlockedError("Photos UI activity/account binding changed")
     if not 0 < heartbeat_seconds <= 15:
         raise ValueError("Photos UI heartbeat interval must be at most 15 seconds")
@@ -139,15 +159,19 @@ async def photos_ui_session(
             raise CanaryBlockedError("Photos UI persistent resource claim rejected")
         lease = PhotosUILease(guard, ticket)
         heartbeat = None
+        previous = None
         failed = True
         try:
             await lease._deadline()
             heartbeat = asyncio.create_task(lease._heartbeat(owner, heartbeat_seconds))
             lease.check()
+            previous = _CURRENT_UI.set(lease)
             yield lease
             lease.check()
             failed = False
         finally:
+            if previous is not None:
+                _CURRENT_UI.reset(previous)
             lease._lost = True
             if heartbeat is not None:
                 heartbeat.cancel()
