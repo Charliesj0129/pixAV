@@ -14,9 +14,11 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 保留 PostgreSQL、roles／ledger／queue checkpoint、guest／ownership、認證及未知上傳 operation。舊 DB、publication、驗證收據與 JSON manifest 僅供 reconciliation；已刪除的本地媒體與錄影不得被當作仍存在或有效的驗收。舊 execution 不自動 resume／replay，未知遠端結果先 reconciliation，不能換新 operation 盲目重傳同一筆媒體。
 
-repository 只保留 [Windows Android 工具入口](docker-compose.android-runner.yml) 與 [CI PostgreSQL／Redis 入口](docker-compose.integration.yml)。舊 base／prod／direct／playback／first-4k／indexer Compose 和啟動 shell 已退休，舊單片 CLI 僅保留唯讀 status。業務模組、歷史 Git checkpoint、操作守衛與 BDD 保留；這不表示 Windows managed upload adapter 或新的應用部署已完成。下一個 agent 先完成指定上傳環境的 adapter／execution ownership 與可回復部署，再從新的隔離 cohort 跑通 Golden Path。
+repository 保留 [Windows Android 工具入口](docker-compose.android-runner.yml) 與 [CI PostgreSQL／Redis 入口](docker-compose.integration.yml)，並以新的 [managed Compose](docker-compose.managed.yml) 分段接入受管部署。舊 base／prod／direct／playback／first-4k／indexer Compose 和啟動 shell 已退休，舊單片 CLI 僅保留唯讀 status。業務模組、歷史 Git checkpoint、操作守衛與 BDD 保留；這不表示 Windows managed upload adapter 或新的應用部署已完成。下一個 agent 先完成指定上傳環境的 adapter／execution ownership 與可回復部署，再從新的隔離 cohort 跑通 Golden Path。
 
 備份及還原工作目錄必須實際位於 D 槽，且在部署 data、staging、cache 與 cleanup 掃描範圍之外；Ubuntu 的 C 槽 LocalState 是指向 D 槽的 junction，不能遞迴刪除。加密保留資料須完整還原驗證；Docker 資料磁碟另做一致離線備份、還原與原 daemon／volume 身分核對。離機備份、整機恢復與 production promotion 保持 OPEN。私有 exact-target manifest、刪除 audit 與備份收據留在 `.verify/` 及專案外私有 vault，不放進 Git。
+
+2026-10-15 操作者指示本輪略過離機備份要求並停止新增實際備份；保留已完成的本機備份與獨立還原，不再要求離機目的地。此指示不把離機保存或 production promotion 記為通過。
 
 ## 完成標準
 
@@ -242,6 +244,28 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 
 2026-10-14 當次隔離 AVD 已完成原生 emulator／QEMU 的 exact stop 與 cold start，保留 userdata、核對新的 Android boot epoch，原 SDK ramdisk 不變。重啟後 root UID 0、Magisk 30.7、Vector 2.2 build 3080／API 102、固定 Infinity 1.4.1 APK 與僅限 Photos／user 0 的 scope 均核對；新 Photos process 有 Pixel XL `VERIFY OK` 且 native ready 的兩筆日誌，無 VERIFY failure。診斷頁 ContentProvider IPC 回報仍有缺口，此處以新 process 的實際 hook 日誌驗證。重啟後 exact ADB／Maestro Settings launch／Home smoke exit 0，runner 實際唯讀 bind 的 device／inode／內容與 host 相符；同次 smoke 執行至結束的 23 次 Windows ADB listener 取樣均為 loopback，5037 owner 與原 server 相符。這些證明本機工具與注入契約，Photos 原始品質／容量、managed fencing 與 production 尚待驗收。
 
+### Managed 部署入口與當前 profile
+
+新的 [docker-compose.managed.yml](docker-compose.managed.yml) 是受管部署的單一入口，目前只宣告 `windows-tools` profile；PostgreSQL／Redis、authority／workers、VPN、resolver 與 private Jellyfin 尚未接入此 manifest，完整 Stage 3 仍 OPEN。工具映像以 [windows-tools.Dockerfile](docker/windows-tools.Dockerfile) 延伸已核對的本機 immutable tools 基底，只加入 repository 的 Maestro flows；build 前後核對基底 image ID／RootFS layers，執行時使用產出的 immutable image ID。二十四個 baked flow 的完整 SHA-256 已核對，帳號、AVD、DB／queue secret 不進 image 或 runner。
+
+[managed preflight](scripts/manage_managed_deployment.py) 是唯讀入口：核對 explicit context／daemon／project、私有 0600 env（父目錄 0700）、固定 image、runtime owner／generation、transport、resource limits、唯讀 `/parts` 與 tmpfs；拒絕額外 service、credential env、socket／privileged／host network 及仍在其他 project 運行的 Android tools。設定檢查不等於 native readiness、DB 登錄或 provider 能力。當前 tools 限制一 CPU／2 GiB、swap 與 RAM 同限、256 PIDs，無 restart policy；health 每三十秒、timeout 二十五秒、grace 二百四十秒，只核對 exact serial 與 Android boot，沒有 metrics endpoint。啟動前仍核對 Windows 實體容量與新 bind 的 host／container device、inode 及內容；只啟動當前需要的 profile，不恢復停止的其他專案。
+
+```bash
+# BASE_IMAGE 是已核實的本機 tools image ID；BASE_REF 是綁定該 ID 的私有建置用 tag。
+docker --context default image tag BASE_IMAGE BASE_REF
+docker --context default build --pull=false --network=none --build-arg PIXAV_WINDOWS_TOOLS_BASE_IMAGE=BASE_REF -f docker/windows-tools.Dockerfile --iidfile PRIVATE_IMAGE_ID_FILE .
+# 將產出的 immutable ID 與固定 owner／runtime／generation 寫入私有 env，先檢查：
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV
+# 只啟動 tools；實際 runtime 登錄與 UI 活動另受 enrollment／lease 守衛。
+docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile windows-tools up -d --no-deps --no-build windows_tools
+```
+
+native host／AVD 或 daemon 恢復後先重新核對 process creation、loopback ADB owner、SDK／AVD 設定、userdata 與 physical disk，重新產生 boot identity；舊收據不能直接沿用為新 generation 的資格。開發 runner 退休使用 exact ID，保留 image／staging／AVD／journal；tools rollback 只停止該受管 object，任何未覆核 UI owner 仍保留 fence。這個 profile 本身不啟動 executor、不處理舊 queue，也不 promotion Golden Path。
+
+native control 的拒絕回應只保留有長度限制的 `NATIVE_*` 錯誤碼；client 不輸出原生 stderr、私有 payload 或 ticket，並保留 resource fence。這讓裝置觀測 timeout 可以被定位，拒絕結果仍不能授權接手或重傳。
+
+Vector 的唯讀模組清單會掃描已安裝 APK；本次兩核心 AVD 冷啟動實測一次需 17.453 秒，原十秒限制因此拒絕有效查詢。該查詢上限改為三十秒，其餘單項仍十秒，整次 native control 仍受四十五秒 deadline 約束；逾時仍拒絕新 writer 並保留原 fence。
+
 ### Docker Runner 開發入口
 
 [docker-compose.android-runner.yml](docker-compose.android-runner.yml) **獨立使用**，不與 base／prod／direct／acceptance 合併；它只宣告一個工具容器，不啟動應用 worker，也不自動登入、push 或 upload。[`.env.example`](.env.example) 的 `PIXAV_ANDROID_*` 鍵只供這份工具 Compose 使用；managed worker 另以 `PIXAV_PIXEL_INJECTOR_MODE=windows_android` 選擇下述 registered runtime。
@@ -359,10 +383,11 @@ AVD userdata、system image／SDK rebuild manifest、設定、ADB keys、runtime
 
 ## 部署與資料操作
 
-目前的兩份 Compose 各自獨立使用，不啟動舊 application executor：
+目前的 Compose 入口各自獨立使用，不啟動舊 application executor：
 
 - `docker-compose.android-runner.yml`：Windows Emulator 的 ADB／Maestro 工具，設定及合成媒體守衛見前文。
 - `docker-compose.integration.yml`：固定映像的專用 PostgreSQL／Redis，loopback ports、資源限制及 tmpfs 資料。只供本機測試／CI，結束以 exact container ID 清除，不碰既有 volumes。
+- `docker-compose.managed.yml`：受管部署的分段入口，目前僅有 `windows-tools`；原生 readiness、runtime 登錄與完整應用部署分別驗收。
 
 CI 先依序建立 PostgreSQL、Redis，從 exact container 取得 DB identifier／Redis run ID，再啟用 `PIXAV_RUN_INTEGRATION=1`。本機完整檢查依 [AGENTS.md](AGENTS.md#驗證)。新 application 部署尚待依目前設計補齊，不能由 CI 或 Android runner 健康推定 Photos 上傳／quota 契約通過。
 

@@ -204,6 +204,51 @@ async def test_http_contract_rejects_unbounded_and_secret_echoing_payloads(host)
         assert response.status_code == 400 and "synthetic-private-token" not in response.text
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("NATIVE_MODULES_OBSERVATION_TIMEOUT", "NATIVE_MODULES_OBSERVATION_TIMEOUT"),
+        ("synthetic private payload", "NATIVE_CONTROL_REJECTED"),
+        ("NATIVE_" + "A" * 81, "NATIVE_CONTROL_REJECTED"),
+    ],
+)
+async def test_http_failure_preserves_only_bounded_native_codes(host, failure, expected):
+    def fail(mode, subject):
+        raise NativeControlError(failure)
+
+    host.control.run = fail
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(host)), base_url="https://synthetic"
+    ) as client:
+        response = await client.post("/v1/claim", content=request(host.manifest).model_dump_json())
+    assert response.status_code == 409
+    assert response.json() == {"detail": expected}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"detail": "NATIVE_MODULES_OBSERVATION_TIMEOUT"}, "NATIVE_MODULES_OBSERVATION_TIMEOUT"),
+        ({"detail": "synthetic private payload"}, "NATIVE_CONTROL_REJECTED"),
+        ({"detail": ["synthetic private payload"]}, "NATIVE_CONTROL_REJECTED"),
+        (["synthetic private payload"], "NATIVE_CONTROL_REJECTED"),
+    ],
+)
+def test_native_client_error_keeps_the_fence_and_only_reports_a_code(manifest, payload, expected):
+    client = object.__new__(WindowsHostClient)
+    client._client = httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(409, json=payload)), base_url="https://synthetic"
+    )
+    try:
+        with pytest.raises(CanaryBlockedError) as error:
+            client.call("claim", request(manifest))
+        assert expected in str(error.value)
+        assert "retain resource fence" in str(error.value)
+        assert "synthetic private payload" not in str(error.value)
+    finally:
+        client.close()
+
+
 def test_manifest_cannot_bind_a_different_native_identity(manifest):
     value = deepcopy(manifest.model_dump(mode="json"))
     value["native"]["boot_id"] = str(uuid.uuid4())

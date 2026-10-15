@@ -119,7 +119,11 @@ function Invoke-PixavRoot([string] $Script, [ValidateSet('ROOT','FRAMEWORK','MOD
     $pixavError=$pixavClient.StandardError.ReadToEndAsync()
     $pixavClient.StandardInput.WriteLine($Script)
     $pixavClient.StandardInput.Close()
-    if (!$pixavClient.WaitForExit(10000)) {$pixavClient.Kill();throw ('NATIVE_'+$Operation+'_OBSERVATION_TIMEOUT')}
+    # Listing modules scans installed APKs. A cold two-core AVD can take more
+    # than ten seconds; keep this read bounded within the host's 45s deadline.
+    $pixavQueryTimeout=10000
+    if ($Operation -eq 'MODULES') {$pixavQueryTimeout=30000}
+    if (!$pixavClient.WaitForExit($pixavQueryTimeout)) {$pixavClient.Kill();throw ('NATIVE_'+$Operation+'_OBSERVATION_TIMEOUT')}
     if ($pixavClient.ExitCode -ne 0) {throw 'NATIVE_ROOT_OBSERVATION_REJECTED'}
     return $pixavOutput.Result.Trim()
 }

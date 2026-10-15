@@ -325,8 +325,11 @@ def create_app(host: WindowsHost) -> FastAPI:
             raise HTTPException(400, "INVALID_REQUEST") from None
         try:
             return await getattr(host, operation.replace("-", "_"))(subject)
-        except NativeControlError:
-            raise HTTPException(409, "NATIVE_CONTROL_REJECTED") from None
+        except NativeControlError as error:
+            code = str(error)
+            if not re.fullmatch(r"NATIVE_[A-Z_]{1,80}", code):
+                code = "NATIVE_CONTROL_REJECTED"
+            raise HTTPException(409, code) from None
 
     return app
 

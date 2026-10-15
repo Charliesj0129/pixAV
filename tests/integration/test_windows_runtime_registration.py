@@ -42,6 +42,14 @@ async def test_dry_run_changes_no_rows_or_host_journal(managed):
     assert state.calls == ["quiescence"]
 
 
+async def test_authority_can_verify_instance_without_a_superuser_connection(managed):
+    async with managed.pool.acquire() as connection:
+        async with connection.transaction():
+            await connection.execute("SET LOCAL ROLE pixav_execution_authority")
+            assert not await connection.fetchval("SELECT rolsuper FROM pg_roles WHERE rolname=current_user")
+            await managed.registry._instance(connection)
+
+
 async def test_apply_is_atomic_audited_and_idempotent(managed):
     state = managed
     result = await enroll(state)

@@ -1,0 +1,49 @@
+# Managed deployment entry. Start only the profiles accepted for the current phase.
+# Application/core profiles are added after their deployment contracts are verified.
+name: ${PIXAV_MANAGED_PROJECT:?set the dedicated managed project}
+services:
+  windows_tools:
+    profiles: [windows-tools]
+    image: ${PIXAV_MANAGED_WINDOWS_TOOLS_IMAGE:?set the immutable tools image ID}
+    pull_policy: never
+    command: [sleep, infinity]
+    restart: "no"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 256
+    environment:
+      ADB_SERVER_SOCKET: tcp:host.docker.internal:5037
+      PIXAV_ANDROID_ADB_SERVER_HOST: host.docker.internal
+      ANDROID_SERIAL: ${PIXAV_ANDROID_SERIAL:?set the exact registered Windows serial}
+      MAESTRO_CLI_NO_ANALYTICS: "1"
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_STAGING_HOST_ROOT:?set the existing daemon-host staging directory}
+        target: /parts
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m,mode=1777
+      - /root:rw,nosuid,nodev,size=512m,mode=0700
+      - /work:rw,nosuid,nodev,size=512m,mode=0700
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(timeout --kill-after=2s 10s adb -s "$$ANDROID_SERIAL" get-state 2>/dev/null | tr -d '\r\n')" = device
+          && test "$$(timeout --kill-after=2s 10s adb -s "$$ANDROID_SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')" = 1
+      interval: 30s
+      timeout: 25s
+      retries: 3
+      start_period: 240s
+    labels:
+      pixav.photos_canary.owner: ${PIXAV_STORAGE_WORKER_OWNER:?set the stable runtime owner}
+      pixav.photos_canary.role: tools
+      pixav.runtime.id: ${PIXAV_STORAGE_WINDOWS_RUNTIME_ID:?set the registered runtime ID}
+      pixav.runtime.generation: ${PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION:?set the registered generation}

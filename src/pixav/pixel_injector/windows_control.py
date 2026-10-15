@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import ssl
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,11 +48,17 @@ class WindowsHostClient:
             result = self._client.post(
                 "/v1/" + operation, content=request.model_dump_json(), headers={"Content-Type": "application/json"}
             )
-            if result.status_code != 200:
-                raise CanaryBlockedError("Windows native control rejected; retain resource fence")
-            payload = result.json()
         except (httpx.HTTPError, ValueError):
             raise CanaryBlockedError("Windows native result unconfirmed; retain resource fence") from None
+        try:
+            payload = result.json() if len(result.content) <= 16384 else None
+        except ValueError:
+            payload = None
+        if result.status_code != 200:
+            code = payload.get("detail") if isinstance(payload, dict) else None
+            if not isinstance(code, str) or not re.fullmatch(r"NATIVE_[A-Z_]{1,80}", code):
+                code = "NATIVE_CONTROL_REJECTED"
+            raise CanaryBlockedError(f"Windows native control rejected: {code}; retain resource fence")
         if not isinstance(payload, dict):
             raise CanaryBlockedError("Windows native response invalid")
         return payload
