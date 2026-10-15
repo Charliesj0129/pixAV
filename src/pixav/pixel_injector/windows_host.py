@@ -16,6 +16,7 @@ import re
 import ssl
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -25,6 +26,9 @@ from pydantic import ValidationError
 from pixav.pixel_injector.windows_environment import EnvironmentFiles
 from pixav.pixel_injector.windows_host_models import (
     HostHaltReceipt,
+    HostReadinessReceipt,
+    HostReadinessRequest,
+    HostRuntimeBinding,
     HostUIRequest,
     WindowsHostManifest,
     canonical_digest,
@@ -51,7 +55,7 @@ class NativeControl:
                 # possible. Admission/readiness cannot use a broken environment.
                 self.environment_error = True
 
-    def run(self, mode: str, subject: HostUIRequest) -> dict:
+    def run(self, mode: str, subject: HostUIRequest | HostReadinessRequest) -> dict:
         self._verify_environment(mode)
         if not hmac.compare_digest(hashlib.sha256(self.script.read_bytes()).hexdigest(), self.script_sha256):
             raise NativeControlError("NATIVE_SCRIPT_IDENTITY_MISMATCH")
@@ -67,7 +71,7 @@ class NativeControl:
                 except (OSError, ValueError):
                     raise NativeControlError("NATIVE_ENVIRONMENT_BINDING_CHANGED") from None
 
-    def _invoke(self, mode: str, subject: HostUIRequest) -> dict:
+    def _invoke(self, mode: str, subject: HostUIRequest | HostReadinessRequest) -> dict:
         payload = {**self.manifest.native.payload(), "session_id": str(subject.session_id)}
         try:
             result = subprocess.run(  # noqa: S603 - fixed executable and digest-pinned local script; JSON only on stdin
@@ -158,7 +162,7 @@ class WindowsHost:
                 os.unlink(temporary)
         self.state = state
 
-    def _binding(self, request: HostUIRequest) -> None:
+    def _binding(self, request: HostRuntimeBinding) -> None:
         if (
             request.runtime_id != self.manifest.runtime_id
             or request.runtime_generation != self.manifest.runtime_generation
@@ -179,7 +183,7 @@ class WindowsHost:
         ):
             raise NativeControlError("NATIVE_RESOURCE_TICKET_REJECTED")
 
-    async def _run(self, mode: str, request: HostUIRequest) -> dict:
+    async def _run(self, mode: str, request: HostUIRequest | HostReadinessRequest) -> dict:
         # Cancellation cannot release the host lock while its native child still
         # runs. Finish the bounded observation/effect and its journal first.
         operation = asyncio.create_task(asyncio.to_thread(self.control.run, mode, request))
@@ -189,6 +193,26 @@ class WindowsHost:
             except asyncio.CancelledError:
                 continue
         return operation.result()
+
+    async def readiness(self, request: HostReadinessRequest) -> dict:
+        async with self.lock:
+            self._binding(request)
+            if self.manifest.native.environment is None:
+                raise NativeControlError("NATIVE_ENVIRONMENT_REVIEW_REQUIRED")
+            if self.state and self.state.get("state") != "HALTED":
+                raise NativeControlError("NATIVE_OWNER_RECONCILIATION_REQUIRED")
+            result = await self._run("quiescence", request)
+            if result.get("result") != "NATIVE_UI_QUIESCENT":
+                raise NativeControlError("NATIVE_UI_NOT_QUIESCENT")
+            return HostReadinessReceipt(
+                **request.model_dump(),
+                device_key=self.manifest.device_key,
+                tools_id=self.manifest.tools_id,
+                script_sha256=self.control.script_sha256,
+                observation_sha256=canonical_digest(result),
+                observed_at=datetime.now(timezone.utc),
+                quiescent=True,
+            ).model_dump(mode="json")
 
     async def claim(self, request: HostUIRequest) -> dict:
         async with self.lock:
@@ -287,13 +311,16 @@ def create_app(host: WindowsHost) -> FastAPI:
         return {"status": "ready", "runtime_generation": host.manifest.runtime_generation}
 
     @app.post("/v1/{operation}")
-    async def control(operation: Literal["claim", "observe", "halt", "verify-halt"], request: Request) -> dict:
+    async def control(
+        operation: Literal["claim", "observe", "halt", "verify-halt", "readiness"], request: Request
+    ) -> dict:
         if request.headers.get("transfer-encoding") or not request.headers.get("content-length", "").isdigit():
             raise HTTPException(400, "INVALID_REQUEST_FRAMING")
         if int(request.headers["content-length"]) > 16384:
             raise HTTPException(413, "REQUEST_TOO_LARGE")
         try:
-            subject = HostUIRequest.model_validate_json(await request.body())
+            model = HostReadinessRequest if operation == "readiness" else HostUIRequest
+            subject = model.model_validate_json(await request.body())
         except (ValueError, ValidationError):
             raise HTTPException(400, "INVALID_REQUEST") from None
         try:

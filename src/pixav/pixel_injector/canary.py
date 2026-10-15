@@ -22,14 +22,11 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 import docker
+from pixav.pixel_injector.errors import CanaryBlockedError
 from pixav.pixel_injector.profiles import get_profile
 
 TOOLS_IMAGE = "pixav-photos-canary:maestro-2.10.0"
 OWNER_LABEL = "pixav.photos_canary.owner"
-
-
-class CanaryBlockedError(ValueError):
-    """Safe, fixed diagnostic suitable for public output."""
 
 
 def sha256(path: Path) -> str:

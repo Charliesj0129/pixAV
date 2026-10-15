@@ -3,16 +3,24 @@
 import asyncio
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import threading
 import uuid
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from pixav.pixel_injector.errors import CanaryBlockedError
+from pixav.pixel_injector.windows_control import WindowsHostClient
 from pixav.pixel_injector.windows_host import NativeControl, NativeControlError, WindowsHost, create_app
 from pixav.pixel_injector.windows_host_models import (
+    HostReadinessReceipt,
+    HostReadinessRequest,
     HostUIRequest,
     NativeIdentity,
     WindowsHostManifest,
@@ -72,7 +80,7 @@ def host(manifest, tmp_path):
         }[mode]
         return {"result": result}
 
-    return WindowsHost(manifest, SimpleNamespace(run=run), tmp_path / "private" / "state.json")
+    return WindowsHost(manifest, SimpleNamespace(run=run, script_sha256="a" * 64), tmp_path / "private" / "state.json")
 
 
 async def test_host_claim_is_idempotent_and_rejects_overlapping_ticket(host):
@@ -214,6 +222,86 @@ async def test_process_only_registration_cannot_admit_new_host_ticket(host):
     assert not host.journal.exists()
 
 
+def readiness_request(host):
+    return HostReadinessRequest(
+        runtime_id=host.manifest.runtime_id,
+        runtime_generation=host.manifest.runtime_generation,
+        identity_sha256=host.manifest.identity_sha256,
+        nonce=uuid.uuid4(),
+    )
+
+
+async def test_readiness_is_fresh_read_only_and_does_not_claim_ui_ticket(host):
+    first, second = readiness_request(host), readiness_request(host)
+    receipt = HostReadinessReceipt.model_validate(await host.readiness(first))
+    assert receipt.nonce == first.nonce and receipt.tools_id == host.manifest.tools_id
+    assert (await host.readiness(second))["nonce"] == str(second.nonce)
+    assert host.state is None and not host.journal.exists()
+    original = request(host.manifest)
+    await host.claim(original)
+    await host.halt(original)
+    before = host.journal.read_bytes()
+    await host.readiness(readiness_request(host))
+    assert host.journal.read_bytes() == before
+
+
+async def test_readiness_cannot_probe_through_unreconciled_owner(host):
+    await host.claim(request(host.manifest))
+    before = host.journal.read_bytes()
+
+    def unexpected(*_):
+        pytest.fail("readiness touched an owned runtime")
+
+    host.control.run = unexpected
+    with pytest.raises(NativeControlError, match="OWNER_RECONCILIATION_REQUIRED"):
+        await host.readiness(readiness_request(host))
+    assert host.journal.read_bytes() == before
+
+
+async def test_readiness_never_force_stops_apps_to_make_probe_pass(host):
+    modes = []
+
+    def active(mode, _):
+        modes.append(mode)
+        return {"result": "NATIVE_UI_WRITERS_ACTIVE"}
+
+    host.control.run = active
+    with pytest.raises(NativeControlError, match="NOT_QUIESCENT"):
+        await host.readiness(readiness_request(host))
+    assert modes == ["quiescence"] and not host.journal.exists()
+
+
+async def test_readiness_http_accepts_only_runtime_binding_and_nonce(host):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(host)), base_url="https://synthetic"
+    ) as client:
+        subject = readiness_request(host)
+        response = await client.post("/v1/readiness", content=subject.model_dump_json())
+        assert response.status_code == 200 and response.json()["nonce"] == str(subject.nonce)
+        bad = {**subject.model_dump(mode="json"), "session_token": "synthetic-private-token"}
+        response = await client.post("/v1/readiness", json=bad)
+        assert response.status_code == 400 and "synthetic-private-token" not in response.text
+        assert not host.journal.exists()
+
+
+@pytest.mark.parametrize("defect", ["nonce", "generation", "not-quiescent", "naive-clock"])
+async def test_readiness_client_rejects_replayed_or_invalid_receipt(host, defect):
+    subject = readiness_request(host)
+    payload = await host.readiness(subject)
+    if defect == "nonce":
+        payload["nonce"] = str(uuid.uuid4())
+    elif defect == "generation":
+        payload["runtime_generation"] += 1
+    elif defect == "not-quiescent":
+        payload["quiescent"] = False
+    else:
+        payload["observed_at"] = "2026-10-15T00:00:00"
+    client = object.__new__(WindowsHostClient)
+    client.call = lambda *args: payload
+    with pytest.raises(CanaryBlockedError, match="readiness response"):
+        client.readiness(subject)
+
+
 def test_native_observation_requires_actual_environment_verification(manifest):
     control = object.__new__(NativeControl)
     control.manifest = manifest
@@ -273,6 +361,24 @@ def test_legacy_native_digest_does_not_gain_a_null_environment_field(manifest):
     legacy = NativeIdentity.model_validate(value)
     assert legacy.payload() == value
     assert canonical_digest(legacy.payload()) == canonical_digest(value)
+
+
+def test_native_control_client_does_not_import_linux_canary_adapter():
+    code = """import builtins
+original = builtins.__import__
+def portable(name, *args, **kwargs):
+    if name == "pixav.pixel_injector.canary":
+        raise ImportError("native transport cannot load the Linux canary adapter")
+    return original(name, *args, **kwargs)
+builtins.__import__ = portable
+from pixav.pixel_injector.windows_control import WindowsHostClient
+"""
+    result = subprocess.run(  # noqa: S603 -- current interpreter and fixed import probe, no shell or external input
+        [sys.executable, "-c", code],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")},
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
 
 
 @pytest.mark.parametrize(

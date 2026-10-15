@@ -41,12 +41,16 @@ class WindowsManagedRuntime:
 
     async def binding(self, account_id: uuid.UUID) -> WindowsAndroidSession:
         row = await self.pool.fetchrow(
-            """SELECT * FROM upload_runtimes WHERE runtime_id=$1 AND generation=$2
-            AND owner=$3 AND account_id=$4 AND kind='windows_android' AND state='READY'""",
+            """SELECT r.* FROM upload_runtimes r JOIN windows_runtime_enrollments e
+            ON e.runtime_id=r.runtime_id AND e.generation=r.generation AND e.identity_sha256=r.identity_sha256
+            WHERE r.runtime_id=$1 AND r.generation=$2
+            AND r.owner=$3 AND r.account_id=$4 AND r.kind='windows_android' AND r.state='READY'
+            AND e.docker_daemon_id=$5""",
             self.runtime_id,
             self.generation,
             self.owner,
             account_id,
+            self.docker_daemon_id,
         )
         if row is None or row["profile"] != self.profile or Path(row["staging_root"]) != self.staging_root:
             raise CanaryBlockedError("registered Windows runtime binding unavailable")
@@ -78,6 +82,7 @@ class WindowsManagedRuntime:
         self, account_id: uuid.UUID, *, role: Literal["upload", "cold_read", "observe"] = "upload"
     ) -> AsyncIterator[tuple[WindowsAndroidDevice, PhotosUILease]]:
         session = await self.binding(account_id)
+        await self._staging_binding(session)
         identity = await asyncio.to_thread(self.docker.info)
         if not self.docker_daemon_id or identity.get("ID") != self.docker_daemon_id:
             raise CanaryBlockedError("Windows tools Docker daemon identity changed")
@@ -99,7 +104,7 @@ class WindowsManagedRuntime:
             return native.last_halt
 
         async with photos_ui_session(self.pool, session, role=role, halt=halt) as lease:
-            native = BoundWindowsControl(self.control, session, lease.ticket)
+            native = BoundWindowsControl(self.control, session, lease.ticket, role=role)
 
             async def stop(_session) -> None:
                 await asyncio.to_thread(native.halt, cold=True)
@@ -121,6 +126,24 @@ class WindowsManagedRuntime:
             yield device, lease
             lease.check()
             failed = False
+
+    async def _staging_binding(self, session: WindowsAndroidSession) -> None:
+        audit = await self.pool.fetchrow(
+            "SELECT staging_device,staging_inode FROM windows_runtime_enrollments WHERE runtime_id=$1 AND generation=$2",
+            session.runtime_id,
+            session.generation,
+        )
+        try:
+            stat = self.staging_root.stat()
+            valid = self.staging_root.resolve() == self.staging_root and self.staging_root.is_dir()
+        except OSError:
+            raise CanaryBlockedError("Windows staging physical binding unavailable") from None
+        if (
+            not valid
+            or audit is None
+            or (stat.st_dev, stat.st_ino) != (audit["staging_device"], audit["staging_inode"])
+        ):
+            raise CanaryBlockedError("Windows staging physical binding changed; require new enrollment")
 
     @asynccontextmanager
     async def cold(self, account_id: uuid.UUID) -> AsyncIterator[PhotosUILease]:

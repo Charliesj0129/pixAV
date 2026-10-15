@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import ssl
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import httpx
 
-from pixav.pixel_injector.canary import CanaryBlockedError
-from pixav.pixel_injector.session import WindowsAndroidSession
-from pixav.pixel_injector.windows_host_models import HostHaltReceipt, HostUIRequest
-from pixav.shared.activity_context import require_activity_context
-from pixav.shared.photos_ui_session import PhotosUITicket
+from pixav.pixel_injector.errors import CanaryBlockedError
+from pixav.pixel_injector.windows_host_models import (
+    HostHaltReceipt,
+    HostReadinessReceipt,
+    HostReadinessRequest,
+    HostUIRequest,
+)
+
+if TYPE_CHECKING:
+    from pixav.pixel_injector.session import WindowsAndroidSession
+    from pixav.shared.photos_ui_session import PhotosUITicket
 
 
 class WindowsHostClient:
@@ -35,7 +42,7 @@ class WindowsHostClient:
     def close(self) -> None:
         self._client.close()
 
-    def call(self, operation: str, request: HostUIRequest) -> dict:
+    def call(self, operation: str, request: HostUIRequest | HostReadinessRequest) -> dict:
         try:
             result = self._client.post(
                 "/v1/" + operation, content=request.model_dump_json(), headers={"Content-Type": "application/json"}
@@ -49,11 +56,22 @@ class WindowsHostClient:
             raise CanaryBlockedError("Windows native response invalid")
         return payload
 
+    def readiness(self, request: HostReadinessRequest) -> HostReadinessReceipt:
+        try:
+            receipt = HostReadinessReceipt.model_validate(self.call("readiness", request))
+        except ValueError:
+            raise CanaryBlockedError("Windows readiness response invalid") from None
+        if any(receipt.model_dump().get(key) != value for key, value in request.model_dump().items()):
+            raise CanaryBlockedError("Windows readiness response binding changed")
+        return receipt
+
 
 class BoundWindowsControl:
     def __init__(
         self, client: WindowsHostClient, session: WindowsAndroidSession, ticket: PhotosUITicket, *, role="upload"
     ) -> None:
+        from pixav.shared.activity_context import require_activity_context
+
         context = require_activity_context()
         self.client, self.session = client, session
         self.request = HostUIRequest(

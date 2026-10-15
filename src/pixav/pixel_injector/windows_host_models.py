@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
@@ -75,11 +76,39 @@ class WindowsHostManifest(BaseModel):
         return self
 
 
-class HostUIRequest(BaseModel):
+class HostRuntimeBinding(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     runtime_id: UUID
     runtime_generation: int = Field(gt=0, strict=True)
     identity_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class HostReadinessRequest(HostRuntimeBinding):
+    nonce: UUID
+
+    @property
+    def session_id(self) -> UUID:
+        # The native read-only probe needs a marker, not an activity ticket.
+        return self.nonce
+
+
+class HostReadinessReceipt(HostRuntimeBinding):
+    nonce: UUID
+    device_key: str = Field(min_length=1, max_length=256)
+    tools_id: str = Field(min_length=1, max_length=128)
+    script_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observed_at: datetime
+    quiescent: Literal[True]
+
+    @model_validator(mode="after")
+    def require_observation_clock(self) -> HostReadinessReceipt:
+        if self.observed_at.tzinfo is None:
+            raise ValueError("native observation requires an explicit clock offset")
+        return self
+
+
+class HostUIRequest(HostRuntimeBinding):
     session_id: UUID
     session_token: UUID = Field(repr=False)
     operation_id: UUID

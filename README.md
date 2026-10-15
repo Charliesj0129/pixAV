@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。軟體檢查為 1,967 passed／8 skipped，完整 coverage 約 82.33%；Ruff／Black／isort／mypy 與兩份工具／CI Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。軟體檢查為 2,001 passed／8 skipped，完整 coverage 約 82.47%；Ruff／Black／isort／mypy 與兩份工具／CI Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -256,9 +256,21 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 
 當次 Windows SDK 實測通過十二個基礎映像檔的封存、設定檔 write-open 拒絕、實際套件／scope 核對、warm quiesce 後再次觀測與錯誤 Photos APK pin 拒絕；原生呼叫約十五至十六秒。AVD 以明確的 [data／system directory 參數](https://developer.android.com/studio/run/emulator-commandline) 冷啟動後，root、Photos-only scope 與同一 Photos process 的 Pixel XL Build hook 通過；diagnostics IPC 仍有失敗，未作 provider 容量驗收。這份環境 candidate 尚未寫入 runtime registry，完整 managed ownership／registration／故障恢復仍 OPEN。
 
-[activity context](src/pixav/shared/activity_context.py) 讓 storage 與 playback worker 的 await chain 保留原 request／worker token，平行活動彼此隔離且 token 不進 repr。[持久 UI scope](src/pixav/shared/photos_ui_session.py) 取得原 activity 綁定的 session，DB clock 決定剩餘期限、monotonic clock 量測等待，每十秒 heartbeat；scope 到期或 execution 改變即停止續租並要求 halt。結束與取消都等待原 writer 的 halt callback，登錄 request 後仍保持 fence，回覆不明不釋放；DB 斷線時保留原 ACTIVE row。[legacy UI guard](src/pixav/shared/photos_ui_ownership.py) 也會拒絕同帳號或 owner 的持久 fence，不能因 advisory connection 消失而接手。Windows cold child 登錄 deterministic name、session／owner label 與 create／remove phase；取消會等候 exact child 收尾，create 結果不明維持 fence。authority 在交接前精確停止並移除已知 reader container，保留 bind-mounted work／evidence，使延遲的 start RPC 不能恢復舊 reader。當次完整檢查為 1,967 passed／8 skipped，含專用 PostgreSQL／Redis；Ruff／Black／isort／mypy 通過。
+[activity context](src/pixav/shared/activity_context.py) 讓 storage 與 playback worker 的 await chain 保留原 request／worker token，平行活動彼此隔離且 token 不進 repr。[持久 UI scope](src/pixav/shared/photos_ui_session.py) 取得原 activity 綁定的 session，DB clock 決定剩餘期限、monotonic clock 量測等待，每十秒 heartbeat；scope 到期或 execution 改變即停止續租並要求 halt。結束與取消都等待原 writer 的 halt callback，登錄 request 後仍保持 fence，回覆不明不釋放；DB 斷線時保留原 ACTIVE row。[legacy UI guard](src/pixav/shared/photos_ui_ownership.py) 也會拒絕同帳號或 owner 的持久 fence，不能因 advisory connection 消失而接手。Windows cold child 登錄 deterministic name、session／owner label 與 create／remove phase；取消會等候 exact child 收尾，create 結果不明維持 fence。authority 在交接前精確停止並移除已知 reader container，保留 bind-mounted work／evidence，使延遲的 start RPC 不能恢復舊 reader。當次完整檢查為 2,001 passed／8 skipped，含專用 PostgreSQL／Redis；Ruff／Black／isort／mypy 通過。
 
 [registered factory](src/pixav/pixel_injector/windows_managed_runtime.py) 與 [Windows storage adapter](src/pixav/pixel_injector/windows_storage.py) 已接入 storage／cold／playback callers，只附著 READY 的原 runtime generation，核對 account／owner／profile／staging、native digest、原 Docker daemon 與 exact tools ID，不 provision 或替換缺失的裝置。正常活動 quiesce；失聯要求 cold halt。只有 [Maxwell halt reconciler](src/pixav/maxwell_core/windows_ui_reconciliation.py) 可在新一輪 native 唯讀觀測及 exact daemon／tools／reader 核對後解除 fence；停止請求與 worker boolean 不抵驗證，原 operation／generation 不變。[真 PostgreSQL factory／authority 情境](tests/integration/test_windows_managed_runtime.py) 已通過。這些隔離測試的 native／Docker adapter 是契約替身，完整 managed hardware、AVD backup／restore、environment registration 與 fault drill 保持 OPEN。
+
+[024 enrollment migration](migrations/024_windows_runtime_enrollment.sql) 新增不可改寫的 `windows_runtime_enrollments`；Windows READY 須有同一 runtime／generation／identity／tools 的登錄稽核，factory 亦核對此關聯。migration 將缺乏登錄證據的舊 Windows READY 留為 REVIEW_REQUIRED，保留原 identity、operation、execution 與 UI fence；不改既有 redroid journal，也不直接升級環境。隔離 PostgreSQL 已驗證交易 rollback、重複 apply、audit 權限／不可改寫、完整 dump／restore 與舊 fence 保留。切換須先停止不相容的舊 callers；rollback 使用仍理解 enrollment 與持久 fence 的 authority／worker 配對。
+
+[登錄入口](scripts/manage_windows_runtime.py) 預設 dry-run，讀取絕對路徑的私有 0600 manifest（父目錄 0700），依 [WindowsRegistration](src/pixav/pixel_injector/windows_registration.py) 固定帳號／owner、完整 host manifest、immutable tools image、原 daemon 與 staging 的 host／container device／inode。tools 必須已存在且為 idle running，唯讀 root、drop ALL、無 privileged／host network／device／socket／secret mounts；只允許唯讀 `/parts` 與 tmpfs，flows 由固定 image 提供。檢查前後重驗實際 bind，並經 mTLS 取得 fresh nonce 的 native readiness。apply 在原帳號／owner guard 和 DB 交易內重查 instance／database、既有 generation 與未覆核 UI owner，原子寫入 registry／audit／READY；同一實體 AVD 或 serial 的 alias、到期或 REVIEW_REQUIRED 的未覆核 owner 都不能跳過；重複登錄仍須符合原 audit 的 daemon／staging／script binding，Native writer 啟動前再驗 staging 實體目錄。這個入口不建立資源、登入、派送或重播 execution，也不扣 quota；失敗只輸出固定拒絕碼。連線與 secret references 沿用 `PIXAV_WINDOWS_CONTROL_*` 及既有 DB Settings。
+
+```bash
+uv run python -m scripts.manage_windows_runtime --manifest PRIVATE_RUNTIME_JSON --db-identity IDENTIFIER --database DATABASE
+# 確認同一私有 manifest 的 dry-run 後，明確登錄：
+uv run python -m scripts.manage_windows_runtime --manifest PRIVATE_RUNTIME_JSON --db-identity IDENTIFIER --database DATABASE --apply --operator OPERATOR --reason REASON
+```
+
+host 的 `POST /v1/readiness` 只接受固定 runtime／generation／identity 與 nonce；在無未覆核 owner、SDK／套件及 UI quiescence 通過時回傳新的綁定收據，不建立 ticket、不改 journal、不停止 app。它供登錄前檢查，`/health` 仍只代表 transport liveness。Windows native client 與獨立 Docker client 均已經實際 mTLS 路徑通過；無 client certificate、錯誤 generation 的 live 請求被拒絕，兩個已關閉 ticket 與 journal bytes 保持不變。收據 replay／binding／clock 拒絕由 client 邊界測試驗證。transport 可在 Windows 載入，保留原 `CanaryBlockedError` 類型，Linux canary 的檔案鎖留在原 adapter。正式資料的 migration／登錄、真實帳號與 managed hardware ownership／fault drill 仍 OPEN。
 
 [host control](src/pixav/pixel_injector/windows_host.py) 使用鎖定的 FastAPI 0.129.0／Uvicorn 0.40.0，在 Windows `127.0.0.1:5043` 提供固定 manifest 的 claim／observe／halt／verify-halt 與 `/health`；由 [mutual-TLS client](src/pixav/pixel_injector/windows_control.py) 經受控 Docker 路徑使用，不提供任意命令或裝置選擇。FastAPI（MIT）、Uvicorn（BSD-3-Clause）及 HTTPX 0.28.1（BSD-3-Clause）沿用 [依賴鎖](uv.lock)；當次 native interpreter 重用 Python 3.13.5。每次 JSON 上限 16 KiB、concurrency 4，原生呼叫 deadline 45 秒、client timeout 60 秒，無自動重傳。host journal 先登錄 resource ownership／halt intent，僅存 ticket digest；已關閉 ticket 留 tombstone，重啟後也不允許遲到請求重新 claim。[host 契約測試](tests/pixel_injector/test_windows_host.py) 通過。當次實機 mTLS 拒絕無 client certificate、合法 health、warm quiesce、新的停止觀測、舊 ticket 拒絕與 successor claim／observe 均通過，AVD boot 未改變；cold halt 未執行。
 
@@ -342,7 +354,7 @@ AVD userdata、system image／SDK rebuild manifest、設定、ADB keys、runtime
 | --- | --- | --- |
 | Microsoft kernel 下 Docker／WSL 與 Windows WHPX Emulator 共存；原 daemon／mounts 不變 | BDD-044、141–142 | 當次原 daemon／保留 volumes 已核對；本機 Emulator／runner 共存，退休 bind 的缺口與新部署驗收仍 OPEN |
 | exact AVD／帳號／owner；多裝置不誤選；ADB／Maestro forwarding／UI 失聯安全停止 | BDD-040–045、127、141 | exact ADB／Maestro smoke 與 cold start 後 root／Photos hook 已驗；帳號／多裝置與 managed fencing live OPEN |
-| 切換／crash 沿用 intent，未知結果不重傳、成功用量不重扣 | BDD-003、048–049、113、128 | expand／隔離 restore、factory／authority 接線、host mTLS／warm handoff 已驗；完整 managed hardware／registration／live recovery OPEN |
+| 切換／crash 沿用 intent，未知結果不重傳、成功用量不重扣 | BDD-003、048–049、113、128 | expand／隔離 restore、factory／authority 接線、登錄交易／audit 與 native／Docker mTLS readiness 已驗；正式登錄／managed ownership／live recovery OPEN |
 | 原始品質、quota、cold read-back、READY／publication、刪 staging 與清 cache 後恢復 | BDD-047–063、109–118、130–143 | 完整新環境驗收 OPEN，不能沿用舊 runtime PASS |
 
 ## 部署與資料操作
