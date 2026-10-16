@@ -16,6 +16,35 @@ from uuid import UUID
 
 IMAGE = re.compile(r"^sha256:[a-f0-9]{64}$")
 PROJECT = re.compile(r"^pixav-managed-[a-z0-9][a-z0-9-]*$")
+CORE_IMAGES = {
+    "postgres": "pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff",
+    "redis": "redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065",
+}
+CORE_COMMANDS = {
+    "postgres": [
+        "postgres",
+        "-c",
+        "max_wal_size=128MB",
+        "-c",
+        "min_wal_size=32MB",
+        "-c",
+        "log_min_error_statement=panic",
+    ],
+    "redis": [
+        "redis-server",
+        "/run/secrets/redis_config",
+        "--dir",
+        "/data",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--bind",
+        "0.0.0.0",  # noqa: S104 -- internal Docker network only; no published port
+        "--protected-mode",
+        "yes",
+    ],
+}
 
 
 def run(command: list[str]) -> str:
@@ -87,7 +116,91 @@ def validate_tools(config: dict) -> None:
         raise ValueError("WINDOWS_TOOLS_HEALTH_OR_TMPFS_INVALID")
 
 
-def preflight(args: argparse.Namespace) -> dict:
+def validate_core(  # noqa: C901 -- explicit deployment refusals
+    config: dict, data_root: Path, secrets_root: Path
+) -> None:
+    if set(config["services"]) != set(CORE_IMAGES) or not config.get("networks", {}).get("core", {}).get("internal"):
+        raise ValueError("CORE_PROFILE_ISOLATION_INVALID")
+    for root in [data_root, secrets_root]:
+        if not root.is_absolute() or root.resolve() != root or stat.S_IMODE(root.stat().st_mode) != 0o700:
+            raise ValueError("CORE_PRIVATE_ROOT_REQUIRED")
+    for name, image in CORE_IMAGES.items():
+        service = config["services"][name]
+        if (
+            service.get("image") != image
+            or service.get("pull_policy") != "never"
+            or service.get("profiles") != ["core"]
+            or service.get("restart") != "no"
+            or not service.get("read_only")
+            or service.get("ports")
+            or service.get("container_name")
+            or service.get("entrypoint") is not None
+            or service.get("command") != CORE_COMMANDS[name]
+            or service.get("privileged")
+            or service.get("devices")
+            or service.get("network_mode")
+            or set(service.get("networks", {})) != {"core"}
+            or service.get("cap_drop") != ["ALL"]
+            or service.get("cap_add")
+            or not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", service.get("user", ""))
+            or service.get("security_opt") != ["no-new-privileges:true"]
+        ):
+            raise ValueError("CORE_SERVICE_ISOLATION_INVALID")
+        memory, cpus, pids = (3 * 1024**3, 2, 256) if name == "postgres" else (256 * 1024**2, 0.5, 64)
+        if (
+            int(service.get("mem_limit", 0)) != memory
+            or int(service.get("memswap_limit", 0)) != memory
+            or float(service.get("cpus", 0)) != cpus
+            or service.get("pids_limit") != pids
+            or not service.get("healthcheck", {}).get("test")
+        ):
+            raise ValueError("CORE_RESOURCE_OR_HEALTH_INVALID")
+        mounts = service.get("volumes", [])
+        target = "/var/lib/postgresql/data" if name == "postgres" else "/data"
+        source = data_root / name
+        if (
+            len(mounts) != 1
+            or mounts[0].get("type") != "bind"
+            or mounts[0].get("source") != str(source)
+            or mounts[0].get("target") != target
+            or mounts[0].get("read_only", False)
+            or mounts[0].get("bind", {}).get("create_host_path") is not False
+            or source.resolve() != source
+            or not source.is_dir()
+            or source.stat().st_uid != int(service["user"].split(":")[0])
+        ):
+            raise ValueError("CORE_DATA_BIND_INVALID")
+        expected_secrets = ["postgres_password"] if name == "postgres" else ["redis_config", "redis_password"]
+        if {row["source"] for row in service.get("secrets", [])} != set(expected_secrets):
+            raise ValueError("CORE_SECRET_BINDING_INVALID")
+        for row in service["secrets"]:
+            if row["target"] != "/run/secrets/" + row["source"]:
+                raise ValueError("CORE_SECRET_BINDING_INVALID")
+    expected_env = {"POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD_FILE", "POSTGRES_INITDB_ARGS", "PGDATA"}
+    pg = config["services"]["postgres"]["environment"]
+    if (
+        set(pg) != expected_env
+        or pg["POSTGRES_PASSWORD_FILE"] != "/run/secrets/postgres_password"  # noqa: S105 -- reference, not a password
+        or pg["PGDATA"] != "/var/lib/postgresql/data/pgdata"
+        or pg["POSTGRES_INITDB_ARGS"] != "--auth-host=scram-sha-256"
+        or config["services"]["redis"].get("environment")
+        or not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", config["services"]["redis"].get("user", ""))
+    ):
+        raise ValueError("CORE_CREDENTIAL_CONFIGURATION_INVALID")
+    if set(config.get("secrets", {})) != {"postgres_password", "redis_config", "redis_password"}:
+        raise ValueError("CORE_SECRET_BINDING_INVALID")
+    for name, secret in config["secrets"].items():
+        path = secrets_root / name
+        if (
+            secret.get("file") != str(path)
+            or path.resolve() != path
+            or not path.is_file()
+            or stat.S_IMODE(path.stat().st_mode) != 0o600
+        ):
+            raise ValueError("CORE_PRIVATE_SECRET_REQUIRED")
+
+
+def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and identity checks before deployment
     if not PROJECT.fullmatch(args.project):
         raise ValueError("MANAGED_PROJECT_REQUIRED")
     private = args.env_file
@@ -111,13 +224,20 @@ def preflight(args: argparse.Namespace) -> dict:
         "-f",
         str(args.compose_file),
         "--profile",
-        "windows-tools",
+        getattr(args, "profile", "windows-tools"),
     ]
     config = json.loads(run([*compose, "config", "--format", "json"]))
     if config.get("name") != args.project:
         raise ValueError("MANAGED_PROJECT_BINDING_CHANGED")
-    validate_tools(config)
-    run([*docker, "image", "inspect", config["services"]["windows_tools"]["image"], "--format", "{{.Id}}"])
+    profile = getattr(args, "profile", "windows-tools")
+    if profile == "core":
+        if args.data_root is None or args.secrets_root is None:
+            raise ValueError("CORE_EXPLICIT_ROOTS_REQUIRED")
+        validate_core(config, args.data_root, args.secrets_root)
+    else:
+        validate_tools(config)
+    for service in config["services"].values():
+        run([*docker, "image", "inspect", service["image"], "--format", "{{.Id}}"])
     active = set()
     for label in ["pixav.runtime.role=android-dev-tools", "pixav.photos_canary.role=tools"]:
         active.update(run([*docker, "ps", "--quiet", "--no-trunc", "--filter", "label=" + label]).splitlines())
@@ -126,13 +246,14 @@ def preflight(args: argparse.Namespace) -> dict:
         if labels.get("com.docker.compose.project") != args.project:
             raise ValueError("PREVIOUS_ANDROID_TOOLS_STILL_RUNNING")
     return {
-        "stage": "windows-tools",
+        "stage": profile,
         "eligible": True,
-        "profile_services": 1,
+        "profile_services": len(config["services"]),
         "daemon_identity_bound": True,
         "immutable_image": True,
         "containers_started": 0,
         "database_touched": False,
+        "runtime_instances_verified": False,
         "golden_path": "OPEN",
     }
 
@@ -143,6 +264,9 @@ def main() -> None:
     parser.add_argument("--context", required=True)
     parser.add_argument("--daemon-id", required=True)
     parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--profile", choices=["windows-tools", "core"], default="windows-tools")
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--secrets-root", type=Path)
     parser.add_argument("--compose-file", type=Path, default=Path("docker-compose.managed.yml"))
     args = parser.parse_args()
     try:

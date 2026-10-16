@@ -1,5 +1,5 @@
 # Managed deployment entry. Start only the profiles accepted for the current phase.
-# Application/core profiles are added after their deployment contracts are verified.
+# Application profiles are added after their deployment contracts are verified.
 name: ${PIXAV_MANAGED_PROJECT:?set the dedicated managed project}
 services:
   windows_tools:
@@ -47,3 +47,81 @@ services:
       pixav.photos_canary.role: tools
       pixav.runtime.id: ${PIXAV_STORAGE_WINDOWS_RUNTIME_ID:?set the registered runtime ID}
       pixav.runtime.generation: ${PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION:?set the registered generation}
+  postgres:
+    profiles: [core]
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    pull_policy: never
+    restart: "no"
+    user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 2.0
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 256
+    shm_size: 256m
+    environment:
+      POSTGRES_USER: ${PIXAV_MANAGED_DB_ADMIN:-pixav_admin}
+      POSTGRES_DB: ${PIXAV_MANAGED_DATABASE:-pixav_managed}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: [postgres, -c, max_wal_size=128MB, -c, min_wal_size=32MB, -c, log_min_error_statement=panic]
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    secrets: [postgres_password]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+      - /var/run/postgresql:rw,nosuid,nodev,size=16m,mode=3775,uid=${PIXAV_MANAGED_UID:-1000},gid=${PIXAV_MANAGED_GID:-1000}
+    networks: [core]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 60s
+  redis:
+    profiles: [core]
+    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    pull_policy: never
+    restart: "no"
+    user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    command: [redis-server, /run/secrets/redis_config, --dir, /data, --appendonly, "yes", --appendfsync, everysec, --bind, 0.0.0.0, --protected-mode, "yes"]
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/redis
+        target: /data
+        bind:
+          create_host_path: false
+    secrets: [redis_config, redis_password]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
+    networks: [core]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$(cat /run/secrets/redis_password)" redis-cli --no-auth-warning ping | grep -qx PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+networks:
+  core:
+    internal: true
+secrets:
+  postgres_password:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/postgres_password
+  redis_config:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_config
+  redis_password:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_password

@@ -134,3 +134,86 @@ def test_both_development_and_managed_foreign_runners_are_checked(config, tmp_pa
     with pytest.raises(ValueError, match="PREVIOUS_ANDROID_TOOLS_STILL_RUNNING"):
         module.preflight(args)
     assert sum("ps" in argv for argv in calls) == 2
+
+
+@pytest.fixture
+def core_config(tmp_path):
+    import json
+    import os
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    data = tmp_path / "data"
+    secrets = tmp_path / "secrets"
+    data.mkdir(mode=0o700)
+    secrets.mkdir(mode=0o700)
+    for name in ["postgres", "redis"]:
+        (data / name).mkdir()
+    for name in ["postgres_password", "redis_config", "redis_password"]:
+        (secrets / name).write_text("synthetic-private-value")
+        (secrets / name).chmod(0o600)
+    manifest = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker-compose.managed.yml").read_text())
+    manifest["services"].pop("windows_tools")
+    replacements = {
+        "PIXAV_MANAGED_DATA_ROOT": str(data),
+        "PIXAV_MANAGED_SECRETS_ROOT": str(secrets),
+        "PIXAV_MANAGED_UID": str(os.getuid()),
+        "PIXAV_MANAGED_GID": str(os.getgid()),
+    }
+    encoded = re.sub(
+        r"\$\{([^}:]+):-([^}]*)\}",
+        lambda match: replacements.get(match[1], match[2]),
+        json.dumps(manifest),
+    )
+    manifest = json.loads(encoded)
+    for service in manifest["services"].values():
+        service["networks"] = {"core": None}
+        service["mem_limit"] = {"3g": "3221225472", "256m": "268435456"}[service["mem_limit"]]
+        service["memswap_limit"] = service["mem_limit"]
+        service["secrets"] = [{"source": name, "target": "/run/secrets/" + name} for name in service["secrets"]]
+    return manifest, data, secrets
+
+
+def test_core_manifest_keeps_credentials_in_files_and_selects_only_infrastructure(core_config):
+    module.validate_core(*core_config)
+    config, _, _ = core_config
+    assert set(config["services"]) == {"postgres", "redis"}
+    assert config["services"]["postgres"]["environment"]["PGDATA"].endswith("/pgdata")
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "host-port",
+        "public-network",
+        "mutable-image",
+        "inline-password",
+        "wrong-bind",
+        "root-redis",
+        "executor-command",
+        "secret-mode",
+    ],
+)
+def test_core_preflight_rejects_unsafe_deployments(core_config, defect):
+    config, data, secrets = core_config
+    pg = config["services"]["postgres"]
+    if defect == "host-port":
+        pg["ports"] = [{"target": 5432, "published": "5432", "host_ip": "0.0.0.0"}]  # noqa: S104 -- refusal fixture
+    elif defect == "public-network":
+        config["networks"]["core"]["internal"] = False
+    elif defect == "mutable-image":
+        pg["image"] = "postgres:latest"
+    elif defect == "inline-password":
+        pg["environment"]["POSTGRES_PASSWORD"] = "synthetic-private-value"
+    elif defect == "wrong-bind":
+        pg["volumes"][0]["source"] = str(data.parent / "original-data")
+    elif defect == "root-redis":
+        config["services"]["redis"]["user"] = "0:0"
+    elif defect == "executor-command":
+        pg["command"] = ["python", "-m", "pixav.maxwell_core.worker"]
+    elif defect == "secret-mode":
+        (secrets / "postgres_password").chmod(0o644)
+    with pytest.raises(ValueError):
+        module.validate_core(config, data, secrets)
