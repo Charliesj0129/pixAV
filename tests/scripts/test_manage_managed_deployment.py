@@ -155,7 +155,12 @@ def core_config(tmp_path):
         (secrets / name).write_text("synthetic-private-value")
         (secrets / name).chmod(0o600)
     manifest = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker-compose.managed.yml").read_text())
-    manifest["services"].pop("windows_tools")
+    manifest["services"] = {
+        name: service for name, service in manifest["services"].items() if service.get("profiles") == ["core"]
+    }
+    manifest["secrets"] = {
+        name: manifest["secrets"][name] for name in ["postgres_password", "redis_config", "redis_password"]
+    }
     replacements = {
         "PIXAV_MANAGED_DATA_ROOT": str(data),
         "PIXAV_MANAGED_SECRETS_ROOT": str(secrets),
@@ -217,3 +222,89 @@ def test_core_preflight_rejects_unsafe_deployments(core_config, defect):
         (secrets / "postgres_password").chmod(0o644)
     with pytest.raises(ValueError):
         module.validate_core(config, data, secrets)
+
+
+@pytest.fixture
+def authority_config(core_config, monkeypatch):
+    import json
+    import os
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    _, data, secrets = core_config
+    for name in ["downloads", "remuxed", "library", "artwork", "playback-cache"]:
+        (data / name).mkdir()
+    names = ["authority_password", "redis_client_url", "windows_ca", "windows_certificate", "windows_key"]
+    for name in names:
+        (secrets / name).write_text("synthetic-private-value")
+        (secrets / name).chmod(0o600)
+    manifest = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker-compose.managed.yml").read_text())
+    manifest["services"] = {"maxwell_core": manifest["services"]["maxwell_core"]}
+    manifest["secrets"] = {name: manifest["secrets"][name] for name in names}
+    replacements = {
+        "PIXAV_MANAGED_APP_IMAGE": "sha256:" + "a" * 64,
+        "PIXAV_MANAGED_COLD_IMAGE": "sha256:" + "b" * 64,
+        "PIXAV_MANAGED_DATA_ROOT": str(data),
+        "PIXAV_MANAGED_SECRETS_ROOT": str(secrets),
+        "PIXAV_MANAGED_UID": str(os.getuid()),
+        "PIXAV_MANAGED_GID": str(os.getgid()),
+        "PIXAV_MANAGED_DATABASE": "synthetic_database",
+        "PIXAV_EXPECTED_DB_IDENTITY": "123",
+        "PIXAV_EXPECTED_REDIS_RUN_ID": "a" * 40,
+        "PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID": "synthetic-daemon",
+        "PIXAV_MANAGED_DOCKER_GID": "1337",
+    }
+    encoded = re.sub(
+        r"\$\{([^}:]+)(?::([-?])([^}]*))?\}",
+        lambda m: replacements.get(m[1], m[3] if m[2] == "-" else "synthetic-binding"),
+        json.dumps(manifest),
+    )
+    manifest = json.loads(encoded)
+    service = manifest["services"]["maxwell_core"]
+    service["networks"] = {name: None for name in service["networks"]}
+    service["mem_limit"] = service["memswap_limit"] = "805306368"
+    service["secrets"] = [
+        row if isinstance(row, dict) else {"source": row, "target": "/run/secrets/" + row} for row in service["secrets"]
+    ]
+    real_stat = Path.stat
+
+    def file_stat(path, *args, **kwargs):
+        if str(path) == "/var/run/docker.sock":
+            return SimpleNamespace(st_gid=1337)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", file_stat)
+    args = SimpleNamespace(
+        profile="authority",
+        db_identity="123",
+        database="synthetic_database",
+        redis_run_id="a" * 40,
+        daemon_id="synthetic-daemon",
+        data_root=data,
+        secrets_root=secrets,
+    )
+    return manifest, args
+
+
+def test_authority_profile_binds_separate_role_secrets_and_exact_instances(authority_config):
+    module.validate_application(*authority_config)
+
+
+@pytest.mark.parametrize("defect", ["admin-secret", "legacy-mode", "wrong-run-id", "raw-password", "database-mount"])
+def test_authority_profile_refuses_privilege_and_identity_drift(authority_config, defect):
+    config, args = authority_config
+    service = config["services"]["maxwell_core"]
+    if defect == "admin-secret":
+        service["secrets"][0]["source"] = "postgres_password"
+    elif defect == "legacy-mode":
+        service["environment"]["PIXAV_MANAGED_MEDIA_WORKFLOW"] = "false"
+    elif defect == "wrong-run-id":
+        service["environment"]["PIXAV_EXPECTED_REDIS_RUN_ID"] = "b" * 40
+    elif defect == "raw-password":
+        service["environment"]["PIXAV_DB_PASSWORD"] = "synthetic-private-value"
+    else:
+        service["volumes"][1]["target"] = "/app/data/postgres"
+    with pytest.raises(ValueError):
+        module.validate_application(config, args)

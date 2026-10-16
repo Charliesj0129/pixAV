@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+from urllib.parse import quote
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -9,24 +13,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application-wide configuration loaded from environment variables."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="PIXAV_", frozen=True, extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="PIXAV_", frozen=True, extra="ignore", hide_input_in_errors=True
+    )
 
     # PostgreSQL
     db_host: str = "localhost"
     db_port: int = 5432
     db_user: str = "pixav"
-    db_password: str = "pixav"
+    db_password: str = Field(default="pixav", repr=False)
     db_name: str = "pixav"
+    expected_db_identity: str = ""
+    expected_db_name: str = ""
 
     # Redis
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = Field(default="redis://localhost:6379/0", repr=False)
+    expected_redis_run_id: str = ""
     system_pause_key: str = "system:pause"
     download_pause_key: str = "pixav:download:pause"
 
     # qBittorrent
     qbit_url: str = "http://localhost:8085"
     qbit_user: str = "admin"
-    qbit_password: str = "adminadmin"
+    qbit_password: str = Field(default="adminadmin", repr=False)
     # Path as seen by qBittorrent inside its own container namespace. This is
     # intentionally separate from ``download_dir`` below: qBittorrent mounts
     # the host directory at /downloads while pixAV workers see it under /app.
@@ -158,7 +167,7 @@ class Settings(BaseSettings):
 
     # Jackett
     jackett_url: str = "http://localhost:9117"
-    jackett_api_key: str = ""
+    jackett_api_key: str = Field(default="", repr=False)
 
     # FlareSolverr
     flaresolverr_url: str = "http://localhost:8191"
@@ -244,9 +253,13 @@ class Settings(BaseSettings):
 
     @property
     def dsn(self) -> str:
-        return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        user, password, database = (quote(value, safe="") for value in (self.db_user, self.db_password, self.db_name))
+        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{database}"
 
 
 def get_settings() -> Settings:
     """Factory — allows overriding in tests."""
-    return Settings()
+    directory = os.environ.get("PIXAV_SETTINGS_SECRETS_DIR", "")
+    if directory and (not Path(directory).is_absolute() or not Path(directory).is_dir()):
+        raise RuntimeError("SETTINGS_SECRET_DIRECTORY_UNAVAILABLE")
+    return Settings(_secrets_dir=directory or None)

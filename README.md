@@ -246,9 +246,9 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 
 ### Managed 部署入口與當前 profile
 
-新的 [docker-compose.managed.yml](docker-compose.managed.yml) 是受管部署的單一入口，目前宣告 `windows-tools` 與 `core` profiles；`core` 只包含 PostgreSQL／Redis，authority／workers、VPN、resolver 與 private Jellyfin 尚未接入此 manifest，完整 Stage 3 仍 OPEN。工具映像以 [windows-tools.Dockerfile](docker/windows-tools.Dockerfile) 延伸已核對的本機 immutable tools 基底，只加入 repository 的 Maestro flows；build 前後核對基底 image ID／RootFS layers，執行時使用產出的 immutable image ID。二十四個 baked flow 的完整 SHA-256 已核對，帳號、AVD、DB／queue secret 不進 image 或 runner。
+新的 [docker-compose.managed.yml](docker-compose.managed.yml) 是受管部署的單一入口，目前宣告 `windows-tools`、`core`、`schema` 與 `authority` profiles；`core` 只包含 PostgreSQL／Redis，`schema` 供 migration／角色登錄，`authority` 啟動唯一 Maxwell。workers、VPN、resolver 與 private Jellyfin 尚未接入此 manifest，完整 Stage 3 仍 OPEN。工具映像以 [windows-tools.Dockerfile](docker/windows-tools.Dockerfile) 延伸已核對的本機 immutable tools 基底，只加入 repository 的 Maestro flows；build 前後核對基底 image ID／RootFS layers，執行時使用產出的 immutable image ID。二十四個 baked flow 的完整 SHA-256 已核對，帳號、AVD、DB／queue secret 不進 image 或 runner。
 
-[managed preflight](scripts/manage_managed_deployment.py) 是唯讀入口：依 `--profile` 選擇 tools 或 core，核對 explicit context／daemon／project、私有 0600 env（父目錄 0700）、固定 image、runtime owner／generation、transport、resource limits、唯讀 `/parts` 與 tmpfs；拒絕額外 service、直接放入的 credential、socket／privileged／host network 及仍在其他 project 運行的 Android tools。設定檢查不等於 native readiness、DB 登錄或 provider 能力。當前 tools 限制一 CPU／2 GiB、swap 與 RAM 同限、256 PIDs，無 restart policy；health 每三十秒、timeout 二十五秒、grace 二百四十秒，只核對 exact serial 與 Android boot，沒有 metrics endpoint。啟動前仍核對 Windows 實體容量與新 bind 的 host／container device、inode 及內容；只啟動當前需要的 profile，不恢復停止的其他專案。
+[managed preflight](scripts/manage_managed_deployment.py) 是唯讀入口：依 `--profile` 選擇 tools、core、schema 或 authority，核對 explicit context／daemon／project、私有 0600 env（父目錄 0700）、固定 image、runtime owner／generation、transport、resource limits、唯讀 `/parts` 與 tmpfs；拒絕額外 service、直接放入的 credential、socket／privileged／host network 及仍在其他 project 運行的 Android tools。設定檢查不等於 native readiness、DB 登錄或 provider 能力。當前 tools 限制一 CPU／2 GiB、swap 與 RAM 同限、256 PIDs，無 restart policy；health 每三十秒、timeout 二十五秒、grace 二百四十秒，只核對 exact serial 與 Android boot，沒有 metrics endpoint。啟動前仍核對 Windows 實體容量與新 bind 的 host／container device、inode 及內容；只啟動當前需要的 profile，不恢復停止的其他專案。
 
 ```bash
 # BASE_IMAGE 是已核實的本機 tools image ID；BASE_REF 是綁定該 ID 的私有建置用 tag。
@@ -283,7 +283,30 @@ docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVA
 
 Redis 8.2 切換的隔離實測僅移轉一筆合成 probe，保留原 expiration；原 7.4.8 資料目錄及映像保留，已實際以保留資料啟動舊版核對，再停止 exact 回退容器並恢復新版。新版重啟後 probe 仍在、run ID 改變，未授權 client 被拒絕；未載入原 production queue，不宣告舊正式 Redis 資料升級完成。
 
-core rollback 停止 exact service containers，保留其 bind、secret 與 instance 收據；不使用 `down -v` 或 prune，不載入舊 queue。這份 profile 不含 migration／角色 provision 或 executor，不能據此宣告完整應用部署。備份依本輪操作者停止新增備份的授權辦理，既有保全資料保留。
+core rollback 停止 exact service containers，保留其 bind、secret 與 instance 收據；不使用 `down -v` 或 prune，不載入舊 queue。core 本身不含 migration／角色 provision 或 executor，後續僅按已驗收的 schema／authority profile 啟動；不能據此宣告完整應用部署。備份依本輪操作者停止新增備份的授權辦理，既有保全資料保留。
+
+[managed-app.Dockerfile](docker/managed-app.Dockerfile) 以固定 Python 3.12 Bookworm digest、uv 0.9.11 及 `uv.lock` 建置同一應用映像，排除 dev／embeddings 與本地資料／secret，只複製程式、設定與 migration。映像預設不選 executor；部署必須給 immutable image ID 與 explicit role。程式來源、映像來源及 runtime 證據分別核對，dependency build 不表示應用已驗收。
+
+`schema` 只有 `migrate`／`provision`，不掛資料目錄或 Docker socket，只連 internal core network。migration 同時核對 cluster identifier 與 database name，再建立 ledger／套用 SQL；角色登錄預設 dry-run，apply 另行明確指定。三個 login 分別只繼承 execution authority、activity worker、playback reader 的權限。role 密碼可經 `PIXAV_*_ROLE_PASSWORD_FILE` 指向 exact 0600 file，與直接值同時出現即拒絕；密碼不進 image、command 或 logs。
+
+當次應用映像實測為 Python 3.12.15（PSF License）、uv 0.9.11（MIT／Apache-2.0）、redis-py 5.3.1（MIT）、Pydantic 2.12.5（MIT）與 FFmpeg 5.1.9 Debian build（啟用 GPL）。版本屬固定映像的實際輸出，不以 mutable base tag 代表部署。
+
+應用以 `PIXAV_SETTINGS_SECRETS_DIR` 載入 Pydantic 的 file secrets，容器的 DB password／Redis URL 分別掛至 `/run/secrets/PIXAV_DB_PASSWORD`、`PIXAV_REDIS_URL`；DB credentials／Redis URL／torrent password／provider API key 不進 Settings repr，DSN 依 URI 規則編碼。schema 與應用連線固定 `PIXAV_EXPECTED_DB_IDENTITY`／`PIXAV_EXPECTED_DB_NAME`，每個新 PostgreSQL pool connection 先核對後才初始化 codec；authority 啟動亦核對 `PIXAV_EXPECTED_REDIS_RUN_ID`，換實例時拒絕開始工作。Redis 計畫重啟後須重核新 run ID，再明確更新部署設定。
+
+`authority` 使用獨立非 superuser login、指定 Windows runtime／mTLS／daemon，所有 application role 限一 CPU／768 MiB／256 PIDs，非 root、drop ALL、唯讀 root、無 published port，不自動重啟。只有 authority 掛所需資料目錄、TLS client references 與 Docker socket；socket 的 readonly mount 仍允許 Docker API 操作，屬信任的控制端，停止行為另受 exact identity／UI fence 保護。health／metrics 只在容器網路提供，health 每五秒、timeout 四秒、grace 三十秒。Core 的 PG／Redis 健康不代表 application ownership 或 provider 就緒。
+
+實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。當前 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用；完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
+
+```bash
+# schema／authority 的 preflight 另外提供 --db-identity、--database；authority 再提供 --redis-run-id。
+docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile schema run --rm --no-deps migrate
+docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile schema run --rm --no-deps provision
+# 僅對同一已核對的隔離實例明確 apply：
+docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile schema run --rm --no-deps provision --db-identity IDENTIFIER --apply
+docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile authority up -d --no-deps --no-build --wait maxwell_core
+```
+
+回退先停止 exact authority、核對其 ownership 已釋放，再使用相容 schema／fence 的舊 immutable image；保留資料、原 operation、秘密與 journal，不切回不能讀取 enrollment 或完整 APK 契約的 process。本輪依操作者指示不新增實際備份，既有還原資料保留。
 
 ### Docker Runner 開發入口
 
@@ -303,7 +326,7 @@ core rollback 停止 exact service containers，保留其 bind、secret 與 inst
 
 當次 Windows SDK 實測通過十二個基礎映像檔的封存、設定檔 write-open 拒絕、實際套件／scope 核對、warm quiesce 後再次觀測與錯誤 Photos APK pin 拒絕；原生呼叫約十五至十六秒。AVD 以明確的 [data／system directory 參數](https://developer.android.com/studio/run/emulator-commandline) 冷啟動後，root、Photos-only scope 與同一 Photos process 的 Pixel XL Build hook 通過；diagnostics IPC 仍有失敗，未作 provider 容量驗收。當次環境已登錄至獨立驗證資料庫，原資料庫尚未登錄；完整故障恢復／restore 與 production 仍 OPEN。
 
-[activity context](src/pixav/shared/activity_context.py) 讓 storage 與 playback worker 的 await chain 保留原 request／worker token，平行活動彼此隔離且 token 不進 repr。[持久 UI scope](src/pixav/shared/photos_ui_session.py) 取得原 activity 綁定的 session，DB clock 決定剩餘期限、monotonic clock 量測等待，每十秒 heartbeat；scope 到期或 execution 改變即停止續租並要求 halt。結束與取消都等待原 writer 的 halt callback，登錄 request 後仍保持 fence，回覆不明不釋放；DB 斷線時保留原 ACTIVE row。[legacy UI guard](src/pixav/shared/photos_ui_ownership.py) 也會拒絕同帳號或 owner 的持久 fence，不能因 advisory connection 消失而接手。Windows cold child 登錄 deterministic name、session／owner label 與 create／remove phase；取消會等候 exact child 收尾，create 結果不明維持 fence。authority 在交接前精確停止並移除已知 reader container，保留 bind-mounted work／evidence，使延遲的 start RPC 不能恢復舊 reader。當次完整檢查為 2,037 passed／8 skipped，含專用 PostgreSQL／Redis；Ruff／Black／isort／mypy 通過。
+[activity context](src/pixav/shared/activity_context.py) 讓 storage 與 playback worker 的 await chain 保留原 request／worker token，平行活動彼此隔離且 token 不進 repr。[持久 UI scope](src/pixav/shared/photos_ui_session.py) 取得原 activity 綁定的 session，DB clock 決定剩餘期限、monotonic clock 量測等待，每十秒 heartbeat；scope 到期或 execution 改變即停止續租並要求 halt。結束與取消都等待原 writer 的 halt callback，登錄 request 後仍保持 fence，回覆不明不釋放；DB 斷線時保留原 ACTIVE row。[legacy UI guard](src/pixav/shared/photos_ui_ownership.py) 也會拒絕同帳號或 owner 的持久 fence，不能因 advisory connection 消失而接手。Windows cold child 登錄 deterministic name、session／owner label 與 create／remove phase；取消會等候 exact child 收尾，create 結果不明維持 fence。authority 在交接前精確停止並移除已知 reader container，保留 bind-mounted work／evidence，使延遲的 start RPC 不能恢復舊 reader。當次完整檢查為 2,059 passed／8 skipped，含專用 PostgreSQL／Redis；Ruff／Black／isort／mypy 通過。
 
 [registered factory](src/pixav/pixel_injector/windows_managed_runtime.py) 與 [Windows storage adapter](src/pixav/pixel_injector/windows_storage.py) 已接入 storage／cold／playback callers，只附著 READY 的原 runtime generation，核對 account／owner／profile／staging、native digest、原 Docker daemon 與 exact tools ID，不 provision 或替換缺失的裝置。正常活動 quiesce；失聯要求 cold halt。只有 [Maxwell halt reconciler](src/pixav/maxwell_core/windows_ui_reconciliation.py) 可在新一輪 native 唯讀觀測及 exact daemon／tools／reader 核對後解除 fence；停止請求與 worker boolean 不抵驗證，原 operation／generation 不變。[真 PostgreSQL factory／authority 情境](tests/integration/test_windows_managed_runtime.py) 已通過。這些隔離測試的 native／Docker adapter 是契約替身，實機 warm 交接另經下述驗收；AVD restore 開機、原 DB 登錄與 fault drill 保持 OPEN。
 

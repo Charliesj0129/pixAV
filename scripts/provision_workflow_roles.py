@@ -25,6 +25,8 @@ import argparse
 import asyncio
 import os
 import re
+import stat
+from pathlib import Path
 from typing import Any
 
 from pixav.config import get_settings
@@ -43,6 +45,24 @@ _SAFE_ROLE = re.compile(r"^[a-z][a-z0-9_]{2,62}$")
 
 def _password(variable: str) -> str:
     value = os.environ.get(variable, "")
+    reference = os.environ.get(variable + "_FILE", "")
+    if value and reference:
+        raise SystemExit("ROLE_SECRET_SOURCE_AMBIGUOUS")
+    if reference:
+        path = Path(reference)
+        try:
+            valid = (
+                path.is_absolute()
+                and path.resolve() == path
+                and path.is_file()
+                and stat.S_IMODE(path.stat().st_mode) == 0o600
+                and path.stat().st_size <= 16384
+            )
+            if not valid:
+                raise SystemExit("ROLE_SECRET_FILE_INVALID")
+            value = path.read_text().rstrip("\r\n")
+        except (OSError, UnicodeError):
+            raise SystemExit("ROLE_SECRET_FILE_INVALID") from None
     if not value.strip():
         raise SystemExit(f"{variable} is required (never hardcode credentials in this script)")
     return value

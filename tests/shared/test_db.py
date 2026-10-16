@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from pixav.config import Settings
 from pixav.shared.db import create_pool, init_connection
 
 
@@ -18,8 +19,7 @@ class TestInitConnection:
 class TestCreatePool:
     async def test_returns_pool(self) -> None:
         """create_pool should call asyncpg.create_pool with dsn and init hook."""
-        settings = MagicMock()
-        settings.dsn = "postgresql://pixav:pixav@localhost:5432/pixav"
+        settings = Settings()
 
         mock_pool = MagicMock()
 

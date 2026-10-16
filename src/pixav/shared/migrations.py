@@ -48,7 +48,9 @@ def select_pending(filenames: list[str], applied: set[str], until: str | None = 
     return [name for name in ordered if name not in applied]
 
 
-async def run_migrations(dsn: str, *, until: str | None = None, expected_identity: str | None = None) -> list[str]:
+async def run_migrations(
+    dsn: str, *, until: str | None = None, expected_identity: str | None = None, expected_database: str | None = None
+) -> list[str]:
     """Apply every pending migration up to ``until``; return what was applied."""
     if not MIGRATIONS_DIR.is_dir():
         # Globbing a missing directory yields nothing, so without this the
@@ -60,6 +62,8 @@ async def run_migrations(dsn: str, *, until: str | None = None, expected_identit
     try:
         if expected_identity is not None and await database_identity(conn) != expected_identity:
             raise ValueError("migration database identity mismatch")
+        if expected_database is not None and await conn.fetchval("SELECT current_database()") != expected_database:
+            raise ValueError("migration database name mismatch")
         # Session ownership spans the ledger read and every migration. Closing
         # the connection releases this lock even after cancellation or failure.
         await conn.execute("SELECT pg_advisory_lock(716492805321)")

@@ -381,7 +381,9 @@ async def run_loop(  # noqa: C901
                         storage_queue=storage_queue,
                         playback_queue=playback_queue,
                     )
-                stats = await orchestrator.tick(download_paused=disk_status.paused)
+                # Managed execution owns dispatch/retry/recovery. Legacy tasks
+                # and their queues remain held for explicit reconciliation.
+                stats = await orchestrator.tick(download_paused=disk_status.paused) if managed is None else {}
                 await _open_reverifications(managed, interval_days=settings.remote_reverify_interval_days)
                 if library is not None and time.monotonic() >= next_library_pass:
                     await _reconcile_library(library)

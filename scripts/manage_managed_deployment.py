@@ -200,6 +200,133 @@ def validate_core(  # noqa: C901 -- explicit deployment refusals
             raise ValueError("CORE_PRIVATE_SECRET_REQUIRED")
 
 
+def validate_application(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed managed roles
+    profile = args.profile
+    expected = {"migrate", "provision"} if profile == "schema" else {"maxwell_core"}
+    if set(config["services"]) != expected or not args.db_identity or not args.database:
+        raise ValueError("APPLICATION_BINDING_REQUIRED")
+    images = {service.get("image", "") for service in config["services"].values()}
+    if len(images) != 1 or not IMAGE.fullmatch(next(iter(images))):
+        raise ValueError("APPLICATION_IMMUTABLE_IMAGE_REQUIRED")
+    entrypoints = {
+        "migrate": "scripts.migrate",
+        "provision": "scripts.provision_workflow_roles",
+        "maxwell_core": "pixav.maxwell_core.worker",
+    }
+    secret_targets = {
+        "migrate": {"postgres_password": "/run/secrets/PIXAV_DB_PASSWORD"},
+        "provision": {
+            "postgres_password": "/run/secrets/PIXAV_DB_PASSWORD",
+            **{name: "/run/secrets/" + name for name in ["authority_password", "worker_password", "reader_password"]},
+        },
+        "maxwell_core": {
+            "authority_password": "/run/secrets/PIXAV_DB_PASSWORD",
+            "redis_client_url": "/run/secrets/PIXAV_REDIS_URL",
+            **{name: "/run/secrets/" + name for name in ["windows_ca", "windows_certificate", "windows_key"]},
+        },
+    }
+    for name, service in config["services"].items():
+        mounted = service.get("secrets", [])
+        if (
+            len(mounted) != len(secret_targets[name])
+            or {row["source"]: row["target"] for row in mounted} != secret_targets[name]
+        ):
+            raise ValueError("APPLICATION_ROLE_SECRETS_INVALID")
+        if (
+            service.get("entrypoint") != ["python", "-m", entrypoints[name]]
+            or service.get("profiles") != [profile]
+            or service.get("pull_policy") != "never"
+            or service.get("restart") != "no"
+            or not service.get("read_only")
+            or not service.get("init")
+            or service.get("cap_drop") != ["ALL"]
+            or service.get("cap_add")
+            or service.get("ports")
+            or service.get("privileged")
+            or service.get("devices")
+            or service.get("container_name")
+            or service.get("network_mode")
+            or service.get("security_opt") != ["no-new-privileges:true"]
+            or not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", service.get("user", ""))
+            or int(service.get("mem_limit", 0)) != 768 * 1024**2
+            or int(service.get("memswap_limit", 0)) != 768 * 1024**2
+            or float(service.get("cpus", 0)) != 1
+            or service.get("pids_limit") != 256
+        ):
+            raise ValueError("APPLICATION_ISOLATION_INVALID")
+        env = service.get("environment", {})
+        if (
+            env.get("PIXAV_DB_HOST") != "postgres"
+            or env.get("PIXAV_DB_PORT") != "5432"
+            or env.get("PIXAV_DB_NAME") != args.database
+            or env.get("PIXAV_EXPECTED_DB_NAME") != args.database
+            or env.get("PIXAV_EXPECTED_DB_IDENTITY") != args.db_identity
+            or env.get("PIXAV_SETTINGS_SECRETS_DIR") != "/run/secrets"
+            or any(key.endswith("_PASSWORD") or key == "PIXAV_REDIS_URL" for key in env)
+        ):
+            raise ValueError("APPLICATION_DATABASE_OR_SECRET_BINDING_INVALID")
+        networks = {"core"} if profile == "schema" else {"core", "runtime"}
+        if set(service.get("networks", {})) != networks or not config["networks"]["core"].get("internal"):
+            raise ValueError("APPLICATION_NETWORK_INVALID")
+        if profile == "schema":
+            command = ["--db-identity", args.db_identity]
+            if name == "migrate":
+                command += ["--database", args.database]
+            if service.get("command") != command or service.get("volumes"):
+                raise ValueError("SCHEMA_DEFAULT_COMMAND_INVALID")
+        else:
+            if (
+                not args.redis_run_id
+                or env.get("PIXAV_EXPECTED_REDIS_RUN_ID") != args.redis_run_id
+                or env.get("PIXAV_DB_USER") != "pixav_authority"
+                or env.get("PIXAV_MANAGED_MEDIA_WORKFLOW") != "true"
+                or env.get("PIXAV_PIXEL_INJECTOR_MODE") != "windows_android"
+                or env.get("PIXAV_LOCAL_CLEANUP_APPLY") != "false"
+                or env.get("PIXAV_UPLOAD_MAX_CONCURRENCY") != "1"
+                or env.get("PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID") != args.daemon_id
+                or not IMAGE.fullmatch(env.get("PIXAV_STORAGE_READBACK_IMAGE", ""))
+            ):
+                raise ValueError("AUTHORITY_EXECUTION_BINDING_INVALID")
+            mounts = service.get("volumes", [])
+            targets = {"/var/run/docker.sock"} | {
+                "/app/data/" + name for name in ["downloads", "remuxed", "library", "artwork", "playback-cache"]
+            }
+            if len(mounts) != 6 or {mount.get("target") for mount in mounts} != targets:
+                raise ValueError("AUTHORITY_MOUNTS_INVALID")
+            for mount in mounts:
+                target = mount.get("target")
+                source = Path(mount.get("source", ""))
+                if mount.get("bind", {}).get("create_host_path") is not False:
+                    raise ValueError("AUTHORITY_MOUNTS_INVALID")
+                if target == "/var/run/docker.sock":
+                    if (
+                        source != Path(target)
+                        or not mount.get("read_only")
+                        or service.get("group_add") != [str(source.stat().st_gid)]
+                    ):
+                        raise ValueError("AUTHORITY_DOCKER_SOCKET_INVALID")
+                elif (
+                    not target.startswith("/app/data/")
+                    or args.data_root is None
+                    or source != args.data_root / target.removeprefix("/app/data/")
+                    or source.resolve() != source
+                    or not source.is_dir()
+                    or source.stat().st_uid != int(service["user"].split(":")[0])
+                ):
+                    raise ValueError("AUTHORITY_MOUNTS_INVALID")
+    if args.secrets_root is None or stat.S_IMODE(args.secrets_root.stat().st_mode) != 0o700:
+        raise ValueError("APPLICATION_PRIVATE_SECRETS_REQUIRED")
+    for secret in config.get("secrets", {}).values():
+        path = Path(secret.get("file", ""))
+        if (
+            path.parent != args.secrets_root
+            or path.resolve() != path
+            or not path.is_file()
+            or stat.S_IMODE(path.stat().st_mode) != 0o600
+        ):
+            raise ValueError("APPLICATION_PRIVATE_SECRETS_REQUIRED")
+
+
 def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and identity checks before deployment
     if not PROJECT.fullmatch(args.project):
         raise ValueError("MANAGED_PROJECT_REQUIRED")
@@ -234,8 +361,10 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
         if args.data_root is None or args.secrets_root is None:
             raise ValueError("CORE_EXPLICIT_ROOTS_REQUIRED")
         validate_core(config, args.data_root, args.secrets_root)
-    else:
+    elif profile == "windows-tools":
         validate_tools(config)
+    else:
+        validate_application(config, args)
     for service in config["services"].values():
         run([*docker, "image", "inspect", service["image"], "--format", "{{.Id}}"])
     active = set()
@@ -264,9 +393,12 @@ def main() -> None:
     parser.add_argument("--context", required=True)
     parser.add_argument("--daemon-id", required=True)
     parser.add_argument("--env-file", type=Path, required=True)
-    parser.add_argument("--profile", choices=["windows-tools", "core"], default="windows-tools")
+    parser.add_argument("--profile", choices=["windows-tools", "core", "schema", "authority"], default="windows-tools")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--secrets-root", type=Path)
+    parser.add_argument("--db-identity")
+    parser.add_argument("--database")
+    parser.add_argument("--redis-run-id")
     parser.add_argument("--compose-file", type=Path, default=Path("docker-compose.managed.yml"))
     args = parser.parse_args()
     try:

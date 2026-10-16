@@ -1,7 +1,128 @@
 # Managed deployment entry. Start only the profiles accepted for the current phase.
 # Application profiles are added after their deployment contracts are verified.
 name: ${PIXAV_MANAGED_PROJECT:?set the dedicated managed project}
+x-app: &app
+  image: ${PIXAV_MANAGED_APP_IMAGE:-pixav-managed-unconfigured:refused}
+  pull_policy: never
+  restart: "no"
+  user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  cpus: 1.0
+  mem_limit: 768m
+  memswap_limit: 768m
+  pids_limit: 256
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+x-db-environment: &db-environment
+  PIXAV_DB_HOST: postgres
+  PIXAV_DB_PORT: "5432"
+  PIXAV_DB_NAME: ${PIXAV_MANAGED_DATABASE:-pixav_managed}
+  PIXAV_EXPECTED_DB_IDENTITY: ${PIXAV_EXPECTED_DB_IDENTITY:-UNBOUND}
+  PIXAV_EXPECTED_DB_NAME: ${PIXAV_MANAGED_DATABASE:-pixav_managed}
+  PIXAV_SETTINGS_SECRETS_DIR: /run/secrets
 services:
+  migrate:
+    <<: *app
+    profiles: [schema]
+    entrypoint: [python, -m, scripts.migrate]
+    command: [--db-identity, '${PIXAV_EXPECTED_DB_IDENTITY:-UNBOUND}', --database, '${PIXAV_MANAGED_DATABASE:-pixav_managed}']
+    environment:
+      <<: *db-environment
+      PIXAV_DB_USER: ${PIXAV_MANAGED_DB_ADMIN:-pixav_admin}
+    secrets:
+      - source: postgres_password
+        target: /run/secrets/PIXAV_DB_PASSWORD
+    networks: [core]
+  provision:
+    <<: *app
+    profiles: [schema]
+    entrypoint: [python, -m, scripts.provision_workflow_roles]
+    command: [--db-identity, '${PIXAV_EXPECTED_DB_IDENTITY:-UNBOUND}']
+    environment:
+      <<: *db-environment
+      PIXAV_DB_USER: ${PIXAV_MANAGED_DB_ADMIN:-pixav_admin}
+      PIXAV_AUTHORITY_ROLE_PASSWORD_FILE: /run/secrets/authority_password
+      PIXAV_WORKER_ROLE_PASSWORD_FILE: /run/secrets/worker_password
+      PIXAV_READER_ROLE_PASSWORD_FILE: /run/secrets/reader_password
+    secrets:
+      - source: postgres_password
+        target: /run/secrets/PIXAV_DB_PASSWORD
+      - authority_password
+      - worker_password
+      - reader_password
+    networks: [core]
+  maxwell_core:
+    <<: *app
+    profiles: [authority]
+    entrypoint: [python, -m, pixav.maxwell_core.worker]
+    command: []
+    environment:
+      <<: *db-environment
+      PIXAV_DB_USER: pixav_authority
+      PIXAV_EXPECTED_REDIS_RUN_ID: ${PIXAV_EXPECTED_REDIS_RUN_ID:-UNBOUND}
+      PIXAV_MANAGED_MEDIA_WORKFLOW: "true"
+      PIXAV_PIXEL_INJECTOR_MODE: windows_android
+      PIXAV_LOCAL_CLEANUP_APPLY: "false"
+      PIXAV_UPLOAD_MAX_CONCURRENCY: "1"
+      PIXAV_DOWNLOAD_DIR: /app/data/downloads
+      PIXAV_REMUX_DIR: /app/data/remuxed
+      PIXAV_LIBRARY_ROOT: /app/data/library
+      PIXAV_ARTWORK_ROOT: /app/data/artwork
+      PIXAV_PLAYBACK_CACHE_DIR: /app/data/playback-cache
+      PIXAV_STORAGE_WORKER_OWNER: ${PIXAV_STORAGE_WORKER_OWNER:?set the stable runtime owner}
+      PIXAV_STORAGE_WINDOWS_RUNTIME_ID: ${PIXAV_STORAGE_WINDOWS_RUNTIME_ID:?set the runtime ID}
+      PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION: ${PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION:?set the runtime generation}
+      PIXAV_WINDOWS_CONTROL_URL: https://host.docker.internal:5043
+      PIXAV_WINDOWS_CONTROL_CA: /run/secrets/windows_ca
+      PIXAV_WINDOWS_CONTROL_CERTIFICATE: /run/secrets/windows_certificate
+      PIXAV_WINDOWS_CONTROL_KEY: /run/secrets/windows_key
+      PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID: ${PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID:-UNBOUND}
+      PIXAV_STORAGE_READBACK_IMAGE: ${PIXAV_MANAGED_COLD_IMAGE:-UNBOUND}
+    secrets:
+      - source: authority_password
+        target: /run/secrets/PIXAV_DB_PASSWORD
+      - source: redis_client_url
+        target: /run/secrets/PIXAV_REDIS_URL
+      - windows_ca
+      - windows_certificate
+      - windows_key
+    group_add: ['${PIXAV_MANAGED_DOCKER_GID:-0}']
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/downloads
+        target: /app/data/downloads
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/remuxed
+        target: /app/data/remuxed
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/library
+        target: /app/data/library
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/artwork
+        target: /app/data/artwork
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/playback-cache
+        target: /app/data/playback-cache
+        bind: {create_host_path: false}
+    networks: [core, runtime]
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=3)']
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 30s
   windows_tools:
     profiles: [windows-tools]
     image: ${PIXAV_MANAGED_WINDOWS_TOOLS_IMAGE:?set the immutable tools image ID}
@@ -118,6 +239,7 @@ services:
 networks:
   core:
     internal: true
+  runtime: {}
 secrets:
   postgres_password:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/postgres_password
@@ -125,3 +247,17 @@ secrets:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_config
   redis_password:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_password
+  authority_password:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/authority_password
+  worker_password:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/worker_password
+  reader_password:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/reader_password
+  redis_client_url:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_client_url
+  windows_ca:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_ca
+  windows_certificate:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_certificate
+  windows_key:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_key
