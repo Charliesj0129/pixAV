@@ -146,13 +146,31 @@ test "$(/debug_ramdisk/magisk -V)" = 30700 || exit 75
     $pixavScope=(Invoke-PixavRoot '/data/adb/modules/zygisk_vector/cli --json scope ls io.github.samson910022.pixelifyphotos' 'SCOPE')|ConvertFrom-Json
     if (!$pixavScope.success -or @($pixavScope.data).Count -ne 1 -or $pixavScope.data[0].APP_PACKAGE -ne 'com.google.android.apps.photos' -or $pixavScope.data[0].USER_ID -ne 0) {throw 'NATIVE_PHOTOS_SCOPE_CHANGED'}
     foreach ($pixavPackage in @('io.github.samson910022.pixelifyphotos','com.google.android.apps.photos')) {
-        $pixavApk=Invoke-PixavRead ('shell pm path '+$pixavPackage)
-        if ($pixavApk -notmatch '^package:(/[A-Za-z0-9_./=+~-]+\.apk)$') {throw 'NATIVE_PACKAGE_PATH_UNCONFIRMED'}
-        $pixavHash=(Invoke-PixavRead ('shell sha256sum '+$matches[1])).Split(' ')[0]
+        $pixavInstalled=Invoke-PixavRead ('shell pm path '+$pixavPackage)
+        $pixavPaths=@()
+        foreach ($pixavLine in @($pixavInstalled -split '\r?\n')) {
+            if ($pixavLine -notmatch '^package:(/[A-Za-z0-9_./=+~-]+\.apk)$') {throw 'NATIVE_PACKAGE_PATH_UNCONFIRMED'}
+            $pixavPaths+= $matches[1]
+        }
+        $pixavSplitContract=$pixavPackage -eq 'com.google.android.apps.photos' -and $pixavEnvironment.schema -eq 'windows-pixel-environment-v2'
+        if ($pixavSplitContract) {
+            if ($pixavPaths.Count -ne @($pixavEnvironment.photos_apks).Count) {throw 'NATIVE_PHOTOS_APK_SET_CHANGED'}
+            foreach ($pixavPath in $pixavPaths) {
+                $pixavExpected=@($pixavEnvironment.photos_apks|Where-Object {$_.path -ceq $pixavPath})
+                if ($pixavExpected.Count -ne 1) {throw 'NATIVE_PHOTOS_APK_SET_CHANGED'}
+                $pixavHash=(Invoke-PixavRead ('shell sha256sum '+$pixavPath)).Split(' ')[0]
+                $pixavSize=Invoke-PixavRead ('shell stat -c %s '+$pixavPath)
+                if ($pixavHash -cne $pixavExpected[0].sha256 -or $pixavSize -cne ([string]$pixavExpected[0].size_bytes)) {throw 'NATIVE_PHOTOS_APK_SET_CHANGED'}
+            }
+        } else {
+            if ($pixavPaths.Count -ne 1) {throw 'NATIVE_PACKAGE_PATH_UNCONFIRMED'}
+            $pixavHash=(Invoke-PixavRead ('shell sha256sum '+$pixavPaths[0])).Split(' ')[0]
+        }
         $pixavVersion=(Invoke-PixavRoot ('dumpsys package '+$pixavPackage+' | grep -m1 versionName=') 'PACKAGE').Trim() -replace '^versionName=',''
         if ($pixavPackage -eq 'com.google.android.apps.photos') {
-            if ($pixavHash -ne $pixavEnvironment.photos_apk_sha256 -or $pixavVersion -ne $pixavEnvironment.photos_version) {throw 'NATIVE_PHOTOS_PACKAGE_CHANGED'}
+            if ((!$pixavSplitContract -and $pixavHash -cne $pixavEnvironment.photos_apk_sha256) -or $pixavVersion -cne $pixavEnvironment.photos_version) {throw 'NATIVE_PHOTOS_PACKAGE_CHANGED'}
         } elseif ($pixavHash -ne '6cac6601adbfb2e27ff4596c8d38735a7a7d0cbf228f646c5e73dbfc8b74203a' -or $pixavVersion -ne '1.4.1') {throw 'NATIVE_MODULE_PACKAGE_CHANGED'}
+        if ((Invoke-PixavRead ('shell pm path '+$pixavPackage)) -cne $pixavInstalled) {throw 'NATIVE_PACKAGE_PATH_CHANGED_DURING_OBSERVATION'}
     }
 }
 

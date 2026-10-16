@@ -10,8 +10,8 @@ from __future__ import annotations
 import hashlib
 import os
 from datetime import datetime
-from pathlib import Path, PureWindowsPath
-from typing import BinaryIO, Literal
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Annotated, BinaryIO, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -32,9 +32,8 @@ class EnvironmentFile(BaseModel):
         return value
 
 
-class WindowsEnvironment(BaseModel):
+class _WindowsEnvironment(BaseModel):
     model_config = {"frozen": True, "extra": "forbid", "populate_by_name": True}
-    schema_id: Literal["windows-pixel-environment-v1"] = Field(alias="schema")
     profile: Literal["gphotos_pixel_xl_infinity_v1"]
     boot_id: UUID
     observed_at: datetime
@@ -65,7 +64,7 @@ class WindowsEnvironment(BaseModel):
     hook_receipt_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
-    def verify_paths_and_evidence(self) -> WindowsEnvironment:
+    def verify_paths_and_evidence(self) -> _WindowsEnvironment:
         root = PureWindowsPath(self.avd_path)
         if not root.is_absolute() or root.drive.startswith("\\") or ".." in root.parts:
             raise ValueError("AVD directory must be an exact local absolute path")
@@ -86,10 +85,54 @@ class WindowsEnvironment(BaseModel):
         return self
 
 
+class WindowsEnvironment(_WindowsEnvironment):
+    """Original single-APK contract; its canonical payload remains unchanged."""
+
+    schema_id: Literal["windows-pixel-environment-v1"] = Field(alias="schema")
+
+
+class AndroidApk(BaseModel):
+    model_config = {"frozen": True, "extra": "forbid"}
+    path: str = Field(pattern=r"^/[A-Za-z0-9_./=+~-]+\.apk$")
+    size_bytes: int = Field(gt=0, strict=True)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("path")
+    @classmethod
+    def exact_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if ".." in path.parts or str(path) != value:
+            raise ValueError("exact installed APK path required")
+        return value
+
+
+class WindowsEnvironmentV2(_WindowsEnvironment):
+    """Pin the installed base and every split without accepting later updates."""
+
+    schema_id: Literal["windows-pixel-environment-v2"] = Field(alias="schema")
+    photos_apks: tuple[AndroidApk, ...] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def complete_photos_apks(self) -> WindowsEnvironmentV2:
+        paths = [PurePosixPath(apk.path) for apk in self.photos_apks]
+        bases = [apk for apk in self.photos_apks if PurePosixPath(apk.path).name == "base.apk"]
+        if (
+            len(set(paths)) != len(paths)
+            or len({path.parent for path in paths}) != 1
+            or len(bases) != 1
+            or bases[0].sha256 != self.photos_apk_sha256
+        ):
+            raise ValueError("complete unambiguous Photos APK set required")
+        return self
+
+
+WindowsEnvironmentContract = Annotated[WindowsEnvironment | WindowsEnvironmentV2, Field(discriminator="schema_id")]
+
+
 class EnvironmentFiles:
     """Keep verified software/config files open without Windows write/delete sharing."""
 
-    def __init__(self, environment: WindowsEnvironment, sdk_root: str) -> None:
+    def __init__(self, environment: WindowsEnvironmentContract, sdk_root: str) -> None:
         if os.name != "nt":
             raise RuntimeError("environment file seals require the Windows host")
         import winreg

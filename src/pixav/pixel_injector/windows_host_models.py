@@ -10,7 +10,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
-from pixav.pixel_injector.windows_environment import WindowsEnvironment
+from pixav.pixel_injector.windows_environment import WindowsEnvironmentContract
 
 
 def canonical_digest(value: dict) -> str:
@@ -43,7 +43,7 @@ class NativeIdentity(BaseModel):
     boot_id: UUID
     processes: NativeProcesses
     result: Literal["NATIVE_IDENTITY_OBSERVED"] = "NATIVE_IDENTITY_OBSERVED"
-    environment: WindowsEnvironment | None = None
+    environment: WindowsEnvironmentContract | None = None
 
     @model_validator(mode="after")
     def validate_serial(self) -> NativeIdentity:
