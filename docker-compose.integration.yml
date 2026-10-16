@@ -22,7 +22,7 @@ services:
       timeout: 2s
       retries: 30
   redis:
-    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    image: redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "127.0.0.1:16379:6379"

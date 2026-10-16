@@ -18,7 +18,7 @@ IMAGE = re.compile(r"^sha256:[a-f0-9]{64}$")
 PROJECT = re.compile(r"^pixav-managed-[a-z0-9][a-z0-9-]*$")
 CORE_IMAGES = {
     "postgres": "pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff",
-    "redis": "redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065",
+    "redis": "redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635",
 }
 CORE_COMMANDS = {
     "postgres": [

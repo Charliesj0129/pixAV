@@ -87,7 +87,7 @@ services:
       start_period: 60s
   redis:
     profiles: [core]
-    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    image: redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
     pull_policy: never
     restart: "no"
     user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}

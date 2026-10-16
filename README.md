@@ -266,9 +266,9 @@ native control 的拒絕回應只保留有長度限制的 `NATIVE_*` 錯誤碼�
 
 Vector 的唯讀模組清單會掃描已安裝 APK；本次兩核心 AVD 冷啟動實測一次需 17.453 秒，原十秒限制因此拒絕有效查詢。該查詢上限改為三十秒，其餘單項仍十秒，整次 native control 仍受四十五秒 deadline 約束；逾時仍拒絕新 writer 並保留原 fence。
 
-`core` 使用固定 PostgreSQL 16／pgvector 與 Redis 7 映像，兩者都以指定非 root UID／GID 執行、drop ALL、唯讀 root、無 published port，只加入 internal network。PostgreSQL 限二 CPU／3 GiB／256 PIDs，Redis 限半 CPU／256 MiB／64 PIDs，swap 與 RAM 同限；兩者均不自動重啟。PostgreSQL health 每五秒、timeout 三秒、grace 六十秒，Redis grace 三十秒；目前只有 health，metrics exporter 尚未接入。
+`core` 使用固定 PostgreSQL 16／pgvector 與 Redis 8.2 映像，兩者都以指定非 root UID／GID 執行、drop ALL、唯讀 root、無 published port，只加入 internal network。PostgreSQL 限二 CPU／3 GiB／256 PIDs，Redis 限半 CPU／256 MiB／64 PIDs，swap 與 RAM 同限；兩者均不自動重啟。PostgreSQL health 每五秒、timeout 三秒、grace 六十秒，Redis grace 三十秒；目前只有 health，metrics exporter 尚未接入。
 
-當次隔離 core 實測版本為 PostgreSQL 16.13／pgvector 0.8.2 與 Redis 7.4.8。[PostgreSQL](https://www.postgresql.org/about/licence/) 與 [pgvector](https://github.com/pgvector/pgvector/blob/v0.8.2/LICENSE) 採 PostgreSQL License；[Redis 7.4](https://redis.io/legal/licenses/) 採 RSALv2／SSPLv1，不能將這個版本記為 OSS 部署選型完成。
+當次隔離 core 實測版本為 PostgreSQL 16.13／pgvector 0.8.2 與 Redis 8.2.10。[PostgreSQL](https://www.postgresql.org/about/licence/) 與 [pgvector](https://github.com/pgvector/pgvector/blob/v0.8.2/LICENSE) 採 PostgreSQL License；[Redis 8.2.10](https://github.com/redis/redis/blob/8.2.10/LICENSE.txt) 的三選一授權在此選用 AGPLv3，CI 亦使用同一 immutable image。
 
 core 資料置於 explicit `PIXAV_MANAGED_DATA_ROOT` 的 `postgres`／`redis` 目錄，禁止自動建立 bind source；目錄 owner 須與服務 UID 相符。PostgreSQL 使用掛載內的 `pgdata` 子目錄，掛載根可保留核對用內容。`PIXAV_MANAGED_SECRETS_ROOT` 下的 `postgres_password`、`redis_password`、`redis_config` 都為 0600、父目錄 0700；Redis config 設定認證，秘密只掛入各自服務，不放 env、image 或 command。core preflight 驗設定及檔案權限，仍須另核對 actual daemon、實體容量、host／container bind 與啟動後 DB identifier／Redis run ID；設定 eligible 不表示 runtime 已驗收。
 
@@ -280,6 +280,8 @@ docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVA
 ```
 
 當次隔離 core 已實測拒絕未授權 PostgreSQL TCP／Redis client，逐一停止及重啟 exact containers 後，PostgreSQL identifier 不變、Redis run ID 改變，兩者的合成 probe 資料仍保留，host／container bind 的 device／inode 與內容再次相符。原 DB／queue 未載入，未啟動 executor，也未建立新備份。這不抵整機故障、獨立 restore、application ownership、VPN 或 private playback 驗收。
+
+Redis 8.2 切換的隔離實測僅移轉一筆合成 probe，保留原 expiration；原 7.4.8 資料目錄及映像保留，已實際以保留資料啟動舊版核對，再停止 exact 回退容器並恢復新版。新版重啟後 probe 仍在、run ID 改變，未授權 client 被拒絕；未載入原 production queue，不宣告舊正式 Redis 資料升級完成。
 
 core rollback 停止 exact service containers，保留其 bind、secret 與 instance 收據；不使用 `down -v` 或 prune，不載入舊 queue。這份 profile 不含 migration／角色 provision 或 executor，不能據此宣告完整應用部署。備份依本輪操作者停止新增備份的授權辦理，既有保全資料保留。
 
