@@ -299,7 +299,7 @@ core rollback 停止 exact service containers，保留其 bind、secret 與 inst
 
 `PIXAV_MANAGED_PHOTOS_AUTH_SECRET` 指向 exact 0600 cookie-only file，其父目錄須 0700；只將該檔掛入 worker 的 `/run/photos-auth/cookies.json`，父目錄使用屬於 worker 的 0700 tmpfs。cookie 經 stdin 交給全新 cold child，不掛 DB／TLS／cookie 目錄到 child。實際合成容器已核對 nested file mount 的 0600／0700、非 root ownership 與可讀性；這不證明登入或帳號綁定完成。worker health／metrics 分別為 8005／8007，無 host port；父程序沿用一 CPU／768 MiB，cold child 的資源、timeout 與版本沿用上述獨立 storage-tools 契約。
 
-worker 每輪在 queue recovery／claim 前檢查 system pause 與同一個持久磁碟 latch，容量查詢後再檢查一次 system pause。暫停期間不搬動 in-flight queue、不 claim 活動；首次放行才恢復 FIFO，低磁碟或容量未知不自動解除 latch。global pause 的輪詢為五秒，正常活動輪詢一秒，容量 RPC 上限五秒。已啟動的活動仍受既有 lease／deadline 與 reconciliation 約束，停止新增 claim 不表示取消或重傳未知上傳。工作區契約及 Compose／preflight 已有隔離證據，當次 GPU generation／登入未重新驗收前不啟動 worker，live、故障恢復及 rollback 保持 OPEN。
+worker 每輪在 queue recovery／claim 前檢查 system pause 與同一個持久磁碟 latch，容量查詢後再檢查一次 system pause。暫停期間不搬動 in-flight queue、不 claim 活動；首次放行才恢復 FIFO，低磁碟或容量未知不自動解除 latch。global pause 的輪詢為五秒，正常活動輪詢一秒，容量 RPC 上限五秒。已啟動的活動仍受既有 lease／deadline 與 reconciliation 約束，停止新增 claim 不表示取消或重傳未知上傳。同一 immutable image 已在專用合成 PostgreSQL／Redis 上逐一啟動兩個 worker，health／metrics 通過，pause 與 FIFO／in-flight queue bytes 維持原值；沒有登錄 runtime、連接原帳號或執行 provider 請求。工作區契約及 Compose／preflight 已有隔離證據，當次 GPU generation／登入未重新驗收前不在原部署啟動 worker，live、故障恢復及 rollback 保持 OPEN。
 
 實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。當前 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用；完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
 
