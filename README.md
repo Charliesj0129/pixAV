@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,181 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,190 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -300,6 +300,8 @@ core rollback 停止 exact service containers，保留其 bind、secret 與 inst
 `PIXAV_MANAGED_PHOTOS_AUTH_SECRET` 指向 exact 0600 cookie-only file，其父目錄須 0700；只將該檔掛入 worker 的 `/run/photos-auth/cookies.json`，父目錄使用屬於 worker 的 0700 tmpfs。cookie 經 stdin 交給全新 cold child，不掛 DB／TLS／cookie 目錄到 child。實際合成容器已核對 nested file mount 的 0600／0700、非 root ownership 與可讀性；這不證明登入或帳號綁定完成。worker health／metrics 分別為 8005／8007，無 host port；父程序沿用一 CPU／768 MiB，cold child 的資源、timeout 與版本沿用上述獨立 storage-tools 契約。
 
 worker 每輪在 queue recovery／claim 前檢查 system pause 與同一個持久磁碟 latch，容量查詢後再檢查一次 system pause。暫停期間不搬動 in-flight queue、不 claim 活動；首次放行才恢復 FIFO，低磁碟或容量未知不自動解除 latch。global pause 的輪詢為五秒，正常活動輪詢一秒，容量 RPC 上限五秒。已啟動的活動仍受既有 lease／deadline 與 reconciliation 約束，停止新增 claim 不表示取消或重傳未知上傳。同一 immutable image 已在專用合成 PostgreSQL／Redis 上逐一啟動兩個 worker，health／metrics 通過，pause 與 FIFO／in-flight queue bytes 維持原值；沒有登錄 runtime、連接原帳號或執行 provider 請求。工作區契約及 Compose／preflight 已有隔離證據，當次 GPU generation／登入未重新驗收前不在原部署啟動 worker，live、故障恢復及 rollback 保持 OPEN。
+
+工作區的 managed media-loader 也將 queue recovery 延至 system pause／disk latch 放行後，容量查詢期間新設的 pause 仍會攔住 recovery／claim；恢復期間新設的 pause 會在後續 claim 前再次攔住兩個 consumer。兩個 consumer 共用一次恢復程序，避免重搬另一個 consumer 正在處理的 receipt；低磁碟時下載與 preparation 都停止新增工作。四個回歸情境在修正前失敗、修正後通過；專用 Redis 另核對暫停期間 pending／in-flight 的完整 bytes 不變、放行後 FIFO 恢復一次、兩個 consumer 各取得不同工作，取消後保留 in-flight 待 reconciliation。這組測試使用合成活動，沒有 torrent／provider 請求，不抵 media-loader 的實際部署與完整故障恢復（BDD-024、034、141）。
 
 實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。當前 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用；完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
 

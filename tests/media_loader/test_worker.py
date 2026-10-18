@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from pixav.config import Settings
-from pixav.media_loader.worker import _parse_int, _parse_uuid, _record_task_outcome, run_loop
+from pixav.media_loader.worker import _parse_int, _parse_uuid, _record_task_outcome, _run_managed_media, run_loop
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import DownloadError
 from pixav.shared.models import Task
@@ -61,6 +61,49 @@ def _wire_common_patches(
 
 
 class TestMediaLoaderWorker:
+    async def test_pause_arriving_during_recovery_stops_both_consumers_before_claim(self):
+        redis = AsyncMock()
+        redis.get.return_value = None
+        queue = AsyncMock()
+        activity = AsyncMock()
+        disk = AsyncMock()
+        disk.check_and_latch.return_value = SimpleNamespace(paused=False)
+
+        async def recover_then_pause():
+            redis.get.side_effect = [True, _StopWorker()]
+
+        queue.requeue_inflight.side_effect = recover_then_pause
+        with pytest.raises(_StopWorker):
+            await _run_managed_media(activity, queue, redis, _settings(), disk)
+        activity.run_one.assert_not_awaited()
+
+    @pytest.mark.parametrize("pause_source", ["system", "disk", "during-capacity"])
+    async def test_managed_pause_preserves_queue_before_recovery_or_claim(self, pause_source):
+        pool = AsyncMock()
+        redis = AsyncMock()
+        redis.get.side_effect = [True, _StopWorker()] if pause_source == "system" else [None, _StopWorker()]
+        queue = AsyncMock()
+        qbit = AsyncMock()
+        qbit.health_check.return_value = "synthetic-version"
+        activity = AsyncMock()
+        disk = AsyncMock()
+        disk.check_and_latch.return_value = SimpleNamespace(paused=pause_source == "disk")
+        if pause_source == "during-capacity":
+            redis.get.side_effect = [None, True, _StopWorker()]
+        with (
+            _wire_common_patches(
+                pool=pool, redis=redis, download_queue=queue, qbit_client=qbit, service=AsyncMock(), disk_guard=disk
+            ),
+            patch("pixav.media_loader.activity.MediaActivityWorker", return_value=activity),
+            patch("pixav.shared.workflow.require_workflow_role", new=AsyncMock()),
+        ):
+            with pytest.raises(_StopWorker):
+                await run_loop(_settings(managed_media_workflow=True))
+        queue.requeue_inflight.assert_not_awaited()
+        activity.run_one.assert_not_awaited()
+        if pause_source == "system":
+            disk.check_and_latch.assert_not_awaited()
+
     async def test_run_loop_claims_and_acks_payload(self) -> None:
         video_id = uuid.uuid4()
         task_id = uuid.uuid4()
@@ -210,7 +253,7 @@ class TestMediaLoaderWorker:
         activity = AsyncMock()
         # The managed loop swallows per-activity errors on purpose, so the stop
         # has to come from outside it.
-        redis.get.side_effect = [None, None, _StopWorker()]
+        redis.get.side_effect = [None, None, None, None, None, None, _StopWorker()]
 
         with (
             _wire_common_patches(

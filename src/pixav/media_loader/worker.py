@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import logging
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pixav.config import Settings, get_settings
 from pixav.media_loader.metadata import StashMetadataScraper
@@ -15,7 +15,7 @@ from pixav.media_loader.remuxer import FFmpegRemuxer
 from pixav.media_loader.service import MediaLoaderService
 from pixav.shared.db import create_pool
 from pixav.shared.dead_letter import DeadLetterStore
-from pixav.shared.disk import build_download_space_guard
+from pixav.shared.disk import DownloadSpaceGuard, build_download_space_guard
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import DownloadError
 from pixav.shared.metrics import record_task_failed, record_task_processed, record_task_retried
@@ -26,6 +26,9 @@ from pixav.shared.redis_client import create_redis
 from pixav.shared.repository import SourceCandidateRepository, TaskRepository, VideoRepository
 from pixav.shared.retry import parse_retry_backoff
 from pixav.shared.vpn import REFERENCE_SIDE, PublicIpProbe, VpnEgressMonitor
+
+if TYPE_CHECKING:
+    from pixav.media_loader.activity import MediaActivityWorker
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,50 @@ def _record_task_outcome(state: TaskState) -> None:
         record_task_failed(_METRICS_MODULE)
     else:
         record_task_retried(_METRICS_MODULE)
+
+
+async def _run_managed_media(
+    worker: MediaActivityWorker,
+    queue: TaskQueue,
+    redis: Any,
+    settings: Settings,
+    disk_guard: DownloadSpaceGuard,
+) -> None:
+    recovered = False
+    recovery_lock = asyncio.Lock()
+
+    async def consume_media() -> None:
+        nonlocal recovered
+        while True:
+            if is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            disk_status = await disk_guard.check_and_latch()
+            if disk_status.paused or is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            async with recovery_lock:
+                if not recovered:
+                    await queue.requeue_inflight()
+                    recovered = True
+            if is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            try:
+                await worker.run_one(queue, download_paused=False)
+            except Exception:
+                logger.warning("managed activity dependency unavailable; authority retains recovery ownership")
+            await asyncio.sleep(1)
+
+    # One prepare and one bounded download check may run concurrently. Recovery
+    # runs once before either consumer claims, so neither recovers its sibling.
+    consumers = [asyncio.create_task(consume_media()) for _ in range(2)]
+    try:
+        await asyncio.gather(*consumers)
+    finally:
+        for consumer in consumers:
+            consumer.cancel()
+        await asyncio.gather(*consumers, return_exceptions=True)
 
 
 async def run_loop(  # noqa: C901
@@ -185,29 +232,7 @@ async def run_loop(  # noqa: C901
                 segment_target_bytes=settings.media_segment_target_bytes,
             )
             activity_queue = TaskQueue(redis=redis, queue_name=MANAGED_QUEUE)
-            await activity_queue.requeue_inflight()
-
-            async def consume_media() -> None:
-                while True:
-                    if is_paused_value(await redis.get(settings.system_pause_key)):
-                        await asyncio.sleep(5)
-                        continue
-                    disk_status = await disk_guard.check_and_latch()
-                    try:
-                        await activity_worker.run_one(activity_queue, download_paused=disk_status.paused)
-                    except Exception:
-                        logger.warning("managed activity dependency unavailable; authority retains recovery ownership")
-                    await asyncio.sleep(1)
-
-            # Maxwell still permits exactly one activity per stage. Two consumers
-            # let its bounded download check run while its one prepare uses CPU.
-            consumers = [asyncio.create_task(consume_media()) for _ in range(2)]
-            try:
-                await asyncio.gather(*consumers)
-            finally:
-                for consumer in consumers:
-                    consumer.cancel()
-                await asyncio.gather(*consumers, return_exceptions=True)
+            await _run_managed_media(activity_worker, activity_queue, redis, settings, disk_guard)
 
         logger.info("media-loader worker started, listening on %s", download_queue.name)
         try:
