@@ -309,6 +309,8 @@ Windows 磁碟守衛以本地 download filesystem 與 enrolled AVD 所在的實�
 
 帳號數量以 `dumpsys account` 的 `Accounts:` 區段與實際 Account rows 核對，不能將 `AuthenticatorDescription {type=com.google}` 當已登入帳號；本次實際為 `Accounts: 0`，先前寬鬆計數的一筆是 authenticator，不能作登入證據。Windows caller 只有明確的空帳號區段才允許初次登入；已有其他帳號或輸出不明時要求人工核對，不以提交帳密修補。已重用本機 [scrcpy 4.1（Apache-2.0）](https://github.com/Genymobile/scrcpy/blob/v4.1/LICENSE) 提供 exact serial 的人工登入視窗，固定 SDK ADB、停用音訊及 clipboard autosync，未記錄帳密。人工控制期間保持 system pause，native managed control 停止；關閉及核對 exact controller／Android child，再重驗 quiescence 與 enrollment 才能交回 managed UI writer。
 
+操作者回報卡頓與 System UI 無回應後，已停止 exact scrcpy、同步 guest filesystem，再以原 process identity 停止 emulator／QEMU，保留同一 AVD 與 userdata。僅調整此 AVD 的 CPU／GPU 設定為 4 個 vCPU、4096 MiB 與 `-gpu host`；當次日誌確認 NVIDIA RTX 4060 硬體 renderer、WHPX 正常，新 boot 的 root UID 0 已恢復，沒有重啟 ADB 或全 WSL。原有 720×1280／280 dpi override 保留。人工視窗已重開，操作體感、登入與新 generation 的完整環境／enrollment 仍待核對；先前 generation 的環境證據不能套用於此次 GPU／CPU 設定。
+
 ```bash
 # schema／authority 的 preflight 另外提供 --db-identity、--database；authority 再提供 --redis-run-id。
 docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile schema run --rm --no-deps migrate
