@@ -421,3 +421,117 @@ def test_activity_profiles_refuse_privilege_and_isolation_drift(activity_config,
         service["group_add"] = ["0"]
     with pytest.raises(ValueError):
         module.validate_application(config, args)
+
+
+@pytest.fixture
+def vpn_config(tmp_path):
+    import json
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    tmp_path.chmod(0o700)
+    wireguard = tmp_path / "wg0.conf"
+    auth = tmp_path / "vpn_control_auth"
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 127.0.0.1\n")
+    resolv.chmod(0o600)
+    for path in [wireguard, auth]:
+        path.write_text("synthetic-secret-reference-only")
+        path.chmod(0o600)
+    auth.write_text(
+        '[[roles]]\nname = "pixav-runtime"\nroutes = ["GET /v1/vpn/status", "PUT /v1/vpn/status"]\n'
+        'auth = "apikey"\napikey = "' + "a" * 32 + '"\n'
+    )
+    manifest = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker-compose.managed.yml").read_text())
+    manifest["services"] = {"gluetun": manifest["services"]["gluetun"]}
+    manifest["secrets"] = {key: manifest["secrets"][key] for key in ["vpn_wireguard", "vpn_control_auth"]}
+    replacements = {
+        "PIXAV_MANAGED_WIREGUARD_CONFIG": str(wireguard),
+        "PIXAV_MANAGED_SECRETS_ROOT": str(tmp_path),
+        "PIXAV_MANAGED_VPN_RESOLV_CONF": str(resolv),
+    }
+    manifest = json.loads(
+        re.sub(
+            r"\$\{([^}:]+)(?::([-?])([^}]*))?\}",
+            lambda m: replacements.get(m[1], m[3] if m[2] == "-" else "synthetic-binding"),
+            json.dumps(manifest),
+        )
+    )
+    service = manifest["services"]["gluetun"]
+    service["networks"] = {"runtime": None}
+    service["devices"] = [{"source": "/dev/net/tun", "target": "/dev/net/tun", "permissions": "rw"}]
+    service["mem_limit"] = service["memswap_limit"] = "536870912"
+    service["secrets"] = [
+        row if isinstance(row, dict) else {"source": row, "target": "/run/secrets/" + row} for row in service["secrets"]
+    ]
+    return manifest, wireguard, tmp_path, resolv
+
+
+def test_vpn_profile_selects_only_gluetun_and_private_file_references(vpn_config):
+    module.validate_vpn(*vpn_config)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "firewall-off",
+        "lan-bypass",
+        "inline-key",
+        "control-port",
+        "host-network",
+        "privileged",
+        "docker-socket",
+        "core-network",
+        "secret-mode",
+        "wrong-config",
+        "mutable-image",
+        "unauthenticated-control",
+        "credential-route",
+        "dns-bypass",
+        "dns-rewrite",
+        "writable-resolver",
+    ],
+)
+def test_vpn_profile_refuses_kill_switch_and_secret_bypasses(  # noqa: C901 -- explicit security cases
+    vpn_config, defect
+):
+    config, wireguard, secrets, resolv = vpn_config
+    service = config["services"]["gluetun"]
+    if defect == "firewall-off":
+        service["environment"]["FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT"] = "off"
+    elif defect == "lan-bypass":
+        service["environment"]["FIREWALL_OUTBOUND_SUBNETS"] = "192.168.0.0/16"
+    elif defect == "inline-key":
+        service["environment"]["WIREGUARD_PRIVATE_KEY"] = "synthetic-value"
+    elif defect == "control-port":
+        service["ports"] = [{"target": 8000, "published": "8000"}]
+    elif defect == "host-network":
+        service["network_mode"] = "host"
+    elif defect == "privileged":
+        service["privileged"] = True
+    elif defect == "docker-socket":
+        service["volumes"] = [{"source": "/var/run/docker.sock", "target": "/var/run/docker.sock"}]
+    elif defect == "core-network":
+        service["networks"]["core"] = None
+    elif defect == "secret-mode":
+        wireguard.chmod(0o644)
+    elif defect == "wrong-config":
+        config["secrets"]["vpn_wireguard"]["file"] = str(secrets / "other.conf")
+    elif defect == "mutable-image":
+        service["image"] = "qmcgaw/gluetun:v3"
+    elif defect == "unauthenticated-control":
+        auth = secrets / "vpn_control_auth"
+        auth.write_text(auth.read_text().replace('auth = "apikey"', 'auth = "none"'))
+    elif defect == "credential-route":
+        auth = secrets / "vpn_control_auth"
+        auth.write_text(auth.read_text().replace('"GET /v1/vpn/status"', '"GET /v1/vpn/settings"'))
+    elif defect == "dns-bypass":
+        resolv.write_text("nameserver 8.8.8.8\n")
+    elif defect == "dns-rewrite":
+        service["environment"]["DNS_KEEP_NAMESERVER"] = "off"
+    elif defect == "writable-resolver":
+        service["volumes"][0]["read_only"] = False
+    with pytest.raises(ValueError):
+        module.validate_vpn(config, wireguard, secrets, resolv)

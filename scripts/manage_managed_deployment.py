@@ -45,12 +45,126 @@ CORE_COMMANDS = {
         "yes",
     ],
 }
+VPN_IMAGE = "qmcgaw/gluetun:v3.41.3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027"
+VPN_CONTROL_CONFIG = re.compile(
+    r'\A\[\[roles\]\]\nname = "pixav-runtime"\n'
+    r'routes = \["GET /v1/vpn/status", "PUT /v1/vpn/status"\]\n'
+    r'auth = "apikey"\napikey = "[1-9A-HJ-NP-Za-km-z]{32,128}"\n\Z'
+)
 
 
 def run(command: list[str]) -> str:
     return subprocess.run(  # noqa: S603 -- fixed Docker CLI, no shell
         command, capture_output=True, text=True, check=True, timeout=30
     ).stdout
+
+
+def validate_vpn(  # noqa: C901 -- fixed VPN boundary
+    config: dict, wireguard: Path, secrets_root: Path, resolv_conf: Path
+) -> None:
+    if set(config["services"]) != {"gluetun"}:
+        raise ValueError("VPN_PROFILE_ISOLATION_INVALID")
+    service = config["services"]["gluetun"]
+    if (
+        service.get("image") != VPN_IMAGE
+        or service.get("profiles") != ["vpn"]
+        or service.get("pull_policy") != "never"
+        or service.get("restart") != "no"
+        or service.get("user") != "0:0"
+        or not service.get("read_only")
+        or not service.get("init")
+        or service.get("cap_drop") != ["ALL"]
+        or service.get("cap_add") != ["NET_ADMIN", "DAC_OVERRIDE"]
+        or service.get("security_opt") != ["no-new-privileges:true"]
+        or service.get("privileged")
+        or service.get("ports")
+        or service.get("container_name")
+        or service.get("network_mode")
+        or service.get("entrypoint") is not None
+        or service.get("command") is not None
+        or set(service.get("networks", {})) != {"runtime"}
+        or config.get("networks", {}).get("runtime", {}).get("internal")
+        or service.get("devices") != [{"source": "/dev/net/tun", "target": "/dev/net/tun", "permissions": "rw"}]
+    ):
+        raise ValueError("VPN_SERVICE_ISOLATION_INVALID")
+    expected_environment = {
+        "VPN_SERVICE_PROVIDER": "custom",
+        "VPN_TYPE": "wireguard",
+        "WIREGUARD_CONF_SECRETFILE": "/run/secrets/wg0.conf",
+        "FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT": "on",
+        "FIREWALL_OUTBOUND_SUBNETS": "",
+        "FIREWALL_INPUT_PORTS": "",
+        "FIREWALL_VPN_INPUT_PORTS": "",
+        "HEALTH_SMALL_CHECK_TYPE": "dns",
+        "HEALTH_TARGET_ADDRESSES": "1.1.1.1:443,1.0.0.1:443",
+        "HEALTH_SERVER_ADDRESS": "127.0.0.1:9999",
+        "HEALTH_RESTART_VPN": "on",
+        "DNS_KEEP_NAMESERVER": "on",
+        "HTTP_CONTROL_SERVER_ADDRESS": "127.0.0.1:8000",
+        "HTTP_CONTROL_SERVER_AUTH_CONFIG_FILEPATH": "/run/secrets/vpn_control_auth",
+        "HTTP_CONTROL_SERVER_LOG": "off",
+        "HTTPPROXY": "off",
+        "SHADOWSOCKS": "off",
+        "PUID": "0",
+        "PGID": "0",
+    }
+    if service.get("environment") != expected_environment:
+        raise ValueError("VPN_FIREWALL_OR_SECRET_BINDING_INVALID")
+    if (
+        float(service.get("cpus", 0)) != 0.5
+        or int(service.get("mem_limit", 0)) != 512 * 1024**2
+        or int(service.get("memswap_limit", 0)) != 512 * 1024**2
+        or service.get("pids_limit") != 128
+        or service.get("healthcheck", {}).get("test") != ["CMD", "/gluetun-entrypoint", "healthcheck"]
+        or service.get("tmpfs")
+        != [
+            "/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777",  # noqa: S108 -- bounded container tmpfs contract
+            "/gluetun:rw,nosuid,nodev,noexec,size=64m,mode=0700",
+        ]
+    ):
+        raise ValueError("VPN_RESOURCE_OR_HEALTH_INVALID")
+    mounts = service.get("volumes", [])
+    if (
+        len(mounts) != 1
+        or mounts[0].get("type") != "bind"
+        or mounts[0].get("source") != str(resolv_conf)
+        or mounts[0].get("target") != "/etc/resolv.conf"
+        or mounts[0].get("read_only") is not True
+        or mounts[0].get("bind", {}).get("create_host_path") is not False
+        or not resolv_conf.is_absolute()
+        or resolv_conf.resolve() != resolv_conf
+        or not resolv_conf.is_file()
+        or stat.S_IMODE(resolv_conf.stat().st_mode) != 0o600
+        or stat.S_IMODE(resolv_conf.parent.stat().st_mode) != 0o700
+    ):
+        raise ValueError("VPN_RESOLVER_BINDING_INVALID")
+    nameservers = [
+        line.split() for line in resolv_conf.read_text().splitlines() if line.strip().startswith("nameserver")
+    ]
+    if nameservers != [["nameserver", "127.0.0.1"]]:
+        raise ValueError("VPN_RESOLVER_BYPASS_REFUSED")
+    mounted = service.get("secrets", [])
+    if len(mounted) != 2 or {row["source"]: row["target"] for row in mounted} != {
+        "vpn_wireguard": "/run/secrets/wg0.conf",
+        "vpn_control_auth": "/run/secrets/vpn_control_auth",
+    }:
+        raise ValueError("VPN_PRIVATE_SECRET_REQUIRED")
+    expected_files = {"vpn_wireguard": wireguard, "vpn_control_auth": secrets_root / "vpn_control_auth"}
+    if set(config.get("secrets", {})) != set(expected_files):
+        raise ValueError("VPN_PRIVATE_SECRET_REQUIRED")
+    for name, path in expected_files.items():
+        if (
+            config["secrets"][name].get("file") != str(path)
+            or not path.is_absolute()
+            or path.resolve() != path
+            or not path.is_file()
+            or stat.S_IMODE(path.stat().st_mode) != 0o600
+            or stat.S_IMODE(path.parent.stat().st_mode) != 0o700
+            or path.stat().st_size > 65536
+        ):
+            raise ValueError("VPN_PRIVATE_SECRET_REQUIRED")
+    if not VPN_CONTROL_CONFIG.fullmatch(expected_files["vpn_control_auth"].read_text()):
+        raise ValueError("VPN_CONTROL_AUTH_REQUIRED")
 
 
 def validate_tools(config: dict) -> None:
@@ -465,6 +579,10 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
         validate_core(config, args.data_root, args.secrets_root)
     elif profile == "windows-tools":
         validate_tools(config)
+    elif profile == "vpn":
+        if args.wireguard_config is None or args.secrets_root is None or args.vpn_resolv_conf is None:
+            raise ValueError("VPN_EXPLICIT_SECRET_REFERENCES_REQUIRED")
+        validate_vpn(config, args.wireguard_config, args.secrets_root, args.vpn_resolv_conf)
     else:
         validate_application(config, args)
     for service in config["services"].values():
@@ -497,7 +615,7 @@ def main() -> None:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=["windows-tools", "core", "schema", "authority", "storage", "playback"],
+        choices=["windows-tools", "core", "schema", "authority", "storage", "playback", "vpn"],
         default="windows-tools",
     )
     parser.add_argument("--data-root", type=Path)
@@ -505,6 +623,8 @@ def main() -> None:
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--staging-root", type=Path)
     parser.add_argument("--photos-auth-secret", type=Path)
+    parser.add_argument("--wireguard-config", type=Path)
+    parser.add_argument("--vpn-resolv-conf", type=Path)
     parser.add_argument("--db-identity")
     parser.add_argument("--database")
     parser.add_argument("--redis-run-id")

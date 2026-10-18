@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,107 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,124 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -336,6 +336,20 @@ uv run python -m scripts.manage_managed_deployment --context default --project M
 ```
 
 worker rollback 先保持 system pause，停止並核對 exact worker 及其 cold child；由 authority reconciliation 原 activity／UI fence 後，才部署理解同一契約的相容 immutable image。保留 read-back／cache／staging／secret 與 operation，不透過清 queue 觸發重新上傳；資料保全沿用本輪停止新增備份的操作者授權。
+
+`vpn` profile 只啟動 [Gluetun v3.41.3](https://github.com/passteque/gluetun/releases/tag/v3.41.3)，固定 digest，採 [MIT](https://github.com/passteque/gluetun/blob/v3.41.3/LICENSE)；不加入 DB／Redis core network，不掛 Docker socket、AVD 或應用認證，不發布 host port。它限半 CPU／512 MiB／128 PIDs、不自動重啟，唯讀 root 並僅提供有容量限制的 `/tmp`／`/gluetun` tmpfs。以 root 設定其自身 network namespace，drop ALL 後只保留 `NET_ADMIN` 與讀取 host-owned 0600 secret 所需的 `DAC_OVERRIDE`；使用標準 `/dev/net/tun`，不修改 WSL kernel。
+
+沿用 [Gluetun firewall](https://github.com/qdm12/gluetun-wiki/blob/main/faq/firewall.md) 執行阻流，固定啟用且不允許 LAN／outbound subnet bypass。`PIXAV_MANAGED_WIREGUARD_CONFIG` 是 exact 0600 WireGuard file，父目錄 0700，掛至 `/run/secrets/wg0.conf`；secret 不放 env 或 command。control 認證檔 `PIXAV_MANAGED_SECRETS_ROOT/vpn_control_auth` 同樣 0600，只允許 `pixav-runtime` API-key role 的 `GET /v1/vpn/status`、`PUT /v1/vpn/status`，key 須為 32–128 個 base58 字元。控制端只綁 namespace 內的 `127.0.0.1:8000`，拒絕未授權控制與 settings route；[官方 control API](https://github.com/qdm12/gluetun-wiki/blob/main/setup/advanced/control-server.md) 不代表 HTTP 200 就已完成停止，仍須核對 outcome、實際狀態與 child。
+
+`PIXAV_MANAGED_VPN_RESOLV_CONF` 指向本輪可重建的 0600 resolver file，父目錄 0700，唯一 nameserver 為 `127.0.0.1`，以唯讀 file bind 掛至 `/etc/resolv.conf`。`DNS_KEEP_NAMESERVER=on` 防止未連線時改寫成公共 DNS；full health 使用固定 IP 的 TLS 目標避免依賴 bootstrap DNS，small health 使用 DNS，沿用自動恢復。將來的 torrent／namespace consumer 必須共用此 resolver bind，不能依賴 Docker 自動產生的 DNS 檔。health 在本機 9999，Docker 每五秒、timeout 五秒、grace 十秒；控制請求依測試 client 上限三秒。managed VPN metrics／sentinel 與 torrent profile 尚未接入，出口 IP 比對仍只作告警。
+
+當次獨立合成設定已實測：外部 IPv4 TCP 對照成功；無法連線的 tunnel、API 確認停止後的恢復期間，以及 exact VPN container 停止後仍存活的 namespace child 都無法直接連外。OUTPUT policy 保持 DROP，child 的 DNS 仍是 loopback，resolver 的 host／container device／inode 相符，未授權控制與 credential settings route 被拒絕；測試容器已逐一移除。測試未使用真實 VPN provider 或帳號，不能抵真實連線、斷線重連、IPv6、torrent topology 或完整 kill switch promotion。
+
+```bash
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV --profile vpn --secrets-root PRIVATE_SECRETS --wireguard-config PRIVATE_WIREGUARD_FILE --vpn-resolv-conf PRIVATE_RESOLVER_FILE
+```
+
+目前沒有可用的私有 VPN 連線設定，原部署未啟動 VPN。取得設定後仍須核對 daemon、實體容量、secret／resolver actual binds、provider contract 與連線／阻流／重連，不能拿合成負向測試當 live PASS。VPN rollback 先停止 exact namespace consumers 與 Gluetun，核對沒有 child 後再以相容 immutable image 恢復；保留私有設定與證據，resolver 可重建，本輪不新增實際備份。
 
 ### Docker Runner 開發入口
 
