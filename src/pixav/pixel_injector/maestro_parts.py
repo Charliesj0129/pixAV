@@ -270,6 +270,10 @@ class MaestroPartUploader:
             raise CanaryBlockedError("Windows account binding changed")
         accounts = await self.adb("shell", "dumpsys", "account")
         if f"name={account.email}, type=com.google" not in accounts:
+            if self.windows_device is not None and re.findall(r"(?m)^\s*Accounts:\s*(\d+)\s*$", accounts) != ["0"]:
+                self.recovery["user_action"] = "verify existing Windows Google account, then resume"
+                await self.save(self.recovery)
+                raise UserActionRequiredError("existing Windows Google account unconfirmed; retain guest")
             await self._sign_in(account)
             accounts = await self.adb("shell", "dumpsys", "account")
             if f"name={account.email}, type=com.google" not in accounts:

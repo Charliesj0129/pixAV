@@ -305,6 +305,10 @@ Windows 磁碟守衛以本地 download filesystem 與 enrolled AVD 所在的實�
 
 2026-10-18 恢復後已重新核對同一 Docker daemon、PostgreSQL identifier 與七個資料 bind 的 device／inode，Redis 換新 run ID 後明確更新設定。新 authority 的實際程式 digest 與來源相符，health／metrics 均 200；部署內以真實 Windows 容量及隔離合成 key 實測低容量 latch、容量恢復後仍保持 pause、其他 owner 被拒絕、原 owner 原子解除。原 system pause 與 legacy queue 保留，未啟動媒體 worker；Android 新 boot enrollment、VPN、私有播放與 provider gates 仍待驗收。
 
+同日保留 AVD 已重新啟動，新的 boot epoch、root UID 0、Vector 3080／API 102、Photos-only scope 與當次 Photos process 的兩筆 Pixel XL 驗證成功紀錄均核對，無驗證失敗或 IPC 錯誤。12 個 SDK 檔案與四個 Photos APK 已重驗，完整 observe 在暖機後以原 45 秒限制實測 21.23 秒；第一次冷啟動的 observe 超時與後續放寬至 90 秒的診斷分開保留，不能把診斷設定當部署 timeout。新 generation 的 Docker tools 已連到 exact serial，registry enrollment 與 managed ownership 尚未促成。
+
+帳號數量以 `dumpsys account` 的 `Accounts:` 區段與實際 Account rows 核對，不能將 `AuthenticatorDescription {type=com.google}` 當已登入帳號；本次實際為 `Accounts: 0`，先前寬鬆計數的一筆是 authenticator，不能作登入證據。Windows caller 只有明確的空帳號區段才允許初次登入；已有其他帳號或輸出不明時要求人工核對，不以提交帳密修補。已重用本機 [scrcpy 4.1（Apache-2.0）](https://github.com/Genymobile/scrcpy/blob/v4.1/LICENSE) 提供 exact serial 的人工登入視窗，固定 SDK ADB、停用音訊及 clipboard autosync，未記錄帳密。人工控制期間保持 system pause，native managed control 停止；關閉及核對 exact controller／Android child，再重驗 quiescence 與 enrollment 才能交回 managed UI writer。
+
 ```bash
 # schema／authority 的 preflight 另外提供 --db-identity、--database；authority 再提供 --redis-run-id。
 docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile schema run --rm --no-deps migrate

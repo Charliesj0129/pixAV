@@ -5,7 +5,7 @@ import logging
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -71,6 +71,46 @@ async def test_confirmed_login_skips_credentials_and_rechecks_original(upload):
     u._sign_in = AsyncMock()
     await u.login(session, Account(email="fixture@example.invalid"))
     u._sign_in.assert_not_awaited()
+    u._photos_ready.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "accounts",
+    [
+        "Accounts: 1\n  Account {type=com.google}\n",
+        "Accounts: 1\n  Account {name=other@example.invalid, type=com.google}\n",
+        "AuthenticatorDescription {type=com.google}\n",
+    ],
+)
+async def test_unidentified_existing_windows_account_never_submits_credentials(upload, accounts):
+    u, session, _ = upload
+    account = Account(email="fixture@example.invalid")
+    u.windows_device = SimpleNamespace(session=SimpleNamespace(account_id=account.id))
+    u.guard = Mock()
+    # Ambiguous account output cannot authorize adding a second account.
+    u.adb.return_value = accounts
+    u._sign_in = AsyncMock(side_effect=AssertionError("UNREQUESTED_CREDENTIAL_SUBMISSION"))
+    u._photos_ready = AsyncMock()
+    with pytest.raises(UserActionRequiredError):
+        await u.login(session, account)
+    u._sign_in.assert_not_awaited()
+    u._photos_ready.assert_not_awaited()
+    assert not u.recovery.get("login_confirmed")
+
+
+async def test_explicitly_empty_windows_account_store_allows_initial_sign_in(upload):
+    u, session, _ = upload
+    account = Account(email="fixture@example.invalid")
+    u.windows_device = SimpleNamespace(session=SimpleNamespace(account_id=account.id))
+    u.guard = Mock()
+    # A registered authenticator is present even when there are no accounts.
+    u.adb.side_effect = [
+        "Accounts: 0\nAuthenticatorDescription {type=com.google}\n",
+        "Accounts: 1\nAccount {name=fixture@example.invalid, type=com.google}\n",
+    ]
+    u._sign_in, u._photos_ready = AsyncMock(), AsyncMock()
+    await u.login(session, account)
+    u._sign_in.assert_awaited_once_with(account)
     u._photos_ready.assert_awaited_once()
 
 

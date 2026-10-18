@@ -44,6 +44,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - `pixav-local://` 播放檔不可當遠端備份而刪除；projection 不完整拒絕 cleanup。cache 可重建但 eviction 仍等待 reader 釋放；首段不能代表整片，缺段與 manifest 不符拒絕 READY。
 - 只用自己的 token 解除 pause，不直接刪 key；DLQ 不自動 replay，人工 replay 留操作者、原因與原 attempt 歷史。VPN kill switch 阻流且須實測，出口 IP 比對只告警。
 - 登入 challenge 停 retry 進 USER_ACTION_REQUIRED 交人工，不重送帳密。保留 ownership、guest/checkpoint 與未知副作用的 reconciliation 資料。
+- Android 帳號以 `Accounts:` 與實際 Account rows 核對，不把 authenticator 註冊算成已登入帳號。人工 scrcpy bootstrap 期間維持 system pause 並停止 native managed control；交回前核對及關閉 exact controller／Android child，重驗 quiescence 與當次 enrollment，避免並行 UI writer。
 - 原帳號 cold 模式只接受私有 cookie-only secret reference，經 stdin 傳入新 context；child 僅掛空白工作目錄。登入收據須核對帳號／owner／item／session／原件 digest 與完整解碼，不以匿名歷史收據補齊新契約；UI 鎖失聯先停止 exact child，不能留下仍操作帳號的背景下載。
 - 新 adapter/服務在 README 記錄 timeout、health/metrics、secret 管理、版本/license、volume、資源限制、備份與 rollback；外部契約須實測。migration 先驗 expand/contract 與 restore，不讓不相容的舊 process 繼續執行。
 
