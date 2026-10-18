@@ -96,7 +96,7 @@ x-activity: &activity
   networks: [core, runtime]
 services:
   gluetun:
-    profiles: [vpn]
+    profiles: [vpn, torrent]
     image: qmcgaw/gluetun:v3.41.3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
     pull_policy: never
     restart: "no"
@@ -117,7 +117,7 @@ services:
       WIREGUARD_CONF_SECRETFILE: /run/secrets/wg0.conf
       FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT: "on"
       FIREWALL_OUTBOUND_SUBNETS: ""
-      FIREWALL_INPUT_PORTS: ""
+      FIREWALL_INPUT_PORTS: "8080"
       FIREWALL_VPN_INPUT_PORTS: ""
       HEALTH_SMALL_CHECK_TYPE: dns
       HEALTH_TARGET_ADDRESSES: 1.1.1.1:443,1.0.0.1:443
@@ -144,12 +144,60 @@ services:
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
       - /gluetun:rw,nosuid,nodev,noexec,size=64m,mode=0700
-    networks: [runtime]
+    networks: [runtime, download_control]
     healthcheck:
       test: [CMD, /gluetun-entrypoint, healthcheck]
       interval: 5s
       timeout: 5s
       retries: 3
+      start_period: 10s
+  qbittorrent:
+    profiles: [torrent]
+    image: lscr.io/linuxserver/qbittorrent@sha256:304b19cf94bf4fda534e0b086cab9c5f1a9e139a8180c05c0ad7d2ba1526fa99
+    pull_policy: never
+    restart: "no"
+    user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint: [/bin/sh, -c]
+    command: ['umask 077; exec /app/qbittorrent-nox --confirm-legal-notice --webui-port=8080']
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    environment:
+      <<: *private-transport
+      HOME: /config
+      XDG_CONFIG_HOME: /config
+      XDG_DATA_HOME: /config
+      XDG_CACHE_HOME: /tmp
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/qbittorrent
+        target: /config
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/downloads
+        target: /downloads
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_VPN_RESOLV_CONF:-.verify/managed-unconfigured/vpn-resolv.conf}
+        target: /etc/resolv.conf
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777
+    healthcheck:
+      test: [CMD, nc, -z, -w, '3', 127.0.0.1, '8080']
+      interval: 5s
+      timeout: 4s
+      retries: 12
       start_period: 10s
   migrate:
     <<: *app
@@ -318,6 +366,65 @@ services:
       timeout: 4s
       retries: 12
       start_period: 30s
+  media_loader:
+    <<: *app
+    profiles: [media]
+    entrypoint: [python, -m, pixav.media_loader.worker]
+    command: []
+    environment:
+      <<: [*db-environment, *private-transport]
+      PIXAV_DB_USER: pixav_worker
+      PIXAV_EXPECTED_REDIS_RUN_ID: ${PIXAV_EXPECTED_REDIS_RUN_ID:-UNBOUND}
+      PIXAV_MANAGED_MEDIA_WORKFLOW: "true"
+      PIXAV_PIXEL_INJECTOR_MODE: windows_android
+      PIXAV_LOCAL_CLEANUP_APPLY: "false"
+      PIXAV_UPLOAD_MAX_CONCURRENCY: "1"
+      PIXAV_DOWNLOAD_DIR: /app/data/downloads
+      PIXAV_REMUX_DIR: /app/data/remuxed
+      PIXAV_DOWNLOAD_MIN_FREE_BYTES: ${PIXAV_DOWNLOAD_MIN_FREE_BYTES:-107374182400}
+      PIXAV_DOWNLOAD_MIN_FREE_PERCENT: ${PIXAV_DOWNLOAD_MIN_FREE_PERCENT:-10}
+      PIXAV_QBIT_URL: http://gluetun:8080
+      PIXAV_QBIT_USER: pixav
+      PIXAV_QBIT_DOWNLOAD_DIR: /downloads
+      PIXAV_STASH_ENABLED: "false"
+      PIXAV_STORAGE_WORKER_OWNER: ${PIXAV_STORAGE_WORKER_OWNER:?set the stable runtime owner}
+      PIXAV_STORAGE_WINDOWS_RUNTIME_ID: ${PIXAV_STORAGE_WINDOWS_RUNTIME_ID:?set the runtime ID}
+      PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION: ${PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION:?set the runtime generation}
+      PIXAV_WINDOWS_CONTROL_URL: https://host.docker.internal:5043
+      PIXAV_WINDOWS_CONTROL_CA: /run/secrets/windows_ca
+      PIXAV_WINDOWS_CONTROL_CERTIFICATE: /run/secrets/windows_certificate
+      PIXAV_WINDOWS_CONTROL_KEY: /run/secrets/windows_key
+      PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID: ${PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID:-UNBOUND}
+      PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256: ${PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256:-UNBOUND}
+      PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE: ${PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE:-0}
+      PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE: /run/secrets/download_pause_token
+    secrets:
+      - source: worker_password
+        target: /run/secrets/PIXAV_DB_PASSWORD
+      - source: redis_client_url
+        target: /run/secrets/PIXAV_REDIS_URL
+      - source: qbit_password
+        target: /run/secrets/PIXAV_QBIT_PASSWORD
+      - windows_ca
+      - windows_certificate
+      - windows_key
+      - download_pause_token
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/downloads
+        target: /app/data/downloads
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/remuxed
+        target: /app/data/remuxed
+        bind: {create_host_path: false}
+    networks: [core, runtime, download_control]
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8002/health", timeout=3)']
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 45s
   strm_resolver:
     <<: *app
     profiles: [resolver]
@@ -558,6 +665,8 @@ networks:
   core:
     internal: true
   runtime: {}
+  download_control:
+    internal: true
   playback_backend:
     internal: true
   library_media:
@@ -582,6 +691,8 @@ secrets:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/reader_password
   redis_client_url:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_client_url
+  qbit_password:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/qbit_password
   windows_ca:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_ca
   windows_certificate:

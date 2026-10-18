@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,190 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,219 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -246,9 +246,9 @@ AVD 起始預算為 2 cores／4096 MiB，使用 Windows 的固定 SDK 與專用 
 
 ### Managed 部署入口與當前 profile
 
-新的 [docker-compose.managed.yml](docker-compose.managed.yml) 是受管部署的單一入口，目前宣告 `windows-tools`、`core`、`schema` 與 `authority` profiles；`core` 只包含 PostgreSQL／Redis，`schema` 供 migration／角色登錄，`authority` 啟動唯一 Maxwell。workers、VPN、resolver 與 private Jellyfin 尚未接入此 manifest，完整 Stage 3 仍 OPEN。工具映像以 [windows-tools.Dockerfile](docker/windows-tools.Dockerfile) 延伸已核對的本機 immutable tools 基底，只加入 repository 的 Maestro flows；build 前後核對基底 image ID／RootFS layers，執行時使用產出的 immutable image ID。二十四個 baked flow 的完整 SHA-256 已核對，帳號、AVD、DB／queue secret 不進 image 或 runner。
+新的 [docker-compose.managed.yml](docker-compose.managed.yml) 是受管部署的單一入口，目前宣告 `windows-tools`、`core`、`schema`、`authority`、`storage`、`playback`、`vpn`、`torrent`、`media`、`resolver` 與 `library` profiles；`core` 只包含 PostgreSQL／Redis，`schema` 供 migration／角色登錄，`authority` 啟動唯一 Maxwell。各 profile 依下列隔離證據分段接入，完整 Stage 3 仍 OPEN。工具映像以 [windows-tools.Dockerfile](docker/windows-tools.Dockerfile) 延伸已核對的本機 immutable tools 基底，只加入 repository 的 Maestro flows；build 前後核對基底 image ID／RootFS layers，執行時使用產出的 immutable image ID。二十四個 baked flow 的完整 SHA-256 已核對，帳號、AVD、DB／queue secret 不進 image 或 runner。
 
-[managed preflight](scripts/manage_managed_deployment.py) 是唯讀入口：依 `--profile` 選擇 tools、core、schema 或 authority，核對 explicit context／daemon／project、私有 0600 env（父目錄 0700）、固定 image、runtime owner／generation、transport、resource limits、唯讀 `/parts` 與 tmpfs；拒絕額外 service、直接放入的 credential、socket／privileged／host network 及仍在其他 project 運行的 Android tools。設定檢查不等於 native readiness、DB 登錄或 provider 能力。當前 tools 限制一 CPU／2 GiB、swap 與 RAM 同限、256 PIDs，無 restart policy；health 每三十秒、timeout 二十五秒、grace 二百四十秒，只核對 exact serial 與 Android boot，沒有 metrics endpoint。啟動前仍核對 Windows 實體容量與新 bind 的 host／container device、inode 及內容；只啟動當前需要的 profile，不恢復停止的其他專案。
+[managed preflight](scripts/manage_managed_deployment.py) 是唯讀入口：依 `--profile` 選擇當階段服務，核對 explicit context／daemon／project、私有 0600 env（父目錄 0700）、固定 image、runtime owner／generation、transport、resource limits、各角色 mounts 與 tmpfs；依角色拒絕額外 service、越界 credential／socket／privileged／host network 及仍在其他 project 運行的 Android tools。設定檢查不等於 native readiness、DB 登錄或 provider 能力。當前 tools 限制一 CPU／2 GiB、swap 與 RAM 同限、256 PIDs，無 restart policy；health 每三十秒、timeout 二十五秒、grace 二百四十秒，只核對 exact serial 與 Android boot，沒有 metrics endpoint。啟動前仍核對 Windows 實體容量與新 bind 的 host／container device、inode 及內容；只啟動當前需要的 profile，不恢復停止的其他專案。
 
 ```bash
 # BASE_IMAGE 是已核實的本機 tools image ID；BASE_REF 是綁定該 ID 的私有建置用 tag。
@@ -341,9 +341,9 @@ worker rollback 先保持 system pause，停止並核對 exact worker 及其 col
 
 `vpn` profile 只啟動 [Gluetun v3.41.3](https://github.com/passteque/gluetun/releases/tag/v3.41.3)，固定 digest，採 [MIT](https://github.com/passteque/gluetun/blob/v3.41.3/LICENSE)；不加入 DB／Redis core network，不掛 Docker socket、AVD 或應用認證，不發布 host port。它限半 CPU／512 MiB／128 PIDs、不自動重啟，唯讀 root 並僅提供有容量限制的 `/tmp`／`/gluetun` tmpfs。以 root 設定其自身 network namespace，drop ALL 後只保留 `NET_ADMIN` 與讀取 host-owned 0600 secret 所需的 `DAC_OVERRIDE`；使用標準 `/dev/net/tun`，不修改 WSL kernel。
 
-沿用 [Gluetun firewall](https://github.com/qdm12/gluetun-wiki/blob/main/faq/firewall.md) 執行阻流，固定啟用且不允許 LAN／outbound subnet bypass。`PIXAV_MANAGED_WIREGUARD_CONFIG` 是 exact 0600 WireGuard file，父目錄 0700，掛至 `/run/secrets/wg0.conf`；secret 不放 env 或 command。control 認證檔 `PIXAV_MANAGED_SECRETS_ROOT/vpn_control_auth` 同樣 0600，只允許 `pixav-runtime` API-key role 的 `GET /v1/vpn/status`、`PUT /v1/vpn/status`，key 須為 32–128 個 base58 字元。控制端只綁 namespace 內的 `127.0.0.1:8000`，拒絕未授權控制與 settings route；[官方 control API](https://github.com/qdm12/gluetun-wiki/blob/main/setup/advanced/control-server.md) 不代表 HTTP 200 就已完成停止，仍須核對 outcome、實際狀態與 child。
+沿用 [Gluetun firewall](https://github.com/qdm12/gluetun-wiki/blob/main/faq/firewall.md) 執行阻流，固定啟用且 `FIREWALL_OUTBOUND_SUBNETS` 為空，不額外豁免 LAN／outbound subnet。Gluetun 連接 runtime 與 internal `download_control`，只額外開放 INPUT 8080 給同 namespace 的 qBittorrent API，沒有 host published port。`PIXAV_MANAGED_WIREGUARD_CONFIG` 是 exact 0600 WireGuard file，父目錄 0700，掛至 `/run/secrets/wg0.conf`；secret 不放 env 或 command。control 認證檔 `PIXAV_MANAGED_SECRETS_ROOT/vpn_control_auth` 同樣 0600，只允許 `pixav-runtime` API-key role 的 `GET /v1/vpn/status`、`PUT /v1/vpn/status`，key 須為 32–128 個 base58 字元。控制端只綁 namespace 內的 `127.0.0.1:8000`，拒絕未授權控制與 settings route；[官方 control API](https://github.com/qdm12/gluetun-wiki/blob/main/setup/advanced/control-server.md) 不代表 HTTP 200 就已完成停止，仍須核對 outcome、實際狀態與 child。
 
-`PIXAV_MANAGED_VPN_RESOLV_CONF` 指向本輪可重建的 0600 resolver file，父目錄 0700，唯一 nameserver 為 `127.0.0.1`，以唯讀 file bind 掛至 `/etc/resolv.conf`。`DNS_KEEP_NAMESERVER=on` 防止未連線時改寫成公共 DNS；full health 使用固定 IP 的 TLS 目標避免依賴 bootstrap DNS，small health 使用 DNS，沿用自動恢復。將來的 torrent／namespace consumer 必須共用此 resolver bind，不能依賴 Docker 自動產生的 DNS 檔。health 在本機 9999，Docker 每五秒、timeout 五秒、grace 十秒；控制請求依測試 client 上限三秒。managed VPN metrics／sentinel 與 torrent profile 尚未接入，出口 IP 比對仍只作告警。
+`PIXAV_MANAGED_VPN_RESOLV_CONF` 指向本輪可重建的 0600 resolver file，父目錄 0700，唯一 nameserver 為 `127.0.0.1`，以唯讀 file bind 掛至 `/etc/resolv.conf`。`DNS_KEEP_NAMESERVER=on` 防止未連線時改寫成公共 DNS；full health 使用固定 IP 的 TLS 目標避免依賴 bootstrap DNS，small health 使用 DNS，沿用自動恢復。torrent／namespace consumer 必須共用此 resolver bind，不能依賴 Docker 自動產生的 DNS 檔。health 在本機 9999，Docker 每五秒、timeout 五秒、grace 十秒；控制請求依測試 client 上限三秒。managed VPN metrics／sentinel 尚未接入，出口 IP 比對仍只作告警。
 
 當次獨立合成設定已實測：外部 IPv4 TCP 對照成功；無法連線的 tunnel、API 確認停止後的恢復期間，以及 exact VPN container 停止後仍存活的 namespace child 都無法直接連外。OUTPUT policy 保持 DROP，child 的 DNS 仍是 loopback，resolver 的 host／container device／inode 相符，未授權控制與 credential settings route 被拒絕；測試容器已逐一移除。測試未使用真實 VPN provider 或帳號，不能抵真實連線、斷線重連、IPv6、torrent topology 或完整 kill switch promotion。
 
@@ -352,6 +352,28 @@ uv run python -m scripts.manage_managed_deployment --context default --project M
 ```
 
 目前沒有可用的私有 VPN 連線設定，原部署未啟動 VPN。取得設定後仍須核對 daemon、實體容量、secret／resolver actual binds、provider contract 與連線／阻流／重連，不能拿合成負向測試當 live PASS。VPN rollback 先停止 exact namespace consumers 與 Gluetun，核對沒有 child 後再以相容 immutable image 恢復；保留私有設定與證據，resolver 可重建，本輪不新增實際備份。
+
+`torrent` profile 選 Gluetun／qBittorrent，`media` 只選 media-loader。qBittorrent 固定本機已核對的 LinuxServer digest，binary／API 實測為 5.2.3；[上游授權](https://github.com/qbittorrent/qBittorrent/blob/release-5.2.3/COPYING) 將 source 列為 GPLv2+、binary distribution 列為 GPLv3+，[LinuxServer wrapper](https://github.com/linuxserver/docker-qbittorrent/blob/master/LICENSE) 為 GPLv3。依 [image 文件](https://docs.linuxserver.io/images/docker-qbittorrent/) 的應用路徑，以非 root UID／GID、唯讀 root、drop ALL、單 CPU／512 MiB／128 PIDs 啟動，不執行 root init。固定 shell 只先設 `umask 077` 再 exec binary；實測缺少此設定時 Qt 關閉時會將 config 重寫成 0644，加上後仍為 0600。
+
+[初始化工具](scripts/prepare_managed_qbittorrent.py) 由 WSL 執行，預設 dry-run，不建立目錄、config 或 credential。它先核對 explicit Docker context／daemon，拒絕任何可寫到該 config 的 running mount；data／secrets root 須為操作者的既有 0700 目錄。apply 僅在新空位置以 O_EXCL 建立兩個 0600 檔案：`DATA/qbittorrent/qBittorrent/qBittorrent.conf` 與 `SECRETS/qbit_password`。完整既有 config 只驗證、不重寫；半完成或不相容的資料保持原樣並要求 reconciliation。密碼隨機生成，只以私有 file reference 提供 worker，server 保存 PBKDF2-HMAC-SHA512 verifier；舊的 container-name bootstrap 已退休。
+
+qBittorrent 使用 `network_mode: service:gluetun`，不另接 bridge、發布 port 或掛 Docker socket／應用 credential。它只寫專用 config／downloads，唯讀掛同一個 loopback resolver；必須等 Gluetun healthy 才能正常啟動。BitTorrent interface 固定 `wg0`、同時最多一個 download，停用 UPnP／local discovery。WebUI 僅接受固定 `gluetun` Host，CSRF／Host header／localhost 認證保持開啟，不啟用 subnet auth bypass 或 reverse proxy auth；worker 使用 `http://gluetun:8080`。health 每五秒、單次四秒，只測 API TCP listener，登入與 torrent 狀態另驗；目前沒有 managed qBittorrent metrics exporter。
+
+media-loader 使用同一 immutable app image 的 `pixav_worker` role，只掛 downloads／remuxed 及 worker DB／Redis／qBittorrent password、Windows capacity mTLS 與自有 disk-pause references；沒有 Docker socket、staging、guest 或 Photos cookie。它限單 CPU／768 MiB／256 PIDs、唯讀 root，health／metrics 只在 internal 8002，每五秒檢查、單次四秒、grace 四十五秒。qBittorrent HTTP timeout 三十秒，下載輪詢沿用後述單次三十秒的 managed check；qBittorrent 暫時不可用仍可提供 preparation，但 system pause／disk latch 會攔住新增工作。完整 GPU generation／登入與 capacity／ownership 未核對前，不在原部署啟動此 worker。
+
+當次新空資料以同一 managed Compose 逐段實際驗證 torrent、core、schema 與 media：VPN unhealthy 會阻止正常 torrent 啟動；只有合成故障測試以 `--no-deps` 啟動 consumer，確認 namespace 相符、失效 tunnel 及 exact VPN container 停止後仍阻擋外部 IPv4 TCP。qBittorrent 重啟後同一 client 重新登入，原 torrent 保留；停止 consumer 後成對重啟 VPN／consumer，namespace 再次相符。media 的 health／metrics 通過，pause 與 pending／in-flight 全部 bytes 不變，二十組 bind 的 device／inode 相符，沒有 runtime enrollment 或 provider 請求。全部臨時容器／network 已依 exact identity 移除；未使用真實 VPN provider，不抵健康連線、重連、IPv6 或 Golden Path（BDD-024、034、141）。
+
+```bash
+# 所有命令均需先核對當次實例；初始化不會停止既有容器或修改現存 config。
+uv run python -m scripts.prepare_managed_qbittorrent --context default --daemon-id DAEMON_ID --data-root PRIVATE_DATA --secrets-root PRIVATE_SECRETS
+uv run python -m scripts.prepare_managed_qbittorrent --context default --daemon-id DAEMON_ID --data-root PRIVATE_DATA --secrets-root PRIVATE_SECRETS --apply
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV --profile torrent --data-root PRIVATE_DATA --secrets-root PRIVATE_SECRETS --wireguard-config PRIVATE_WIREGUARD_FILE --vpn-resolv-conf PRIVATE_RESOLVER_FILE
+# 真實 VPN healthy、contract 與當次 promotion gate 通過後，保留 health dependency：
+docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile torrent up -d --no-build qbittorrent
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV --profile media --db-identity IDENTIFIER --database MANAGED_DATABASE --redis-run-id RUN_ID --data-root PRIVATE_DATA --secrets-root PRIVATE_SECRETS
+```
+
+回退與維護保持自有 system pause，先停止 exact media／torrent consumers，再停止 Gluetun。VPN 重啟後須重新啟動 consumer 並核對實際 namespace，不能只看 Config 的舊 parent ID；保留 config、torrent state、下載檔與原 operation，不刪 queue、不重加未知 torrent。本輪不新增實際備份；原 volumes、資料與既有保全收據保留，完整 production rollback 仍待驗收。
 
 ### Docker Runner 開發入口
 

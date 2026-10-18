@@ -6,7 +6,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 
 - 開始前讀相關 `.agent/skills/`、`.agent/workflows/` 與 `user_rules.md`；不存在時記錄並繼續，不虛構 workflow。
 - 核對 worktree，先讀實際 repository、callers、測試、migration、Compose 與可核實 runtime evidence；保留既有程式修改。區分目標契約、目前實作、隔離證據與 production 驗收。
-- 舊 application Compose／start_workers 與 first-4k 啟動入口已退休；獨立 Android runner 與 CI integration Compose 保留。新 managed Compose 依已驗收 profile 分段接入，目前有 `windows-tools`、僅含 PostgreSQL／Redis 的 `core`、schema／authority、storage／playback、`vpn`、`resolver` 與 `library` profiles。部分隔離驗證已完成，完整應用部署／Windows upload adapter 另行驗收，不復活舊 executor 或重播舊 queue。
+- 舊 application Compose／start_workers 與 first-4k 啟動入口已退休；獨立 Android runner 與 CI integration Compose 保留。新 managed Compose 依已驗收 profile 分段接入，目前有 `windows-tools`、僅含 PostgreSQL／Redis 的 `core`、schema／authority、storage／playback、vpn／torrent／media、`resolver` 與 `library` profiles。部分隔離驗證已完成，完整應用部署／Windows upload adapter 另行驗收，不復活舊 executor 或重播舊 queue。
 - Windows 開發環境採 Windows Android Emulator + Docker Runner，WSL／Docker Desktop 使用 Microsoft 提供的 WSL kernel。操作者已回報 `bzImage-6.6.87.2-pixav-redroid` 的 `.wslconfig` kernel override 造成相容性問題；不得把修改全域 kernel、載入 binder 或 privileged redroid guest 作為開發前置。設定範圍、ADB／Maestro 與遷移守衛見 README。
 - 維持 README、AGENTS、CLAUDE 三份核心文件，不新增 roadmap、CODEMAPS、ADR、實驗流水帳、archive 或轉址頁。外來規格整合進 README 並保留情境對應；文件刪改直接進行，不建立文件備份，同步修正引用。
 - 文件採中性用語與合成媒體，不放來源名稱、連結、作品識別資料或相關圖片；實際程式路徑、參數、設定鍵保留原名。私有 evidence 不變成公開文件或 fixture。

@@ -14,6 +14,8 @@ import subprocess
 from pathlib import Path
 from uuid import UUID
 
+from scripts.prepare_managed_qbittorrent import QBIT_IMAGE, validate_qbit_files
+
 IMAGE = re.compile(r"^sha256:[a-f0-9]{64}$")
 PROJECT = re.compile(r"^pixav-managed-[a-z0-9][a-z0-9-]*$")
 CORE_IMAGES = {
@@ -73,7 +75,7 @@ def validate_vpn(  # noqa: C901 -- fixed VPN boundary
     service = config["services"]["gluetun"]
     if (
         service.get("image") != VPN_IMAGE
-        or service.get("profiles") != ["vpn"]
+        or service.get("profiles") != ["vpn", "torrent"]
         or service.get("pull_policy") != "never"
         or service.get("restart") != "no"
         or service.get("user") != "0:0"
@@ -88,8 +90,9 @@ def validate_vpn(  # noqa: C901 -- fixed VPN boundary
         or service.get("network_mode")
         or service.get("entrypoint") is not None
         or service.get("command") is not None
-        or set(service.get("networks", {})) != {"runtime"}
+        or set(service.get("networks", {})) != {"runtime", "download_control"}
         or config.get("networks", {}).get("runtime", {}).get("internal")
+        or not config.get("networks", {}).get("download_control", {}).get("internal")
         or service.get("devices") != [{"source": "/dev/net/tun", "target": "/dev/net/tun", "permissions": "rw"}]
     ):
         raise ValueError("VPN_SERVICE_ISOLATION_INVALID")
@@ -99,7 +102,7 @@ def validate_vpn(  # noqa: C901 -- fixed VPN boundary
         "WIREGUARD_CONF_SECRETFILE": "/run/secrets/wg0.conf",
         "FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT": "on",
         "FIREWALL_OUTBOUND_SUBNETS": "",
-        "FIREWALL_INPUT_PORTS": "",
+        "FIREWALL_INPUT_PORTS": "8080",
         "FIREWALL_VPN_INPUT_PORTS": "",
         "HEALTH_SMALL_CHECK_TYPE": "dns",
         "HEALTH_TARGET_ADDRESSES": "1.1.1.1:443,1.0.0.1:443",
@@ -434,7 +437,8 @@ def validate_private_binds(service: dict, expected: dict[str, tuple[Path, bool]]
             or not source.is_absolute()
             or source.resolve() != source
             or not source.exists()
-            or (row["target"] != "/config/config/logging.json" and not source.is_dir())
+            or (row["target"] not in {"/config/config/logging.json", "/etc/resolv.conf"} and not source.is_dir())
+            or (row["target"] in {"/config/config/logging.json", "/etc/resolv.conf"} and not source.is_file())
             or (source.is_dir() and source.stat().st_uid != uid)
         ):
             raise ValueError("PRIVATE_PLAYBACK_MOUNTS_INVALID")
@@ -622,6 +626,115 @@ def validate_library(config: dict, args: argparse.Namespace) -> None:  # noqa: C
         raise ValueError("PRIVATE_JELLYFIN_LOOPBACK_PORT_REQUIRED")
 
 
+def validate_torrent(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed shared VPN namespace
+    if set(config["services"]) != {"gluetun", "qbittorrent"} or args.data_root is None or args.secrets_root is None:
+        raise ValueError("TORRENT_EXPLICIT_BINDING_REQUIRED")
+    vpn = {
+        **config,
+        "services": {"gluetun": config["services"]["gluetun"]},
+        "secrets": {key: config["secrets"][key] for key in ["vpn_wireguard", "vpn_control_auth"]},
+    }
+    if set(config.get("secrets", {})) != set(vpn["secrets"]):
+        raise ValueError("TORRENT_SECRET_BOUNDARY_INVALID")
+    validate_vpn(vpn, args.wireguard_config, args.secrets_root, args.vpn_resolv_conf)
+    service = config["services"]["qbittorrent"]
+    if (
+        service.get("profiles") != ["torrent"]
+        or service.get("image") != QBIT_IMAGE
+        or service.get("pull_policy") != "never"
+        or service.get("restart") != "no"
+        or not service.get("read_only")
+        or not service.get("init")
+        or service.get("cap_drop") != ["ALL"]
+        or service.get("cap_add")
+        or service.get("privileged")
+        or service.get("devices")
+        or service.get("ports")
+        or service.get("secrets")
+        or service.get("group_add")
+        or service.get("dns")
+        or service.get("extra_hosts")
+        or service.get("container_name")
+        or service.get("networks")
+        or service.get("network_mode") != "service:gluetun"
+        or service.get("depends_on", {}).get("gluetun", {}).get("condition") != "service_healthy"
+        or set(service.get("depends_on", {})) != {"gluetun"}
+        or service.get("security_opt") != ["no-new-privileges:true"]
+        or not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", service.get("user", ""))
+        or float(service.get("cpus", 0)) != 1
+        or int(service.get("mem_limit", 0)) != 512 * 1024**2
+        or int(service.get("memswap_limit", 0)) != 512 * 1024**2
+        or service.get("pids_limit") != 128
+        or service.get("entrypoint") != ["/bin/sh", "-c"]
+        or service.get("command") != ["umask 077; exec /app/qbittorrent-nox --confirm-legal-notice --webui-port=8080"]
+        or service.get("healthcheck", {}).get("test") != ["CMD", "nc", "-z", "-w", "3", "127.0.0.1", "8080"]
+        or service.get("tmpfs") != ["/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777"]  # noqa: S108 -- bounded tmpfs
+        or service.get("environment")
+        != {
+            **PRIVATE_PROXY_ENV,
+            "HOME": "/config",
+            "XDG_CONFIG_HOME": "/config",
+            "XDG_DATA_HOME": "/config",
+            "XDG_CACHE_HOME": "/tmp",  # noqa: S108 -- bounded container tmpfs
+        }
+    ):
+        raise ValueError("TORRENT_VPN_NAMESPACE_OR_ISOLATION_INVALID")
+    validate_private_binds(
+        service,
+        {
+            "/config": (args.data_root / "qbittorrent", False),
+            "/downloads": (args.data_root / "downloads", False),
+            "/etc/resolv.conf": (args.vpn_resolv_conf, True),
+        },
+    )
+    if args.vpn_resolv_conf.stat().st_uid != int(service["user"].split(":")[0]):
+        raise ValueError("TORRENT_PRIVATE_RESOLVER_UNREADABLE")
+    validate_qbit_files(args.data_root, args.secrets_root, int(service["user"].split(":")[0]))
+
+
+def validate_media(config: dict, service: dict, args: argparse.Namespace) -> None:
+    env = service["environment"]
+    fixed = {
+        **PRIVATE_PROXY_ENV,
+        "PIXAV_DOWNLOAD_DIR": "/app/data/downloads",
+        "PIXAV_REMUX_DIR": "/app/data/remuxed",
+        "PIXAV_QBIT_URL": "http://gluetun:8080",
+        "PIXAV_QBIT_USER": "pixav",
+        "PIXAV_QBIT_DOWNLOAD_DIR": "/downloads",
+        "PIXAV_STASH_ENABLED": "false",
+        "PIXAV_WINDOWS_CONTROL_URL": "https://host.docker.internal:5043",
+        "PIXAV_WINDOWS_CONTROL_CA": "/run/secrets/windows_ca",
+        "PIXAV_WINDOWS_CONTROL_CERTIFICATE": "/run/secrets/windows_certificate",
+        "PIXAV_WINDOWS_CONTROL_KEY": "/run/secrets/windows_key",
+    }
+    if (
+        any(env.get(key) != value for key, value in fixed.items())
+        or service.get("command") != []
+        or service.get("group_add")
+        or service.get("depends_on")
+        or not config.get("networks", {}).get("download_control", {}).get("internal")
+        or not service.get("healthcheck", {}).get("test")
+        or service.get("tmpfs") != ["/tmp:rw,nosuid,nodev,size=64m,mode=1777"]  # noqa: S108 -- bounded tmpfs
+        or any("PHOTOS" in key or "READBACK" in key or "STAGING" in key for key in env)
+    ):
+        raise ValueError("MEDIA_DEPENDENCY_BOUNDARY_INVALID")
+    try:
+        UUID(env["PIXAV_STORAGE_WORKER_OWNER"])
+        UUID(env["PIXAV_STORAGE_WINDOWS_RUNTIME_ID"])
+        if int(env["PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION"]) <= 0:
+            raise ValueError
+    except (KeyError, ValueError, TypeError):
+        raise ValueError("MEDIA_RUNTIME_BINDING_INVALID") from None
+    validate_private_binds(
+        service,
+        {
+            "/app/data/downloads": (args.data_root / "downloads", False),
+            "/app/data/remuxed": (args.data_root / "remuxed", False),
+        },
+    )
+    validate_qbit_files(args.data_root, args.secrets_root, int(service["user"].split(":")[0]))
+
+
 def validate_application(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed managed roles
     profile = args.profile
     expected = {
@@ -630,6 +743,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         "storage": {"storage_worker"},
         "playback": {"playback_worker"},
         "resolver": {"strm_resolver"},
+        "media": {"media_loader"},
     }[profile]
     if set(config["services"]) != expected or not args.db_identity or not args.database:
         raise ValueError("APPLICATION_BINDING_REQUIRED")
@@ -643,6 +757,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         "storage_worker": "pixav.pixel_injector.storage_worker",
         "playback_worker": "pixav.pixel_injector.playback_worker",
         "strm_resolver": "uvicorn",
+        "media_loader": "pixav.media_loader.worker",
     }
     secret_targets = {
         "strm_resolver": {
@@ -665,6 +780,9 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         secret_targets[name] = {
             key: target for key, target in secret_targets["maxwell_core"].items() if key != "authority_password"
         } | {"worker_password": "/run/secrets/PIXAV_DB_PASSWORD", "photos_auth": "/run/photos-auth/cookies.json"}
+    secret_targets["media_loader"] = {
+        key: target for key, target in secret_targets["maxwell_core"].items() if key != "authority_password"
+    } | {"worker_password": "/run/secrets/PIXAV_DB_PASSWORD", "qbit_password": "/run/secrets/PIXAV_QBIT_PASSWORD"}
     for name, service in config["services"].items():
         mounted = service.get("secrets", [])
         if (
@@ -710,6 +828,8 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
             if profile == "schema"
             else ({"core", "playback_backend"} if profile == "resolver" else {"core", "runtime"})
         )
+        if profile == "media":
+            networks = {"core", "runtime", "download_control"}
         if set(service.get("networks", {})) != networks or not config["networks"]["core"].get("internal"):
             raise ValueError("APPLICATION_NETWORK_INVALID")
         if profile == "schema":
@@ -731,12 +851,15 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
                 or env.get("PIXAV_UPLOAD_MAX_CONCURRENCY") != "1"
                 or (profile == "authority" and env.get("PIXAV_RESOLVER_BASE_URL") != "http://playback-gateway:8080")
                 or env.get("PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID") != args.daemon_id
-                or not IMAGE.fullmatch(env.get("PIXAV_STORAGE_READBACK_IMAGE", ""))
+                or (profile != "media" and not IMAGE.fullmatch(env.get("PIXAV_STORAGE_READBACK_IMAGE", "")))
                 or not re.fullmatch(r"[a-f0-9]{64}", env.get("PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256", ""))
                 or not re.fullmatch(r"[1-9][0-9]*", env.get("PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE", ""))
                 or env.get("PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE") != "/run/secrets/download_pause_token"
             ):
                 raise ValueError("AUTHORITY_EXECUTION_BINDING_INVALID")
+            if profile == "media":
+                validate_media(config, service, args)
+                continue
             if profile in {"storage", "playback"}:
                 validate_activity_mounts(service, args)
                 continue
@@ -823,10 +946,13 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
         validate_core(config, args.data_root, args.secrets_root)
     elif profile == "windows-tools":
         validate_tools(config)
-    elif profile == "vpn":
+    elif profile in {"vpn", "torrent"}:
         if args.wireguard_config is None or args.secrets_root is None or args.vpn_resolv_conf is None:
             raise ValueError("VPN_EXPLICIT_SECRET_REFERENCES_REQUIRED")
-        validate_vpn(config, args.wireguard_config, args.secrets_root, args.vpn_resolv_conf)
+        if profile == "torrent":
+            validate_torrent(config, args)
+        else:
+            validate_vpn(config, args.wireguard_config, args.secrets_root, args.vpn_resolv_conf)
     elif profile == "library":
         if args.data_root is None or args.playback_auth_dir is None:
             raise ValueError("PRIVATE_LIBRARY_EXPLICIT_ROOTS_REQUIRED")
@@ -863,7 +989,19 @@ def main() -> None:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=["windows-tools", "core", "schema", "authority", "storage", "playback", "vpn", "resolver", "library"],
+        choices=[
+            "windows-tools",
+            "core",
+            "schema",
+            "authority",
+            "storage",
+            "playback",
+            "vpn",
+            "torrent",
+            "media",
+            "resolver",
+            "library",
+        ],
         default="windows-tools",
     )
     parser.add_argument("--data-root", type=Path)

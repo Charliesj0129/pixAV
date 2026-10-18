@@ -464,7 +464,7 @@ def vpn_config(tmp_path):
         )
     )
     service = manifest["services"]["gluetun"]
-    service["networks"] = {"runtime": None}
+    service["networks"] = {name: None for name in service["networks"]}
     service["devices"] = [{"source": "/dev/net/tun", "target": "/dev/net/tun", "permissions": "rw"}]
     service["mem_limit"] = service["memswap_limit"] = "536870912"
     service["secrets"] = [

@@ -187,7 +187,7 @@ async def run_loop(  # noqa: C901
             logger.info("qBittorrent health check ok (version=%s)", version)
         except DownloadError as exc:
             logger.error("qBittorrent health check failed: %s", exc)
-            logger.error("hint: run `uv run python scripts/bootstrap_qbittorrent_webui.py` to set stable credentials")
+            logger.error("hint: validate the managed qBittorrent config and its file secret before download activities")
             if max_tasks > 0 or expected_task_id is not None or expected_video_id is not None:
                 raise _OneShotGuardError("qBittorrent health check failed before the guarded claim") from exc
             if not settings.managed_media_workflow:
