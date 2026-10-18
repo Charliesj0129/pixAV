@@ -317,3 +317,107 @@ def test_authority_profile_refuses_privilege_and_identity_drift(authority_config
         service["volumes"][1]["target"] = "/app/data/postgres"
     with pytest.raises(ValueError):
         module.validate_application(config, args)
+
+
+@pytest.fixture(params=["storage", "playback"])
+def activity_config(authority_config, request):
+    import json
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    authority, args = authority_config
+    args.profile = request.param
+    args.project_root = args.data_root.parent
+    args.staging_root = args.project_root / "staging"
+    args.staging_root.mkdir()
+    (args.data_root / "storage-readback").mkdir()
+    cookies = args.project_root / "photos-auth"
+    cookies.mkdir(mode=0o700)
+    args.photos_auth_secret = cookies / "cookies.json"
+    args.photos_auth_secret.write_text("synthetic-cookie-only-reference")
+    args.photos_auth_secret.chmod(0o600)
+    (args.secrets_root / "worker_password").write_text("synthetic-worker-password")
+    (args.secrets_root / "worker_password").chmod(0o600)
+    name = args.profile + "_worker"
+    manifest = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker-compose.managed.yml").read_text())
+    manifest["services"] = {name: manifest["services"][name]}
+    names = [row["source"] if isinstance(row, dict) else row for row in manifest["services"][name]["secrets"]]
+    manifest["secrets"] = {key: manifest["secrets"][key] for key in names}
+    uid, gid = authority["services"]["maxwell_core"]["user"].split(":")
+    replacements = {
+        "PIXAV_MANAGED_APP_IMAGE": "sha256:" + "a" * 64,
+        "PIXAV_MANAGED_COLD_IMAGE": "sha256:" + "b" * 64,
+        "PIXAV_MANAGED_DATA_ROOT": str(args.data_root),
+        "PIXAV_MANAGED_PROJECT_ROOT": str(args.project_root),
+        "PIXAV_MANAGED_STAGING_HOST_ROOT": str(args.staging_root),
+        "PIXAV_MANAGED_SECRETS_ROOT": str(args.secrets_root),
+        "PIXAV_MANAGED_PHOTOS_AUTH_SECRET": str(args.photos_auth_secret),
+        "PIXAV_MANAGED_UID": uid,
+        "PIXAV_MANAGED_GID": gid,
+        "PIXAV_MANAGED_DATABASE": args.database,
+        "PIXAV_EXPECTED_DB_IDENTITY": args.db_identity,
+        "PIXAV_EXPECTED_REDIS_RUN_ID": args.redis_run_id,
+        "PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID": args.daemon_id,
+        "PIXAV_MANAGED_DOCKER_GID": "1337",
+        "PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256": "c" * 64,
+        "PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE": "123",
+        "PIXAV_STORAGE_WORKER_OWNER": "11111111-1111-4111-8111-111111111111",
+        "PIXAV_STORAGE_WINDOWS_RUNTIME_ID": "22222222-2222-4222-8222-222222222222",
+        "PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION": "7",
+    }
+    manifest = json.loads(
+        re.sub(
+            r"\$\{([^}:]+)(?::([-?])([^}]*))?\}",
+            lambda m: replacements.get(m[1], m[3] if m[2] == "-" else "synthetic-binding"),
+            json.dumps(manifest),
+        )
+    )
+    service = manifest["services"][name]
+    service["networks"] = {key: None for key in service["networks"]}
+    service["mem_limit"] = service["memswap_limit"] = "805306368"
+    service["secrets"] = [
+        row if isinstance(row, dict) else {"source": row, "target": "/run/secrets/" + row} for row in service["secrets"]
+    ]
+    return manifest, args
+
+
+def test_activity_profile_binds_only_worker_credentials_and_exact_data_roots(activity_config):
+    module.validate_application(*activity_config)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "authority-role",
+        "staging-alias",
+        "cookie-mode",
+        "cookie-parent",
+        "cold-image",
+        "readback-writable",
+        "command",
+        "socket-group",
+    ],
+)
+def test_activity_profiles_refuse_privilege_and_isolation_drift(activity_config, defect):
+    config, args = activity_config
+    service = config["services"][args.profile + "_worker"]
+    if defect == "authority-role":
+        service["environment"]["PIXAV_DB_USER"] = "pixav_authority"
+    elif defect == "staging-alias":
+        service["environment"]["PIXAV_STORAGE_STAGING_DIR"] = "/parts"
+    elif defect == "cookie-mode":
+        args.photos_auth_secret.chmod(0o644)
+    elif defect == "cookie-parent":
+        args.photos_auth_secret.parent.chmod(0o755)
+    elif defect == "cold-image":
+        service["environment"]["PIXAV_STORAGE_READBACK_IMAGE"] = "cold:latest"
+    elif defect == "readback-writable":
+        service["volumes"][1]["read_only"] = False
+    elif defect == "command":
+        service["command"] = ["--skip-fence"]
+    elif defect == "socket-group":
+        service["group_add"] = ["0"]
+    with pytest.raises(ValueError):
+        module.validate_application(config, args)

@@ -23,6 +23,52 @@ x-db-environment: &db-environment
   PIXAV_EXPECTED_DB_IDENTITY: ${PIXAV_EXPECTED_DB_IDENTITY:-UNBOUND}
   PIXAV_EXPECTED_DB_NAME: ${PIXAV_MANAGED_DATABASE:-pixav_managed}
   PIXAV_SETTINGS_SECRETS_DIR: /run/secrets
+x-activity-environment: &activity-environment
+  <<: *db-environment
+  PIXAV_DB_USER: pixav_worker
+  PIXAV_EXPECTED_REDIS_RUN_ID: ${PIXAV_EXPECTED_REDIS_RUN_ID:-UNBOUND}
+  PIXAV_MANAGED_MEDIA_WORKFLOW: "true"
+  PIXAV_PIXEL_INJECTOR_MODE: windows_android
+  PIXAV_LOCAL_CLEANUP_APPLY: "false"
+  PIXAV_UPLOAD_MAX_CONCURRENCY: "1"
+  PIXAV_DOWNLOAD_MIN_FREE_BYTES: ${PIXAV_DOWNLOAD_MIN_FREE_BYTES:-107374182400}
+  PIXAV_DOWNLOAD_MIN_FREE_PERCENT: ${PIXAV_DOWNLOAD_MIN_FREE_PERCENT:-10}
+  PIXAV_STORAGE_WORKER_OWNER: ${PIXAV_STORAGE_WORKER_OWNER:?set the stable runtime owner}
+  PIXAV_STORAGE_WINDOWS_RUNTIME_ID: ${PIXAV_STORAGE_WINDOWS_RUNTIME_ID:?set the runtime ID}
+  PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION: ${PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION:?set the runtime generation}
+  PIXAV_STORAGE_STAGING_DIR: ${PIXAV_MANAGED_STAGING_HOST_ROOT:?set the existing daemon-host staging directory}
+  PIXAV_STORAGE_READBACK_DIR: /app/data/storage-readback
+  PIXAV_PLAYBACK_CACHE_DIR: /app/data/playback-cache
+  PIXAV_HOST_PROJECT_ROOT: ${PIXAV_MANAGED_PROJECT_ROOT:-UNBOUND}
+  PIXAV_WINDOWS_CONTROL_URL: https://host.docker.internal:5043
+  PIXAV_WINDOWS_CONTROL_CA: /run/secrets/windows_ca
+  PIXAV_WINDOWS_CONTROL_CERTIFICATE: /run/secrets/windows_certificate
+  PIXAV_WINDOWS_CONTROL_KEY: /run/secrets/windows_key
+  PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID: ${PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID:-UNBOUND}
+  PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256: ${PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256:-UNBOUND}
+  PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE: ${PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE:-0}
+  PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE: /run/secrets/download_pause_token
+  PIXAV_STORAGE_READBACK_IMAGE: ${PIXAV_MANAGED_COLD_IMAGE:-UNBOUND}
+  PIXAV_PHOTOS_COLD_AUTH_SECRET: /run/photos-auth/cookies.json
+x-activity: &activity
+  <<: *app
+  command: []
+  secrets:
+    - source: worker_password
+      target: /run/secrets/PIXAV_DB_PASSWORD
+    - source: redis_client_url
+      target: /run/secrets/PIXAV_REDIS_URL
+    - windows_ca
+    - windows_certificate
+    - windows_key
+    - download_pause_token
+    - source: photos_auth
+      target: /run/photos-auth/cookies.json
+  group_add: ['${PIXAV_MANAGED_DOCKER_GID:-0}']
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+    - /run/photos-auth:rw,nosuid,nodev,noexec,size=1m,mode=0700,uid=${PIXAV_MANAGED_UID:-1000},gid=${PIXAV_MANAGED_GID:-1000}
+  networks: [core, runtime]
 services:
   migrate:
     <<: *app
@@ -125,6 +171,67 @@ services:
     networks: [core, runtime]
     healthcheck:
       test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=3)']
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 30s
+  storage_worker:
+    <<: *activity
+    profiles: [storage]
+    entrypoint: [python, -m, pixav.pixel_injector.storage_worker]
+    environment:
+      <<: *activity-environment
+      PIXAV_DOWNLOAD_DIR: /app/data/storage-readback
+      PIXAV_REMUX_DIR: /app/data/remuxed
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/remuxed
+        target: /app/data/remuxed
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/storage-readback
+        target: /app/data/storage-readback
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_STAGING_HOST_ROOT:?set the existing daemon-host staging directory}
+        target: ${PIXAV_MANAGED_STAGING_HOST_ROOT:?set the existing daemon-host staging directory}
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8005/health", timeout=3)']
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 30s
+  playback_worker:
+    <<: *activity
+    profiles: [playback]
+    entrypoint: [python, -m, pixav.pixel_injector.playback_worker]
+    environment:
+      <<: *activity-environment
+      PIXAV_DOWNLOAD_DIR: /app/data/playback-cache
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/storage-readback
+        target: /app/data/storage-readback
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/playback-cache
+        target: /app/data/playback-cache
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8007/health", timeout=3)']
       interval: 5s
       timeout: 4s
       retries: 12
@@ -269,3 +376,5 @@ secrets:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_key
   download_pause_token:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/download_pause_token
+  photos_auth:
+    file: ${PIXAV_MANAGED_PHOTOS_AUTH_SECRET:-.verify/managed-unconfigured/photos-auth.json}

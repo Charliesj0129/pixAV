@@ -1,9 +1,8 @@
 """Runner for the managed playback activity worker.
 
-It shares nothing with the upload guest: no account, no retained runtime, no
-staging root. It needs the Docker daemon for the isolated materialization
-container, read access to the storage read-back files it may offer as inputs,
-and write access to the playback cache it publishes verified objects into.
+The cold child only receives a fresh workspace and account-bound cookies over
+stdin. The parent uses the retained runtime's UI fence, the Docker daemon,
+verified read-back inputs and the writable playback cache, without staging.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import redis.asyncio as aioredis
 
 from pixav.config import Settings
 from pixav.pixel_injector.playback_activity import PhotosPlaybackMaterializer, PlaybackActivityWorker
+from pixav.shared.disk import build_download_space_guard
 from pixav.shared.pause import is_paused_value
 from pixav.shared.queue import TaskQueue
 from pixav.shared.workflow import PLAYBACK_QUEUE, require_workflow_role
@@ -54,16 +54,28 @@ async def run_playback_activity_worker(
 ) -> None:
     """Claim and report playback activities until cancelled."""
     await require_workflow_role(pool, "pixav_activity_worker")
+    disk_guard = build_download_space_guard(settings, redis)
     worker = build_worker(pool, settings)
     queue = TaskQueue(redis=redis, queue_name=PLAYBACK_QUEUE)
-    await queue.requeue_inflight()
+    recovered = False
     logger.info("managed playback worker started on %s", PLAYBACK_QUEUE)
-    while True:
-        if is_paused_value(await redis.get(settings.system_pause_key)):
-            await asyncio.sleep(5)
-            continue
-        await worker.run_one(queue)
-        await asyncio.sleep(poll_seconds)
+    try:
+        while True:
+            if is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            disk_status = await disk_guard.check_and_latch()
+            if disk_status.paused or is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            if not recovered:
+                await queue.requeue_inflight()
+                recovered = True
+            await worker.run_one(queue)
+            await asyncio.sleep(poll_seconds)
+    finally:
+        if isinstance(worker.materializer, PhotosPlaybackMaterializer) and worker.materializer._windows_runtime:
+            worker.materializer._windows_runtime.control.close()
 
 
 async def run_from_settings(settings: Settings, *, health_state: Any = None) -> None:

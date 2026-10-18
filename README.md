@@ -293,7 +293,13 @@ core rollback 停止 exact service containers，保留其 bind、secret 與 inst
 
 應用以 `PIXAV_SETTINGS_SECRETS_DIR` 載入 Pydantic 的 file secrets，容器的 DB password／Redis URL 分別掛至 `/run/secrets/PIXAV_DB_PASSWORD`、`PIXAV_REDIS_URL`；DB credentials／Redis URL／torrent password／provider API key 不進 Settings repr，DSN 依 URI 規則編碼。schema 與應用連線固定 `PIXAV_EXPECTED_DB_IDENTITY`／`PIXAV_EXPECTED_DB_NAME`，每個新 PostgreSQL pool connection 先核對後才初始化 codec；authority 啟動亦核對 `PIXAV_EXPECTED_REDIS_RUN_ID`，換實例時拒絕開始工作。Redis 計畫重啟後須重核新 run ID，再明確更新部署設定。
 
-`authority` 使用獨立非 superuser login、指定 Windows runtime／mTLS／daemon，所有 application role 限一 CPU／768 MiB／256 PIDs，非 root、drop ALL、唯讀 root、無 published port，不自動重啟。只有 authority 掛所需資料目錄、TLS client references 與 Docker socket；socket 的 readonly mount 仍允許 Docker API 操作，屬信任的控制端，停止行為另受 exact identity／UI fence 保護。health／metrics 只在容器網路提供，health 每五秒、timeout 四秒、grace 三十秒。Core 的 PG／Redis 健康不代表 application ownership 或 provider 就緒。
+`authority` 使用獨立非 superuser login、指定 Windows runtime／mTLS／daemon，所有 application role 限一 CPU／768 MiB／256 PIDs，非 root、drop ALL、唯讀 root、無 published port，不自動重啟。authority 與 activity workers 依職責掛資料目錄、TLS client references 與 Docker socket；socket 的 readonly mount 仍允許 Docker API 操作，屬信任的控制端，停止行為另受 exact identity／UI fence 保護。health／metrics 只在容器網路提供，health 每五秒、timeout 四秒、grace 三十秒。Core 的 PG／Redis 健康不代表 application ownership 或 provider 就緒。
+
+`storage`／`playback` profiles 各只選一個 [storage worker](src/pixav/pixel_injector/storage_worker.py)／[playback worker](src/pixav/pixel_injector/playback_worker.py)，使用 `pixav_worker` activity role，不能取得 authority／admin password。兩者固定 DB／Redis、原 Windows runtime／generation／owner、native identity、daemon 與 cold image；不自行 provision guest，也不啟動 legacy executor。storage 只讀 remuxed、寫 read-back 與原登錄 staging；staging 在 worker 內使用相同 host 絕對路徑，以保留 enrollment 的 device／inode 核對。playback 只讀 read-back、寫 cache，不掛 staging。`PIXAV_MANAGED_PROJECT_ROOT` 必須與 `PIXAV_MANAGED_DATA_ROOT=PROJECT_ROOT/data` 對應，讓冷 child 的工作目錄正確轉換成 daemon-host 路徑；未綁定時 preflight 拒絕。
+
+`PIXAV_MANAGED_PHOTOS_AUTH_SECRET` 指向 exact 0600 cookie-only file，其父目錄須 0700；只將該檔掛入 worker 的 `/run/photos-auth/cookies.json`，父目錄使用屬於 worker 的 0700 tmpfs。cookie 經 stdin 交給全新 cold child，不掛 DB／TLS／cookie 目錄到 child。實際合成容器已核對 nested file mount 的 0600／0700、非 root ownership 與可讀性；這不證明登入或帳號綁定完成。worker health／metrics 分別為 8005／8007，無 host port；父程序沿用一 CPU／768 MiB，cold child 的資源、timeout 與版本沿用上述獨立 storage-tools 契約。
+
+worker 每輪在 queue recovery／claim 前檢查 system pause 與同一個持久磁碟 latch，容量查詢後再檢查一次 system pause。暫停期間不搬動 in-flight queue、不 claim 活動；首次放行才恢復 FIFO，低磁碟或容量未知不自動解除 latch。global pause 的輪詢為五秒，正常活動輪詢一秒，容量 RPC 上限五秒。已啟動的活動仍受既有 lease／deadline 與 reconciliation 約束，停止新增 claim 不表示取消或重傳未知上傳。工作區契約及 Compose／preflight 已有隔離證據，當次 GPU generation／登入未重新驗收前不啟動 worker，live、故障恢復及 rollback 保持 OPEN。
 
 實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。當前 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用；完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
 
@@ -321,6 +327,15 @@ docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVA
 ```
 
 回退先停止 exact authority、核對其 ownership 已釋放，再使用相容 schema／fence 的舊 immutable image；保留資料、原 operation、秘密與 journal，不切回不能讀取 enrollment 或完整 APK 契約的 process。本輪依操作者指示不新增實際備份，既有還原資料保留。
+
+worker preflight 使用同一 project／env／daemon／DB／Redis 綁定，另外明確指定 project root、原 staging 與 cookie reference；通過只是靜態部署資格，不表示已取得 UI ownership：
+
+```bash
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV --profile storage --db-identity IDENTIFIER --database MANAGED_DATABASE --redis-run-id RUN_ID --data-root PRIVATE_DATA --secrets-root PRIVATE_SECRETS --project-root PRIVATE_PROJECT --staging-root REGISTERED_STAGING --photos-auth-secret PRIVATE_COOKIE_FILE
+# playback 用同一組實例與路徑參數，僅將 --profile storage 改為 --profile playback。
+```
+
+worker rollback 先保持 system pause，停止並核對 exact worker 及其 cold child；由 authority reconciliation 原 activity／UI fence 後，才部署理解同一契約的相容 immutable image。保留 read-back／cache／staging／secret 與 operation，不透過清 queue 觸發重新上傳；資料保全沿用本輪停止新增備份的操作者授權。
 
 ### Docker Runner 開發入口
 

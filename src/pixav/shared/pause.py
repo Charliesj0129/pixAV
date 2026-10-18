@@ -10,6 +10,8 @@ def is_paused_value(raw: Any) -> bool:
     """Accept legacy booleans and owned JSON pause records."""
     if raw is None:
         return False
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
     text = str(raw).strip()
     if not text:
         return False

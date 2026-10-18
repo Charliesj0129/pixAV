@@ -26,6 +26,7 @@ from pixav.pixel_injector.storage_activity import SegmentUploader, StorageActivi
 from pixav.pixel_injector.windows_control import WindowsHostClient
 from pixav.pixel_injector.windows_managed_runtime import WindowsManagedRuntime
 from pixav.pixel_injector.windows_storage import WINDOWS_PIXEL_MODE, WindowsSegmentUploader
+from pixav.shared.disk import build_download_space_guard
 from pixav.shared.pause import is_paused_value
 from pixav.shared.queue import TaskQueue
 from pixav.shared.workflow import STORAGE_QUEUE, require_workflow_role
@@ -136,15 +137,23 @@ async def run_storage_activity_worker(
 ) -> None:
     """Claim and report storage activities until cancelled."""
     await require_workflow_role(pool, "pixav_activity_worker")
+    disk_guard = build_download_space_guard(settings, redis)
     worker = build_worker(pool, settings, runtime, owner=owner)
     queue = TaskQueue(redis=redis, queue_name=STORAGE_QUEUE)
-    await queue.requeue_inflight()
+    recovered = False
     logger.info("managed storage worker started on %s", STORAGE_QUEUE)
     try:
         while True:
             if is_paused_value(await redis.get(settings.system_pause_key)):
                 await asyncio.sleep(5)
                 continue
+            disk_status = await disk_guard.check_and_latch()
+            if disk_status.paused or is_paused_value(await redis.get(settings.system_pause_key)):
+                await asyncio.sleep(5)
+                continue
+            if not recovered:
+                await queue.requeue_inflight()
+                recovered = True
             await worker.run_one(queue)
             await asyncio.sleep(poll_seconds)
     finally:

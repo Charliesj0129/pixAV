@@ -200,9 +200,91 @@ def validate_core(  # noqa: C901 -- explicit deployment refusals
             raise ValueError("CORE_PRIVATE_SECRET_REQUIRED")
 
 
+def validate_activity_mounts(service: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- exact bind contract
+    env = service["environment"]
+    project = args.project_root
+    staging = args.staging_root
+    if (
+        project is None
+        or staging is None
+        or args.data_root != project / "data"
+        or not project.is_absolute()
+        or project.resolve() != project
+        or not staging.is_absolute()
+        or staging.resolve() != staging
+        or not staging.is_dir()
+        or env.get("PIXAV_HOST_PROJECT_ROOT") != str(project)
+        or env.get("PIXAV_STORAGE_STAGING_DIR") != str(staging)
+        or env.get("PIXAV_STORAGE_READBACK_DIR") != "/app/data/storage-readback"
+        or env.get("PIXAV_PLAYBACK_CACHE_DIR") != "/app/data/playback-cache"
+        or env.get("PIXAV_PHOTOS_COLD_AUTH_SECRET") != "/run/photos-auth/cookies.json"
+        or service.get("command") != []
+    ):
+        raise ValueError("ACTIVITY_PATH_BINDING_INVALID")
+    try:
+        UUID(env["PIXAV_STORAGE_WORKER_OWNER"])
+        UUID(env["PIXAV_STORAGE_WINDOWS_RUNTIME_ID"])
+        if int(env["PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION"]) <= 0:
+            raise ValueError
+    except (KeyError, ValueError, TypeError):
+        raise ValueError("ACTIVITY_RUNTIME_BINDING_INVALID") from None
+    expected = {"/var/run/docker.sock": (Path("/var/run/docker.sock"), True)}
+    if args.profile == "storage":
+        expected.update(
+            {
+                "/app/data/remuxed": (args.data_root / "remuxed", True),
+                "/app/data/storage-readback": (args.data_root / "storage-readback", False),
+                str(staging): (staging, False),
+            }
+        )
+        probe = "/app/data/storage-readback"
+    else:
+        expected.update(
+            {
+                "/app/data/storage-readback": (args.data_root / "storage-readback", True),
+                "/app/data/playback-cache": (args.data_root / "playback-cache", False),
+            }
+        )
+        probe = "/app/data/playback-cache"
+    if env.get("PIXAV_DOWNLOAD_DIR") != probe:
+        raise ValueError("ACTIVITY_DISK_PROBE_PATH_INVALID")
+    mounts = service.get("volumes", [])
+    if len(mounts) != len(expected) or {row.get("target") for row in mounts} != set(expected):
+        raise ValueError("ACTIVITY_MOUNTS_INVALID")
+    for row in mounts:
+        source, readonly = expected[row["target"]]
+        if (
+            row.get("type") != "bind"
+            or row.get("source") != str(source)
+            or row.get("read_only", False) != readonly
+            or row.get("bind", {}).get("create_host_path") is not False
+        ):
+            raise ValueError("ACTIVITY_MOUNTS_INVALID")
+        if row["target"] == "/var/run/docker.sock":
+            if service.get("group_add") != [str(source.stat().st_gid)]:
+                raise ValueError("ACTIVITY_DOCKER_SOCKET_INVALID")
+        elif (
+            source.resolve() != source
+            or not source.is_dir()
+            or source.stat().st_uid != int(service["user"].split(":")[0])
+        ):
+            raise ValueError("ACTIVITY_MOUNTS_INVALID")
+    uid, gid = service["user"].split(":")
+    if service.get("tmpfs") != [
+        "/tmp:rw,nosuid,nodev,size=64m,mode=1777",  # noqa: S108 -- bounded container tmpfs contract
+        f"/run/photos-auth:rw,nosuid,nodev,noexec,size=1m,mode=0700,uid={uid},gid={gid}",
+    ] or not service.get("healthcheck", {}).get("test"):
+        raise ValueError("ACTIVITY_PRIVATE_WORKSPACE_INVALID")
+
+
 def validate_application(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed managed roles
     profile = args.profile
-    expected = {"migrate", "provision"} if profile == "schema" else {"maxwell_core"}
+    expected = {
+        "schema": {"migrate", "provision"},
+        "authority": {"maxwell_core"},
+        "storage": {"storage_worker"},
+        "playback": {"playback_worker"},
+    }[profile]
     if set(config["services"]) != expected or not args.db_identity or not args.database:
         raise ValueError("APPLICATION_BINDING_REQUIRED")
     images = {service.get("image", "") for service in config["services"].values()}
@@ -212,6 +294,8 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         "migrate": "scripts.migrate",
         "provision": "scripts.provision_workflow_roles",
         "maxwell_core": "pixav.maxwell_core.worker",
+        "storage_worker": "pixav.pixel_injector.storage_worker",
+        "playback_worker": "pixav.pixel_injector.playback_worker",
     }
     secret_targets = {
         "migrate": {"postgres_password": "/run/secrets/PIXAV_DB_PASSWORD"},
@@ -226,6 +310,10 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
             "download_pause_token": "/run/secrets/download_pause_token",
         },
     }
+    for name in ["storage_worker", "playback_worker"]:
+        secret_targets[name] = {
+            key: target for key, target in secret_targets["maxwell_core"].items() if key != "authority_password"
+        } | {"worker_password": "/run/secrets/PIXAV_DB_PASSWORD", "photos_auth": "/run/photos-auth/cookies.json"}
     for name, service in config["services"].items():
         mounted = service.get("secrets", [])
         if (
@@ -279,7 +367,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
             if (
                 not args.redis_run_id
                 or env.get("PIXAV_EXPECTED_REDIS_RUN_ID") != args.redis_run_id
-                or env.get("PIXAV_DB_USER") != "pixav_authority"
+                or env.get("PIXAV_DB_USER") != ("pixav_authority" if profile == "authority" else "pixav_worker")
                 or env.get("PIXAV_MANAGED_MEDIA_WORKFLOW") != "true"
                 or env.get("PIXAV_PIXEL_INJECTOR_MODE") != "windows_android"
                 or env.get("PIXAV_LOCAL_CLEANUP_APPLY") != "false"
@@ -291,6 +379,9 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
                 or env.get("PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE") != "/run/secrets/download_pause_token"
             ):
                 raise ValueError("AUTHORITY_EXECUTION_BINDING_INVALID")
+            if profile in {"storage", "playback"}:
+                validate_activity_mounts(service, args)
+                continue
             mounts = service.get("volumes", [])
             targets = {"/var/run/docker.sock"} | {
                 "/app/data/" + name for name in ["downloads", "remuxed", "library", "artwork", "playback-cache"]
@@ -320,10 +411,17 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
                     raise ValueError("AUTHORITY_MOUNTS_INVALID")
     if args.secrets_root is None or stat.S_IMODE(args.secrets_root.stat().st_mode) != 0o700:
         raise ValueError("APPLICATION_PRIVATE_SECRETS_REQUIRED")
-    for secret in config.get("secrets", {}).values():
+    if set(config.get("secrets", {})) != {key for name in expected for key in secret_targets[name]}:
+        raise ValueError("APPLICATION_ROLE_SECRETS_INVALID")
+    for name, secret in config.get("secrets", {}).items():
         path = Path(secret.get("file", ""))
+        if name == "photos_auth":
+            if path != args.photos_auth_secret or stat.S_IMODE(path.parent.stat().st_mode) != 0o700:
+                raise ValueError("ACTIVITY_PRIVATE_AUTH_REQUIRED")
+        elif path.parent != args.secrets_root:
+            raise ValueError("APPLICATION_PRIVATE_SECRETS_REQUIRED")
         if (
-            path.parent != args.secrets_root
+            not path.is_absolute()
             or path.resolve() != path
             or not path.is_file()
             or stat.S_IMODE(path.stat().st_mode) != 0o600
@@ -397,9 +495,16 @@ def main() -> None:
     parser.add_argument("--context", required=True)
     parser.add_argument("--daemon-id", required=True)
     parser.add_argument("--env-file", type=Path, required=True)
-    parser.add_argument("--profile", choices=["windows-tools", "core", "schema", "authority"], default="windows-tools")
+    parser.add_argument(
+        "--profile",
+        choices=["windows-tools", "core", "schema", "authority", "storage", "playback"],
+        default="windows-tools",
+    )
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--secrets-root", type=Path)
+    parser.add_argument("--project-root", type=Path)
+    parser.add_argument("--staging-root", type=Path)
+    parser.add_argument("--photos-auth-secret", type=Path)
     parser.add_argument("--db-identity")
     parser.add_argument("--database")
     parser.add_argument("--redis-run-id")
