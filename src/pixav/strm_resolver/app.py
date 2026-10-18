@@ -13,7 +13,9 @@ import asyncpg
 from fastapi import FastAPI
 from redis import asyncio as aioredis
 
-from pixav.config import get_settings
+from pixav.config import Settings, get_settings
+from pixav.shared.db import connection_initializer
+from pixav.shared.redis_client import create_redis
 from pixav.shared.workflow import require_workflow_role
 from pixav.strm_resolver.cache_janitor import PlaybackCacheJanitor, run_janitor
 from pixav.strm_resolver.middleware import PlaybackAuthMiddleware, RateLimitMiddleware, setup_cors
@@ -24,9 +26,16 @@ from pixav.strm_resolver.routes import router
 logger = logging.getLogger(__name__)
 
 
-async def _open_database(dsn: str, redis_client: aioredis.Redis | None) -> asyncpg.Pool:
+async def _open_database(
+    dsn: str, redis_client: aioredis.Redis | None, *, settings: Settings | None = None
+) -> asyncpg.Pool:
     try:
-        return await asyncio.wait_for(asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5), timeout=10)
+        return await asyncio.wait_for(
+            asyncpg.create_pool(
+                dsn=dsn, min_size=1, max_size=5, init=connection_initializer(settings or get_settings())
+            ),
+            timeout=10,
+        )
     except Exception as exc:
         logger.warning("postgres unavailable at startup (%s)", type(exc).__name__)
         if redis_client is not None:
@@ -44,6 +53,21 @@ async def _require_reader(db_pool: asyncpg.Pool, redis_client: aioredis.Redis | 
         if redis_client is not None:
             await redis_client.aclose()
         raise
+
+
+async def _open_redis(url: str, settings: Settings) -> aioredis.Redis | None:
+    client = None
+    try:
+        client = await asyncio.wait_for(create_redis(settings.model_copy(update={"redis_url": url})), timeout=10)
+        await asyncio.wait_for(client.ping(), timeout=3)
+        return client
+    except Exception as exc:
+        logger.warning("redis unavailable at startup (%s)", type(exc).__name__)
+        if client is not None:
+            await client.aclose()
+        if settings.expected_redis_run_id:
+            raise RuntimeError("Redis instance binding required for configured playback") from None
+        return None
 
 
 def _start_janitor(app: FastAPI, db_pool: asyncpg.Pool | None) -> asyncio.Task[None] | None:
@@ -66,19 +90,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     db_dsn: str | None = app.state.db_dsn
     redis_client: aioredis.Redis | None = None
     db_pool: asyncpg.Pool | None = None
+    settings: Settings = app.state.settings
 
     # Initialize resources
     if redis_url:
-        try:
-            redis_client = aioredis.from_url(redis_url, encoding="utf-8", decode_responses=True)
-            await redis_client.ping()
-            app.state.redis = redis_client
-        except Exception as exc:
-            logger.warning("redis unavailable at startup (%s)", type(exc).__name__)
-            app.state.redis = None
+        redis_client = await _open_redis(redis_url, settings)
+        app.state.redis = redis_client
 
     if db_dsn:
-        db_pool = await _open_database(db_dsn, redis_client)
+        db_pool = await _open_database(db_dsn, redis_client, settings=settings)
         if app.state.require_reader_role:
             await _require_reader(db_pool, redis_client)
         app.state.db_pool = db_pool
@@ -114,8 +134,22 @@ def create_app(
         db_dsn = settings.dsn
     if redis_url == "auto":
         redis_url = settings.redis_url
+    if settings.managed_media_workflow and not all(
+        (
+            db_dsn,
+            redis_url,
+            settings.resolver_require_reader_role,
+            settings.resolver_auth_required,
+            settings.resolver_token_file,
+            settings.expected_db_identity,
+            settings.expected_db_name,
+            settings.expected_redis_run_id,
+        )
+    ):
+        raise RuntimeError("Managed playback requires private authentication and bound reader instances")
 
     app = FastAPI(title="pixAV Strm-Resolver", lifespan=lifespan)
+    app.state.settings = settings
     app.state.redis_url = redis_url
     app.state.db_dsn = db_dsn
     app.state.redis = None

@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,124 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,138 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -585,7 +585,7 @@ managed prepare 使用 `PIXAV_MEDIA_SEGMENT_TARGET_BYTES`（預設 9,500,000,000
 
 Photos 原件回載的 browser navigation timeout 為 60 秒、選單操作 30 秒，下載啟動等待最多 10 分鐘，整個隔離程序仍受 6 小時 deadline 約束。managed cold path 只接受分享頁唯一的影片，等到影片檢視可用後，選取該檢視的選單並使用原件 Download 操作；provider filename、完整 size／SHA-256 及媒體資訊仍須符合 manifest。這個操作已在新 session 實測取得完整原件；Download all 的 ZIP 建立則曾反覆逾時。錯誤檔名、播放用 rendition、缺段或多個候選都不能放行 DURABLE；逾時仍交既有 infrastructure retry，不回到 upload stage。
 
-resolver 有設定 PostgreSQL 時，啟動連線最多等待 10 秒；失敗即退出，由容器 restart policy 重試，避免 DB 恢復後仍持續回 503。`/health` 在有設定 DB 時，以最多 2 秒的 `SELECT 1` 核對依賴，讀不到 facts 就回 503；Redis 仍可降級為無 cache。
+resolver 有設定 PostgreSQL 時，啟動連線最多等待 10 秒；失敗即退出，待依部署策略明確重啟，避免 DB 恢復後仍持續回 503。每個新 connection 在 codec 初始化前核對預期 cluster／database，pool connection 重建也必須重驗。Redis instance 檢查最多 10 秒、PING 最多 3 秒；有設定 expected run ID 時，錯誤實例或無法核對就退出，僅未綁定的 legacy 模式可降級為無 cache。`/health` 在有設定 DB 時，以最多 2 秒的 `SELECT 1` 核對依賴，讀不到 facts 就回 503。
 
 cleanup 增補 [021 migration](migrations/021_cleanup_journal.sql) 與單檔 `cleanup_journal`。janitor 在 publication advisory lock 後取得 video row lock，重查掃描時的 `local_path`；依 canonical path 核對其他 video、workflow artifact、remote segment 與有效 reader 引用。共用路徑目前一律拒絕，尚未提供整組授權／一次 unlink。單一目標在 unlink 前以獨立交易提交 intent，保存 device／inode、size、mtime／ctime、hash 與 parent identity；unlink 後 fsync parent，domain 路徑、audit 與 journal 完成狀態在同一交易提交。`LocalFileJanitor.recover()` 預設唯讀，只接受已有 committed intent、parent identity 及 domain path 一致的缺檔；存在或被替換的檔案保留 pending，不重刪。此功能須先套用 expand migration；正式 cleanup apply 維持關閉。
 
@@ -620,6 +620,8 @@ repository 已退休舊隔離 Compose 模板。新的 managed deployment 必須�
 ### 私有 Jellyfin 部署
 
 目前沒有 repository 內的 Jellyfin 部署 Compose；新隔離部署只向認證 gateway 開放 loopback，Jellyfin origin 不對外發布，錄影 client 不得直連 origin 或讀 staging。library root 整體唯讀掛載，保留 publication 相對 symlink，設定與觀看紀錄納入加密備份。
+
+managed resolver factory 必須同時提供 DB／Redis 連線、expected instance IDs、reader role、私有認證與 token file，缺一即拒絕啟動。工作區已用專用 PostgreSQL／Redis 與獨立非 superuser reader login 驗證完整 startup：錯誤 cluster／database／Redis run ID 拒絕，正確 pool 重建仍重驗；未授權 service 請求及旋轉前的 token 被拒絕，旋轉後的新 token 可進入正常路由。此為 resolver service 認證，未證明 Jellyfin 裝置撤銷、任何媒體 READY 或實播；當次測試沒有 provider 請求，新部署與 client gateway 驗收仍待完成。
 
 Jellyfin 只取得 pixAV 穩定 URL，不取得 provider URL、cookie 或 token。未授權 client 與撤銷裝置必須實測拒絕；多段、seek、resume 及全部交界須有新錄影與人工確認。[官方容器說明](https://jellyfin.org/docs/general/installation/container/)的部署限制與當次 live contract 仍適用，工具或容器健康不代表 production promotion。
 

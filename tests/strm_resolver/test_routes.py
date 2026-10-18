@@ -80,6 +80,81 @@ async def test_failed_database_startup_exits_and_closes_optional_redis(app, capl
     assert "private connection detail" not in caplog.text
 
 
+async def test_resolver_checks_database_identity_before_initializing_each_connection(monkeypatch):
+    from pixav.config import Settings
+
+    settings = Settings(expected_db_identity="123", expected_db_name="synthetic_database")
+    monkeypatch.setattr("pixav.strm_resolver.app.get_settings", lambda: settings)
+    app = create_app(redis_url=None, db_dsn="postgresql://synthetic")
+    pool = AsyncMock()
+    captured = {}
+
+    async def connect(**kwargs):
+        captured.update(kwargs)
+        return pool
+
+    with patch("pixav.strm_resolver.app.asyncpg.create_pool", side_effect=connect):
+        async with lifespan(app):
+            pass
+    initializer = captured.get("init")
+    assert callable(initializer), "resolver omitted the managed database identity initializer"
+    connection = AsyncMock()
+    connection.fetchrow.return_value = {"identity": "different-cluster", "database": "synthetic_database"}
+    with pytest.raises(RuntimeError, match="DATABASE_INSTANCE_BINDING_CHANGED"):
+        await initializer(connection)
+
+
+async def test_resolver_refuses_mismatched_bound_redis_before_opening_database(monkeypatch, caplog):
+    from pixav.config import Settings
+
+    settings = Settings(expected_redis_run_id="a" * 40)
+    monkeypatch.setattr("pixav.strm_resolver.app.get_settings", lambda: settings)
+    app = create_app(redis_url="redis://synthetic", db_dsn="postgresql://synthetic")
+    redis = AsyncMock()
+    redis.info.return_value = {"run_id": "b" * 40}
+    with (
+        patch("pixav.strm_resolver.app.aioredis.from_url", return_value=redis),
+        patch("pixav.strm_resolver.app._open_database", return_value=AsyncMock()) as database,
+    ):
+        with pytest.raises(RuntimeError, match="Redis instance binding required"):
+            async with lifespan(app):
+                pytest.fail("resolver must not accept a different Redis instance")
+    database.assert_not_awaited()
+    redis.aclose.assert_awaited_once()
+    assert "redis://synthetic" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "resolver_auth_required",
+        "resolver_require_reader_role",
+        "resolver_token_file",
+        "expected_db_identity",
+        "expected_db_name",
+        "expected_redis_run_id",
+    ],
+)
+def test_managed_resolver_cannot_start_with_public_or_unbound_configuration(monkeypatch, tmp_path, field):
+    from pixav.config import Settings
+
+    settings = Settings(
+        managed_media_workflow=True,
+        resolver_auth_required=True,
+        resolver_require_reader_role=True,
+        resolver_token_file=str(tmp_path / "token"),
+        expected_db_identity="123",
+        expected_db_name="synthetic_database",
+        expected_redis_run_id="a" * 40,
+        playback_cache_dir=str(tmp_path / "cache"),
+    )
+    monkeypatch.setattr("pixav.strm_resolver.app.get_settings", lambda: settings)
+    assert create_app() is not None
+    settings = settings.model_copy(update={field: False if field.endswith(("required", "role")) else ""})
+    with pytest.raises(RuntimeError, match="Managed playback requires"):
+        create_app()
+
+
 @pytest.mark.asyncio
 async def test_metrics_endpoint_exposes_prometheus_payload(app):
     """Strm-Resolver must honour the shared /metrics contract, not 404."""
