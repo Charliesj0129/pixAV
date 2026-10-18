@@ -236,7 +236,14 @@ def authority_config(core_config, monkeypatch):
     _, data, secrets = core_config
     for name in ["downloads", "remuxed", "library", "artwork", "playback-cache"]:
         (data / name).mkdir()
-    names = ["authority_password", "redis_client_url", "windows_ca", "windows_certificate", "windows_key"]
+    names = [
+        "authority_password",
+        "redis_client_url",
+        "windows_ca",
+        "windows_certificate",
+        "windows_key",
+        "download_pause_token",
+    ]
     for name in names:
         (secrets / name).write_text("synthetic-private-value")
         (secrets / name).chmod(0o600)
@@ -255,6 +262,8 @@ def authority_config(core_config, monkeypatch):
         "PIXAV_EXPECTED_REDIS_RUN_ID": "a" * 40,
         "PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID": "synthetic-daemon",
         "PIXAV_MANAGED_DOCKER_GID": "1337",
+        "PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256": "c" * 64,
+        "PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE": "123",
     }
     encoded = re.sub(
         r"\$\{([^}:]+)(?::([-?])([^}]*))?\}",

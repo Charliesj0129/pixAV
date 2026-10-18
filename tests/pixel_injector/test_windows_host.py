@@ -347,6 +347,101 @@ async def test_readiness_client_rejects_replayed_or_invalid_receipt(host, defect
         client.readiness(subject)
 
 
+async def test_capacity_is_read_only_during_active_ui_ownership(host):
+    host.control.capacity = lambda: dict(volume_root="D:\\", volume_device=123, total_bytes=1000, free_bytes=500)
+    await host.claim(request(host.manifest))
+    before = host.journal.read_bytes()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(host)), base_url="https://synthetic"
+    ) as client:
+        subject = readiness_request(host)
+        response = await client.post("/v1/capacity", content=subject.model_dump_json())
+        assert response.status_code == 200
+        assert response.json()["nonce"] == str(subject.nonce)
+        bad = subject.model_copy(update={"runtime_generation": subject.runtime_generation + 1})
+        response = await client.post("/v1/capacity", content=bad.model_dump_json())
+        assert response.status_code == 409
+    assert host.journal.read_bytes() == before
+
+
+@pytest.mark.parametrize("defect", ["nonce", "generation", "impossible-free", "naive-clock"])
+async def test_capacity_client_rejects_invalid_or_replayed_receipts(host, defect):
+    host.control.capacity = lambda: dict(volume_root="D:\\", volume_device=123, total_bytes=1000, free_bytes=500)
+    subject = readiness_request(host)
+    payload = await host.capacity(subject)
+    if defect == "nonce":
+        payload["nonce"] = str(uuid.uuid4())
+    elif defect == "generation":
+        payload["runtime_generation"] += 1
+    elif defect == "impossible-free":
+        payload["free_bytes"] = payload["total_bytes"] + 1
+    else:
+        payload["observed_at"] = "2026-10-16T00:00:00"
+    client = object.__new__(WindowsHostClient)
+    client.call = lambda *args: payload
+    with pytest.raises(CanaryBlockedError, match="physical capacity"):
+        client.capacity(subject)
+
+
+def test_native_capacity_refuses_changed_physical_volume(manifest, monkeypatch):
+    import pixav.pixel_injector.windows_host as module
+
+    control = object.__new__(NativeControl)
+    control.manifest = manifest
+    control.environment_error = False
+    control.environment_files = SimpleNamespace(verify=lambda: None)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        module, "Path", lambda _: SimpleNamespace(anchor="D:\\", stat=lambda: SimpleNamespace(st_dev=0))
+    )
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda _: pytest.fail("read capacity from wrong volume"))
+    assert manifest.native.environment.avd_directory_device != 0
+    with pytest.raises(NativeControlError, match="VOLUME_CHANGED"):
+        control.capacity()
+
+
+async def test_capacity_probe_binds_volume_refreshes_nonce_and_closes_transport(host, monkeypatch):
+    from pixav.config import Settings
+    from pixav.pixel_injector.windows_control import WindowsCapacityProbe
+    from pixav.pixel_injector.windows_host_models import HostCapacityReceipt
+
+    subjects, closes = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["timeout_seconds"] == 5
+
+        def capacity(self, subject):
+            subjects.append(subject)
+            return HostCapacityReceipt(
+                **subject.model_dump(),
+                volume_root="D:\\",
+                volume_device=123,
+                total_bytes=1000,
+                free_bytes=500,
+                observed_at="2026-10-16T00:00:00Z",
+            )
+
+        def close(self):
+            closes.append(True)
+
+    monkeypatch.setattr("pixav.pixel_injector.windows_control.WindowsHostClient", Client)
+    settings = Settings(
+        storage_windows_runtime_id=str(host.manifest.runtime_id),
+        storage_windows_runtime_generation=host.manifest.runtime_generation,
+        windows_control_identity_sha256=host.manifest.identity_sha256,
+        windows_capacity_volume_device=123,
+    )
+    probe = WindowsCapacityProbe(settings)
+    assert (await probe()).free_bytes == 500
+    assert (await probe()).free_bytes == 500
+    assert subjects[0].nonce != subjects[1].nonce
+    probe = WindowsCapacityProbe(settings.model_copy(update={"windows_capacity_volume_device": 456}))
+    with pytest.raises(CanaryBlockedError, match="volume changed"):
+        await probe()
+    assert len(closes) == 3
+
+
 def test_native_observation_requires_actual_environment_verification(manifest):
     control = object.__new__(NativeControl)
     control.manifest = manifest

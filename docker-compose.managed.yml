@@ -68,6 +68,8 @@ services:
       PIXAV_LOCAL_CLEANUP_APPLY: "false"
       PIXAV_UPLOAD_MAX_CONCURRENCY: "1"
       PIXAV_DOWNLOAD_DIR: /app/data/downloads
+      PIXAV_DOWNLOAD_MIN_FREE_BYTES: ${PIXAV_DOWNLOAD_MIN_FREE_BYTES:-107374182400}
+      PIXAV_DOWNLOAD_MIN_FREE_PERCENT: ${PIXAV_DOWNLOAD_MIN_FREE_PERCENT:-10}
       PIXAV_REMUX_DIR: /app/data/remuxed
       PIXAV_LIBRARY_ROOT: /app/data/library
       PIXAV_ARTWORK_ROOT: /app/data/artwork
@@ -80,6 +82,9 @@ services:
       PIXAV_WINDOWS_CONTROL_CERTIFICATE: /run/secrets/windows_certificate
       PIXAV_WINDOWS_CONTROL_KEY: /run/secrets/windows_key
       PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID: ${PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID:-UNBOUND}
+      PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256: ${PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256:-UNBOUND}
+      PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE: ${PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE:-0}
+      PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE: /run/secrets/download_pause_token
       PIXAV_STORAGE_READBACK_IMAGE: ${PIXAV_MANAGED_COLD_IMAGE:-UNBOUND}
     secrets:
       - source: authority_password
@@ -89,6 +94,7 @@ services:
       - windows_ca
       - windows_certificate
       - windows_key
+      - download_pause_token
     group_add: ['${PIXAV_MANAGED_DOCKER_GID:-0}']
     volumes:
       - type: bind
@@ -261,3 +267,5 @@ secrets:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_certificate
   windows_key:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/windows_key
+  download_pause_token:
+    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/download_pause_token

@@ -15,7 +15,7 @@ from pixav.media_loader.remuxer import FFmpegRemuxer
 from pixav.media_loader.service import MediaLoaderService
 from pixav.shared.db import create_pool
 from pixav.shared.dead_letter import DeadLetterStore
-from pixav.shared.disk import DownloadSpaceGuard
+from pixav.shared.disk import build_download_space_guard
 from pixav.shared.enums import TaskState
 from pixav.shared.exceptions import DownloadError
 from pixav.shared.metrics import record_task_failed, record_task_processed, record_task_retried
@@ -122,13 +122,7 @@ async def run_loop(  # noqa: C901
             retention_days=settings.dlq_retention_days,
             max_items_per_stage=settings.dlq_max_items_per_stage,
         )
-        disk_guard = DownloadSpaceGuard(
-            redis,
-            path=settings.download_dir,
-            pause_key=settings.download_pause_key,
-            min_free_bytes=settings.download_min_free_bytes,
-            min_free_percent=settings.download_min_free_percent,
-        )
+        disk_guard = build_download_space_guard(settings, redis)
         egress_monitor = build_egress_monitor(settings, redis)
 
         client = QBitClient(

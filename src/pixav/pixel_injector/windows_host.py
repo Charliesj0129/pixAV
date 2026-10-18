@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import tempfile
@@ -25,6 +26,7 @@ from pydantic import ValidationError
 
 from pixav.pixel_injector.windows_environment import EnvironmentFiles
 from pixav.pixel_injector.windows_host_models import (
+    HostCapacityReceipt,
     HostHaltReceipt,
     HostReadinessReceipt,
     HostReadinessRequest,
@@ -70,6 +72,19 @@ class NativeControl:
                     self.environment_files.verify()
                 except (OSError, ValueError):
                     raise NativeControlError("NATIVE_ENVIRONMENT_BINDING_CHANGED") from None
+
+    def capacity(self) -> dict:
+        """Read the pinned Windows volume without ADB, UI effects or a guest claim."""
+        self._verify_environment("capacity")
+        environment = self.manifest.native.environment
+        if os.name != "nt" or environment is None or self.environment_files is None:
+            raise NativeControlError("NATIVE_CAPACITY_ENVIRONMENT_UNAVAILABLE")
+        root = Path(environment.avd_path).anchor
+        device = Path(root).stat().st_dev
+        if device != environment.avd_directory_device:
+            raise NativeControlError("NATIVE_CAPACITY_VOLUME_CHANGED")
+        usage = shutil.disk_usage(root)
+        return {"volume_root": root, "volume_device": device, "total_bytes": usage.total, "free_bytes": usage.free}
 
     def _invoke(self, mode: str, subject: HostUIRequest | HostReadinessRequest) -> dict:
         payload = {**self.manifest.native.payload(), "session_id": str(subject.session_id)}
@@ -214,6 +229,14 @@ class WindowsHost:
                 quiescent=True,
             ).model_dump(mode="json")
 
+    async def capacity(self, request: HostReadinessRequest) -> dict:
+        self._binding(request)
+        # Capacity is independent of UI ownership and never changes its journal.
+        observation = await asyncio.to_thread(self.control.capacity)
+        return HostCapacityReceipt(
+            **request.model_dump(), **observation, observed_at=datetime.now(timezone.utc)
+        ).model_dump(mode="json")
+
     async def claim(self, request: HostUIRequest) -> dict:
         async with self.lock:
             self._binding(request)
@@ -312,14 +335,14 @@ def create_app(host: WindowsHost) -> FastAPI:
 
     @app.post("/v1/{operation}")
     async def control(
-        operation: Literal["claim", "observe", "halt", "verify-halt", "readiness"], request: Request
+        operation: Literal["claim", "observe", "halt", "verify-halt", "readiness", "capacity"], request: Request
     ) -> dict:
         if request.headers.get("transfer-encoding") or not request.headers.get("content-length", "").isdigit():
             raise HTTPException(400, "INVALID_REQUEST_FRAMING")
         if int(request.headers["content-length"]) > 16384:
             raise HTTPException(413, "REQUEST_TOO_LARGE")
         try:
-            model = HostReadinessRequest if operation == "readiness" else HostUIRequest
+            model = HostReadinessRequest if operation in {"readiness", "capacity"} else HostUIRequest
             subject = model.model_validate_json(await request.body())
         except (ValueError, ValidationError):
             raise HTTPException(400, "INVALID_REQUEST") from None

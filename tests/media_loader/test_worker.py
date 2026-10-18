@@ -56,7 +56,7 @@ def _wire_common_patches(
         FFmpegRemuxer=Mock(return_value=object()),
         StashMetadataScraper=Mock(return_value=object()),
         MediaLoaderService=Mock(return_value=service),
-        DownloadSpaceGuard=Mock(return_value=disk_guard),
+        build_download_space_guard=Mock(return_value=disk_guard),
     )
 
 

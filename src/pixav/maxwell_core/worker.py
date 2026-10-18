@@ -18,7 +18,7 @@ from pixav.maxwell_core.gc import LocalFileJanitor, OrphanTaskCleaner
 from pixav.maxwell_core.orchestrator import MaxwellOrchestrator
 from pixav.maxwell_core.scheduler import LruAccountScheduler
 from pixav.shared.db import create_pool
-from pixav.shared.disk import DownloadSpaceGuard
+from pixav.shared.disk import build_download_space_guard
 from pixav.shared.enums import TaskState
 from pixav.shared.metrics import (
     record_source_adapter_error,
@@ -325,13 +325,7 @@ async def run_loop(  # noqa: C901
             library_root=settings.library_root,
             apply_deletions=settings.local_cleanup_apply,
         )
-        disk_guard = DownloadSpaceGuard(
-            redis,
-            path=settings.download_dir,
-            pause_key=settings.download_pause_key,
-            min_free_bytes=settings.download_min_free_bytes,
-            min_free_percent=settings.download_min_free_percent,
-        )
+        disk_guard = build_download_space_guard(settings, redis)
 
         orchestrator = MaxwellOrchestrator(
             scheduler=scheduler,

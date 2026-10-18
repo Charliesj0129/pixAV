@@ -40,6 +40,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - 磁碟餘額須同時核對 WSL／Docker VHD 所在實體分區；虛擬檔案系統餘額不代替實體容量。Docker 資料磁碟搬移須先完整盤點、獨立備份還原與容量守衛，再取得明確搬移授權；停止的其他專案不得隨 daemon 恢復而自動啟動。
 - 本輪已授權的 Docker 搬移及精確舊 C 副本清除已完成，資料與開機 distro 位於 D 槽，未重啟全 WSL；後續新搬移或新增其他專案中斷範圍須另行核對授權。可重建 build／工具 cache 的清理須逐筆核對 manifest，保留映像、設定與重建入口；不可藉精簡清除媒體、guest、intents 或驗收 evidence，未核實 VHD 實體餘額前不宣稱已騰出 Windows 空間。
 - 保留 local retention、100 GiB／10% disk latch、symlink/path containment、open-task guard、FIFO/in-flight recovery、有限 retry。磁碟壓力或 terminal failure 不豁免 durability gate。DB clock 決定 quota/retry 與持久期限；heartbeat 用 monotonic clock。
+- 2026-10-18 操作者授權本輪隔離續作至 D 槽剩餘 25 GiB 才停止；本輪私有容量設定可覆寫 100 GiB／10% 預設，在實體餘額小於等於 25 GiB 時停止新增工作並收斂既有操作。預設政策及其餘資料／durability 守衛不變。
 - `pixav-local://` 播放檔不可當遠端備份而刪除；projection 不完整拒絕 cleanup。cache 可重建但 eviction 仍等待 reader 釋放；首段不能代表整片，缺段與 manifest 不符拒絕 READY。
 - 只用自己的 token 解除 pause，不直接刪 key；DLQ 不自動 replay，人工 replay 留操作者、原因與原 attempt 歷史。VPN kill switch 阻流且須實測，出口 IP 比對只告警。
 - 登入 challenge 停 retry 進 USER_ACTION_REQUIRED 交人工，不重送帳密。保留 ownership、guest/checkpoint 與未知副作用的 reconciliation 資料。

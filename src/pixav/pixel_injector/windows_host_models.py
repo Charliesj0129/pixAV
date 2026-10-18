@@ -108,6 +108,21 @@ class HostReadinessReceipt(HostRuntimeBinding):
         return self
 
 
+class HostCapacityReceipt(HostRuntimeBinding):
+    nonce: UUID
+    volume_root: str = Field(pattern=r"^[A-Za-z]:\\$")
+    volume_device: int = Field(ge=0, strict=True)
+    total_bytes: int = Field(gt=0, strict=True)
+    free_bytes: int = Field(ge=0, strict=True)
+    observed_at: datetime
+
+    @model_validator(mode="after")
+    def valid_capacity(self) -> HostCapacityReceipt:
+        if self.free_bytes > self.total_bytes or self.observed_at.tzinfo is None:
+            raise ValueError("invalid physical capacity observation")
+        return self
+
+
 class HostUIRequest(HostRuntimeBinding):
     session_id: UUID
     session_token: UUID = Field(repr=False)

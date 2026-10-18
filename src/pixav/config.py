@@ -115,6 +115,7 @@ class Settings(BaseSettings):
     media_segment_target_bytes: int = Field(default=9_500_000_000, gt=0, lt=10_000_000_000)
     download_min_free_bytes: int = 100 * 1024**3
     download_min_free_percent: float = 10.0
+    download_pause_token_file: str = ""
     local_cleanup_success_hours: int = 24
     local_cleanup_failure_days: int = 7
     local_cleanup_batch_size: int = 100
@@ -156,6 +157,8 @@ class Settings(BaseSettings):
     windows_control_certificate: str = ""
     windows_control_key: str = ""
     windows_control_docker_daemon_id: str = ""
+    windows_control_identity_sha256: str = ""
+    windows_capacity_volume_device: int | None = Field(default=None, ge=0)
 
     # VPN egress detection (secondary to gluetun's kill switch, never a latch)
     # Empty URL disables the check: both observers must agree on one endpoint,

@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import ssl
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 
 import httpx
 
 from pixav.pixel_injector.errors import CanaryBlockedError
 from pixav.pixel_injector.windows_host_models import (
+    HostCapacityReceipt,
     HostHaltReceipt,
     HostReadinessReceipt,
     HostReadinessRequest,
+    HostRuntimeBinding,
     HostUIRequest,
 )
 
 if TYPE_CHECKING:
+    from pixav.config import Settings
     from pixav.pixel_injector.session import WindowsAndroidSession
+    from pixav.shared.disk import PhysicalCapacity
     from pixav.shared.photos_ui_session import PhotosUITicket
 
 
@@ -71,6 +77,51 @@ class WindowsHostClient:
         if any(receipt.model_dump().get(key) != value for key, value in request.model_dump().items()):
             raise CanaryBlockedError("Windows readiness response binding changed")
         return receipt
+
+    def capacity(self, request: HostReadinessRequest) -> HostCapacityReceipt:
+        try:
+            receipt = HostCapacityReceipt.model_validate(self.call("capacity", request))
+        except ValueError:
+            raise CanaryBlockedError("Windows physical capacity response invalid") from None
+        if any(receipt.model_dump().get(key) != value for key, value in request.model_dump().items()):
+            raise CanaryBlockedError("Windows physical capacity binding changed")
+        return receipt
+
+
+class WindowsCapacityProbe:
+    """Read the enrolled physical volume using a fresh nonce and bounded mTLS."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._binding = HostRuntimeBinding(
+            runtime_id=UUID(settings.storage_windows_runtime_id),
+            runtime_generation=settings.storage_windows_runtime_generation,
+            identity_sha256=settings.windows_control_identity_sha256,
+        )
+        if settings.windows_capacity_volume_device is None:
+            raise ValueError("Windows capacity requires the enrolled volume identity")
+
+    def _read(self) -> PhysicalCapacity:
+        from pixav.shared.disk import PhysicalCapacity
+
+        settings = self._settings
+        client = WindowsHostClient(
+            settings.windows_control_url,
+            ca=Path(settings.windows_control_ca),
+            certificate=Path(settings.windows_control_certificate),
+            key=Path(settings.windows_control_key),
+            timeout_seconds=5,
+        )
+        try:
+            receipt = client.capacity(HostReadinessRequest(**self._binding.model_dump(), nonce=uuid4()))
+            if receipt.volume_device != settings.windows_capacity_volume_device:
+                raise CanaryBlockedError("Windows physical capacity volume changed")
+            return PhysicalCapacity(receipt.volume_root, receipt.total_bytes, receipt.free_bytes)
+        finally:
+            client.close()
+
+    async def __call__(self) -> PhysicalCapacity:
+        return await asyncio.to_thread(self._read)
 
 
 class BoundWindowsControl:

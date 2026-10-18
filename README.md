@@ -297,6 +297,14 @@ core rollback 停止 exact service containers，保留其 bind、secret 與 inst
 
 實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。當前 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用；完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
 
+Windows 磁碟守衛以本地 download filesystem 與 enrolled AVD 所在的實體 Windows volume 同時檢查 100 GiB／10% 門檻。`PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256` 固定 native environment，`PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE` 固定 volume identity；本輪已核對 AVD、SDK 與 Docker／WSL VHD 都位於同一 D 槽。新 `/v1/capacity` 使用既有 mTLS、runtime generation 與 fresh nonce，五秒 timeout，不經 ADB、不取得 UI ticket、不改 journal。容量未知或分區身分改變就 latch，不能用容器虛擬餘額放行；移動 VHD 或 AVD 前必須重核此對應。
+
+2026-10-18 操作者授權本輪隔離驗收繼續至 D 槽剩餘 25 GiB 才停止，因此此輪私有部署設定為 `PIXAV_DOWNLOAD_MIN_FREE_BYTES=26843545601`、`PIXAV_DOWNLOAD_MIN_FREE_PERCENT=0`，在餘額小於等於 25 GiB 時 latch。程式與 Compose 預設仍為 100 GiB／10%；此例外不豁免容量身分、未知結果 reconciliation 或其他資料守衛。
+
+`PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE` 指向持久、絕對路徑的 0600 file，managed authority 掛至 `/run/secrets/download_pause_token`。Redis 僅保存 owner digest，latch 使用 SET NX，恢復必須重新核對兩個 filesystem、持有原 token，並原子比對完整 pause record 後解除；不自動恢復。`scripts/manage_download_pause.py status` 只讀，`resume` 不接受未知 owner 或 legacy 無 owner 的 latch。當次 native 容量與唯讀 journal 實測、真 Redis 的 SET／resume 競態測試已通過；這些守衛不抵 Photos、VPN 或播放驗收。
+
+2026-10-18 恢復後已重新核對同一 Docker daemon、PostgreSQL identifier 與七個資料 bind 的 device／inode，Redis 換新 run ID 後明確更新設定。新 authority 的實際程式 digest 與來源相符，health／metrics 均 200；部署內以真實 Windows 容量及隔離合成 key 實測低容量 latch、容量恢復後仍保持 pause、其他 owner 被拒絕、原 owner 原子解除。原 system pause 與 legacy queue 保留，未啟動媒體 worker；Android 新 boot enrollment、VPN、私有播放與 provider gates 仍待驗收。
+
 ```bash
 # schema／authority 的 preflight 另外提供 --db-identity、--database；authority 再提供 --redis-run-id。
 docker --context default compose --project-name MANAGED_PROJECT --env-file PRIVATE_ENV -f docker-compose.managed.yml --profile schema run --rm --no-deps migrate

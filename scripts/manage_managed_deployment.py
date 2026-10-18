@@ -223,6 +223,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
             "authority_password": "/run/secrets/PIXAV_DB_PASSWORD",
             "redis_client_url": "/run/secrets/PIXAV_REDIS_URL",
             **{name: "/run/secrets/" + name for name in ["windows_ca", "windows_certificate", "windows_key"]},
+            "download_pause_token": "/run/secrets/download_pause_token",
         },
     }
     for name, service in config["services"].items():
@@ -285,6 +286,9 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
                 or env.get("PIXAV_UPLOAD_MAX_CONCURRENCY") != "1"
                 or env.get("PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID") != args.daemon_id
                 or not IMAGE.fullmatch(env.get("PIXAV_STORAGE_READBACK_IMAGE", ""))
+                or not re.fullmatch(r"[a-f0-9]{64}", env.get("PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256", ""))
+                or not re.fullmatch(r"[1-9][0-9]*", env.get("PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE", ""))
+                or env.get("PIXAV_DOWNLOAD_PAUSE_TOKEN_FILE") != "/run/secrets/download_pause_token"
             ):
                 raise ValueError("AUTHORITY_EXECUTION_BINDING_INVALID")
             mounts = service.get("volumes", [])
