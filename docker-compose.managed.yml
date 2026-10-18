@@ -23,6 +23,31 @@ x-db-environment: &db-environment
   PIXAV_EXPECTED_DB_IDENTITY: ${PIXAV_EXPECTED_DB_IDENTITY:-UNBOUND}
   PIXAV_EXPECTED_DB_NAME: ${PIXAV_MANAGED_DATABASE:-pixav_managed}
   PIXAV_SETTINGS_SECRETS_DIR: /run/secrets
+x-private-transport: &private-transport
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  ALL_PROXY: ""
+  NO_PROXY: "*"
+  http_proxy: ""
+  https_proxy: ""
+  all_proxy: ""
+  no_proxy: "*"
+x-gateway: &gateway
+  image: ${PIXAV_MANAGED_GATEWAY_IMAGE:-pixav-gateway-unconfigured:refused}
+  pull_policy: never
+  restart: "no"
+  user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  cpus: 0.25
+  mem_limit: 128m
+  memswap_limit: 128m
+  pids_limit: 64
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777
+    - /etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0700,uid=${PIXAV_MANAGED_UID:-1000},gid=${PIXAV_MANAGED_GID:-1000}
 x-activity-environment: &activity-environment
   <<: *db-environment
   PIXAV_DB_USER: pixav_worker
@@ -174,6 +199,7 @@ services:
       PIXAV_DOWNLOAD_MIN_FREE_PERCENT: ${PIXAV_DOWNLOAD_MIN_FREE_PERCENT:-10}
       PIXAV_REMUX_DIR: /app/data/remuxed
       PIXAV_LIBRARY_ROOT: /app/data/library
+      PIXAV_RESOLVER_BASE_URL: http://playback-gateway:8080
       PIXAV_ARTWORK_ROOT: /app/data/artwork
       PIXAV_PLAYBACK_CACHE_DIR: /app/data/playback-cache
       PIXAV_STORAGE_WORKER_OWNER: ${PIXAV_STORAGE_WORKER_OWNER:?set the stable runtime owner}
@@ -288,6 +314,129 @@ services:
         bind: {create_host_path: false}
     healthcheck:
       test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8007/health", timeout=3)']
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 30s
+  strm_resolver:
+    <<: *app
+    profiles: [resolver]
+    entrypoint: [python, -m, uvicorn]
+    command: [pixav.strm_resolver.app:create_app, --factory, --host, 0.0.0.0, --port, '8000', --no-access-log]
+    environment:
+      <<: [*db-environment, *private-transport]
+      PIXAV_DB_USER: pixav_reader
+      PIXAV_EXPECTED_REDIS_RUN_ID: ${PIXAV_EXPECTED_REDIS_RUN_ID:-UNBOUND}
+      PIXAV_MANAGED_MEDIA_WORKFLOW: "true"
+      PIXAV_PIXEL_INJECTOR_MODE: windows_android
+      PIXAV_RESOLVER_REQUIRE_READER_ROLE: "true"
+      PIXAV_RESOLVER_AUTH_REQUIRED: "true"
+      PIXAV_RESOLVER_TOKEN_FILE: /run/playback-auth/resolver_token
+      PIXAV_RESOLVER_RATE_LIMIT_RPM: "6000"
+      PIXAV_PLAYBACK_CACHE_DIR: /app/data/playback-cache
+    secrets:
+      - source: reader_password
+        target: /run/secrets/PIXAV_DB_PASSWORD
+      - source: redis_client_url
+        target: /run/secrets/PIXAV_REDIS_URL
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/playback-cache
+        target: /app/data/playback-cache
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_PLAYBACK_AUTH_DIR:-.verify/managed-unconfigured/playback-auth}
+        target: /run/playback-auth
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [core, playback_backend]
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3)']
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 30s
+  playback-gateway:
+    <<: *gateway
+    profiles: [library]
+    entrypoint: [/usr/local/bin/pixav-playback-gateway]
+    command: []
+    environment:
+      <<: *private-transport
+      PIXAV_RESOLVER_TOKEN_FILE: /run/playback-auth/resolver_token
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_PLAYBACK_AUTH_DIR:-.verify/managed-unconfigured/playback-auth}
+        target: /run/playback-auth
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [playback_backend, library_media]
+    healthcheck:
+      test: [CMD, wget, -q, -T, '3', -O, /dev/null, http://127.0.0.1:8080/health]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+  jellyfin:
+    profiles: [library]
+    image: jellyfin/jellyfin:12.1@sha256:78d3ea1207d1322471fcac39a614f004f2ccf7e878f95ab2977d752f07e4dd7e
+    pull_policy: never
+    restart: "no"
+    user: ${PIXAV_MANAGED_UID:-1000}:${PIXAV_MANAGED_GID:-1000}
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 256
+    environment: *private-transport
+    volumes:
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/jellyfin/config
+        target: /config
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/jellyfin/cache
+        target: /cache
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/library
+        target: /media/library
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_JELLYFIN_LOGGING_POLICY:-./config/jellyfin/logging.json}
+        target: /config/config/logging.json
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+    networks:
+      library_media: {}
+      library_origin:
+        aliases: [jellyfin-origin]
+    healthcheck:
+      test: [CMD, curl, -fsS, --max-time, '3', http://127.0.0.1:8096/health]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+      start_period: 60s
+  jellyfin-client-gateway:
+    <<: *gateway
+    profiles: [library]
+    entrypoint: [/usr/local/bin/pixav-jellyfin-gateway]
+    command: []
+    environment: *private-transport
+    ports:
+      - target: 8096
+        published: ${PIXAV_MANAGED_JELLYFIN_PORT:-18096}
+        host_ip: 127.0.0.1
+        protocol: tcp
+    networks: [library_origin, client_capture, library_ingress]
+    healthcheck:
+      test: [CMD, wget, -q, -T, '3', -O, /dev/null, http://127.0.0.1:8096/health]
       interval: 5s
       timeout: 4s
       retries: 12
@@ -409,6 +558,15 @@ networks:
   core:
     internal: true
   runtime: {}
+  playback_backend:
+    internal: true
+  library_media:
+    internal: true
+  library_origin:
+    internal: true
+  client_capture:
+    internal: true
+  library_ingress: {}
 secrets:
   postgres_password:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/postgres_password

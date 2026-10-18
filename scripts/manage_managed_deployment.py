@@ -46,6 +46,12 @@ CORE_COMMANDS = {
     ],
 }
 VPN_IMAGE = "qmcgaw/gluetun:v3.41.3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027"
+JELLYFIN_IMAGE = "jellyfin/jellyfin:12.1@sha256:78d3ea1207d1322471fcac39a614f004f2ccf7e878f95ab2977d752f07e4dd7e"
+PRIVATE_PROXY_ENV = {
+    **{key: "" for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]},
+    "NO_PROXY": "*",
+    "no_proxy": "*",
+}
 VPN_CONTROL_CONFIG = re.compile(
     r'\A\[\[roles\]\]\nname = "pixav-runtime"\n'
     r'routes = \["GET /v1/vpn/status", "PUT /v1/vpn/status"\]\n'
@@ -391,6 +397,231 @@ def validate_activity_mounts(service: dict, args: argparse.Namespace) -> None:  
         raise ValueError("ACTIVITY_PRIVATE_WORKSPACE_INVALID")
 
 
+def validate_playback_auth(path: Path, uid: int) -> None:
+    if (
+        not path.is_absolute()
+        or path.resolve() != path
+        or not path.is_dir()
+        or stat.S_IMODE(path.stat().st_mode) != 0o700
+        or path.stat().st_uid != uid
+        or {entry.name for entry in path.iterdir()} != {"resolver_token"}
+    ):
+        raise ValueError("PRIVATE_PLAYBACK_AUTH_DIRECTORY_REQUIRED")
+    token = path / "resolver_token"
+    if (
+        token.is_symlink()
+        or not token.is_file()
+        or token.stat().st_uid != uid
+        or stat.S_IMODE(token.stat().st_mode) != 0o600
+        or token.stat().st_size > 4096
+        or not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", token.read_text().strip())
+    ):
+        raise ValueError("PRIVATE_PLAYBACK_TOKEN_REQUIRED")
+
+
+def validate_private_binds(service: dict, expected: dict[str, tuple[Path, bool]]) -> None:
+    mounts = service.get("volumes", [])
+    if len(mounts) != len(expected) or {row.get("target") for row in mounts} != set(expected):
+        raise ValueError("PRIVATE_PLAYBACK_MOUNTS_INVALID")
+    uid = int(service["user"].split(":")[0])
+    for row in mounts:
+        source, readonly = expected[row["target"]]
+        if (
+            row.get("type") != "bind"
+            or row.get("source") != str(source)
+            or row.get("read_only", False) != readonly
+            or row.get("bind", {}).get("create_host_path") is not False
+            or not source.is_absolute()
+            or source.resolve() != source
+            or not source.exists()
+            or (row["target"] != "/config/config/logging.json" and not source.is_dir())
+            or (source.is_dir() and source.stat().st_uid != uid)
+        ):
+            raise ValueError("PRIVATE_PLAYBACK_MOUNTS_INVALID")
+
+
+def validate_resolver(config: dict, service: dict, args: argparse.Namespace) -> None:
+    env = service["environment"]
+    expected = {
+        **PRIVATE_PROXY_ENV,
+        "PIXAV_DB_USER": "pixav_reader",
+        "PIXAV_EXPECTED_REDIS_RUN_ID": args.redis_run_id,
+        "PIXAV_MANAGED_MEDIA_WORKFLOW": "true",
+        "PIXAV_PIXEL_INJECTOR_MODE": "windows_android",
+        "PIXAV_RESOLVER_REQUIRE_READER_ROLE": "true",
+        "PIXAV_RESOLVER_AUTH_REQUIRED": "true",
+        "PIXAV_RESOLVER_TOKEN_FILE": "/run/playback-auth/resolver_token",
+        "PIXAV_RESOLVER_RATE_LIMIT_RPM": "6000",
+        "PIXAV_PLAYBACK_CACHE_DIR": "/app/data/playback-cache",
+    }
+    database_keys = {
+        "PIXAV_DB_HOST",
+        "PIXAV_DB_PORT",
+        "PIXAV_DB_NAME",
+        "PIXAV_EXPECTED_DB_IDENTITY",
+        "PIXAV_EXPECTED_DB_NAME",
+        "PIXAV_SETTINGS_SECRETS_DIR",
+    }
+    if (
+        not args.redis_run_id
+        or set(env) != set(expected) | database_keys
+        or any(env.get(key) != value for key, value in expected.items())
+        or service.get("command")
+        != [
+            "pixav.strm_resolver.app:create_app",
+            "--factory",
+            "--host",
+            "0.0.0.0",  # noqa: S104 -- private container networks only
+            "--port",
+            "8000",
+            "--no-access-log",
+        ]  # noqa: S104 -- private container networks only
+        or not config["networks"]["playback_backend"].get("internal")
+        or not service.get("healthcheck", {}).get("test")
+    ):
+        raise ValueError("PRIVATE_RESOLVER_BINDING_INVALID")
+    validate_playback_auth(args.playback_auth_dir, int(service["user"].split(":")[0]))
+    validate_private_binds(
+        service,
+        {
+            "/app/data/playback-cache": (args.data_root / "playback-cache", False),
+            "/run/playback-auth": (args.playback_auth_dir, True),
+        },
+    )
+
+
+def validate_library_isolation(service: dict, *, memory: int, cpus: float, pids: int) -> None:
+    if (
+        service.get("profiles") != ["library"]
+        or service.get("pull_policy") != "never"
+        or service.get("restart") != "no"
+        or not service.get("read_only")
+        or not service.get("init")
+        or service.get("cap_drop") != ["ALL"]
+        or service.get("cap_add")
+        or service.get("privileged")
+        or service.get("devices")
+        or service.get("container_name")
+        or service.get("network_mode")
+        or service.get("security_opt") != ["no-new-privileges:true"]
+        or service.get("secrets")
+        or not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", service.get("user", ""))
+        or int(service.get("mem_limit", 0)) != memory
+        or int(service.get("memswap_limit", 0)) != memory
+        or float(service.get("cpus", 0)) != cpus
+        or service.get("pids_limit") != pids
+        or not service.get("healthcheck", {}).get("test")
+    ):
+        raise ValueError("PRIVATE_LIBRARY_ISOLATION_INVALID")
+
+
+def validate_library(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed private service topology
+    services = config["services"]
+    if set(services) != {"playback-gateway", "jellyfin", "jellyfin-client-gateway"} or config.get("secrets"):
+        raise ValueError("PRIVATE_LIBRARY_PROFILE_INVALID")
+    networks = {
+        "playback-gateway": {"playback_backend", "library_media"},
+        "jellyfin": {"library_media", "library_origin"},
+        "jellyfin-client-gateway": {"library_origin", "client_capture", "library_ingress"},
+    }
+    for name in ["playback_backend", "library_media", "library_origin", "client_capture"]:
+        if not config.get("networks", {}).get(name, {}).get("internal"):
+            raise ValueError("PRIVATE_LIBRARY_NETWORK_INVALID")
+    if config.get("networks", {}).get("library_ingress", {}).get("internal"):
+        raise ValueError("PRIVATE_LIBRARY_INGRESS_INVALID")
+    images = {services[name].get("image", "") for name in ["playback-gateway", "jellyfin-client-gateway"]}
+    if len(images) != 1 or not IMAGE.fullmatch(next(iter(images))):
+        raise ValueError("PRIVATE_GATEWAY_IMMUTABLE_IMAGE_REQUIRED")
+    for name, service in services.items():
+        uid, gid = service.get("user", ":").split(":")
+        is_origin = name == "jellyfin"
+        validate_library_isolation(
+            service,
+            memory=(1024 if is_origin else 128) * 1024**2,
+            cpus=1 if is_origin else 0.25,
+            pids=256 if is_origin else 64,
+        )
+        env = {**PRIVATE_PROXY_ENV}
+        if name == "playback-gateway":
+            env["PIXAV_RESOLVER_TOKEN_FILE"] = "/run/playback-auth/resolver_token"  # noqa: S105 -- file reference only
+        if service.get("environment") != env or set(service.get("networks", {})) != networks[name]:
+            raise ValueError("PRIVATE_LIBRARY_NETWORK_OR_PROXY_INVALID")
+        if name != "jellyfin-client-gateway" and service.get("ports"):
+            raise ValueError("PRIVATE_LIBRARY_ORIGIN_EXPOSED")
+        if is_origin:
+            if (
+                service.get("image") != JELLYFIN_IMAGE
+                or service.get("entrypoint") is not None
+                or service.get("command") is not None
+            ):
+                raise ValueError("PRIVATE_JELLYFIN_IMAGE_OR_ENTRY_INVALID")
+            if service["networks"]["library_origin"].get("aliases") != ["jellyfin-origin"]:
+                raise ValueError("PRIVATE_JELLYFIN_ORIGIN_ALIAS_REQUIRED")
+            validate_private_binds(
+                service,
+                {
+                    "/config": (args.data_root / "jellyfin/config", False),
+                    "/cache": (args.data_root / "jellyfin/cache", False),
+                    "/media/library": (args.data_root / "library", True),
+                    "/config/config/logging.json": (args.jellyfin_logging_policy, True),
+                },
+            )
+            for folder in [
+                args.data_root / "jellyfin/config",
+                args.data_root / "jellyfin/config/config",
+                args.data_root / "jellyfin/cache",
+            ]:
+                if (
+                    folder.resolve() != folder
+                    or stat.S_IMODE(folder.stat().st_mode) != 0o700
+                    or folder.stat().st_uid != int(uid)
+                ):
+                    raise ValueError("PRIVATE_JELLYFIN_DATA_REQUIRED")
+            target = args.data_root / "jellyfin/config/config/logging.json"
+            if target.is_symlink() or not target.is_file() or target.stat().st_uid != int(uid):
+                raise ValueError("PRIVATE_JELLYFIN_LOG_TARGET_REQUIRED")
+        else:
+            entry = "/usr/local/bin/" + (
+                "pixav-playback-gateway" if name == "playback-gateway" else "pixav-jellyfin-gateway"
+            )
+            if service.get("entrypoint") != [entry] or service.get("command") != []:
+                raise ValueError("PRIVATE_GATEWAY_ENTRY_INVALID")
+            if service.get("tmpfs") != [
+                "/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777",  # noqa: S108 -- bounded container tmpfs contract
+                f"/etc/nginx/conf.d:rw,nosuid,nodev,noexec,size=1m,mode=0700,uid={uid},gid={gid}",
+            ]:
+                raise ValueError("PRIVATE_GATEWAY_TMPFS_INVALID")
+            if name == "playback-gateway":
+                validate_playback_auth(args.playback_auth_dir, int(uid))
+                validate_private_binds(service, {"/run/playback-auth": (args.playback_auth_dir, True)})
+            elif service.get("volumes"):
+                raise ValueError("PRIVATE_CLIENT_GATEWAY_MOUNTS_INVALID")
+    policy = args.jellyfin_logging_policy
+    expected_policy = {
+        "Serilog": {
+            "MinimumLevel": {
+                "Default": "Warning",
+                "Override": {
+                    "Emby.Server.Implementations.Session.SessionManager": "Warning",
+                    "Jellyfin.Server.Implementations.Users.UserManager": "Warning",
+                },
+            }
+        }
+    }
+    if policy.resolve() != policy or not policy.is_file() or json.loads(policy.read_text()) != expected_policy:
+        raise ValueError("PRIVATE_JELLYFIN_LOGGING_POLICY_REQUIRED")
+    ports = services["jellyfin-client-gateway"].get("ports", [])
+    if (
+        not 1024 <= args.jellyfin_port <= 65535
+        or len(ports) != 1
+        or ports[0].get("target") != 8096
+        or str(ports[0].get("published")) != str(args.jellyfin_port)
+        or ports[0].get("host_ip") != "127.0.0.1"
+        or ports[0].get("protocol") != "tcp"
+    ):
+        raise ValueError("PRIVATE_JELLYFIN_LOOPBACK_PORT_REQUIRED")
+
+
 def validate_application(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed managed roles
     profile = args.profile
     expected = {
@@ -398,6 +629,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         "authority": {"maxwell_core"},
         "storage": {"storage_worker"},
         "playback": {"playback_worker"},
+        "resolver": {"strm_resolver"},
     }[profile]
     if set(config["services"]) != expected or not args.db_identity or not args.database:
         raise ValueError("APPLICATION_BINDING_REQUIRED")
@@ -410,8 +642,13 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         "maxwell_core": "pixav.maxwell_core.worker",
         "storage_worker": "pixav.pixel_injector.storage_worker",
         "playback_worker": "pixav.pixel_injector.playback_worker",
+        "strm_resolver": "uvicorn",
     }
     secret_targets = {
+        "strm_resolver": {
+            "reader_password": "/run/secrets/PIXAV_DB_PASSWORD",
+            "redis_client_url": "/run/secrets/PIXAV_REDIS_URL",
+        },
         "migrate": {"postgres_password": "/run/secrets/PIXAV_DB_PASSWORD"},
         "provision": {
             "postgres_password": "/run/secrets/PIXAV_DB_PASSWORD",
@@ -468,7 +705,11 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
             or any(key.endswith("_PASSWORD") or key == "PIXAV_REDIS_URL" for key in env)
         ):
             raise ValueError("APPLICATION_DATABASE_OR_SECRET_BINDING_INVALID")
-        networks = {"core"} if profile == "schema" else {"core", "runtime"}
+        networks = (
+            {"core"}
+            if profile == "schema"
+            else ({"core", "playback_backend"} if profile == "resolver" else {"core", "runtime"})
+        )
         if set(service.get("networks", {})) != networks or not config["networks"]["core"].get("internal"):
             raise ValueError("APPLICATION_NETWORK_INVALID")
         if profile == "schema":
@@ -477,6 +718,8 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
                 command += ["--database", args.database]
             if service.get("command") != command or service.get("volumes"):
                 raise ValueError("SCHEMA_DEFAULT_COMMAND_INVALID")
+        elif profile == "resolver":
+            validate_resolver(config, service, args)
         else:
             if (
                 not args.redis_run_id
@@ -486,6 +729,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
                 or env.get("PIXAV_PIXEL_INJECTOR_MODE") != "windows_android"
                 or env.get("PIXAV_LOCAL_CLEANUP_APPLY") != "false"
                 or env.get("PIXAV_UPLOAD_MAX_CONCURRENCY") != "1"
+                or (profile == "authority" and env.get("PIXAV_RESOLVER_BASE_URL") != "http://playback-gateway:8080")
                 or env.get("PIXAV_WINDOWS_CONTROL_DOCKER_DAEMON_ID") != args.daemon_id
                 or not IMAGE.fullmatch(env.get("PIXAV_STORAGE_READBACK_IMAGE", ""))
                 or not re.fullmatch(r"[a-f0-9]{64}", env.get("PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256", ""))
@@ -583,6 +827,10 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
         if args.wireguard_config is None or args.secrets_root is None or args.vpn_resolv_conf is None:
             raise ValueError("VPN_EXPLICIT_SECRET_REFERENCES_REQUIRED")
         validate_vpn(config, args.wireguard_config, args.secrets_root, args.vpn_resolv_conf)
+    elif profile == "library":
+        if args.data_root is None or args.playback_auth_dir is None:
+            raise ValueError("PRIVATE_LIBRARY_EXPLICIT_ROOTS_REQUIRED")
+        validate_library(config, args)
     else:
         validate_application(config, args)
     for service in config["services"].values():
@@ -615,7 +863,7 @@ def main() -> None:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=["windows-tools", "core", "schema", "authority", "storage", "playback", "vpn"],
+        choices=["windows-tools", "core", "schema", "authority", "storage", "playback", "vpn", "resolver", "library"],
         default="windows-tools",
     )
     parser.add_argument("--data-root", type=Path)
@@ -625,6 +873,13 @@ def main() -> None:
     parser.add_argument("--photos-auth-secret", type=Path)
     parser.add_argument("--wireguard-config", type=Path)
     parser.add_argument("--vpn-resolv-conf", type=Path)
+    parser.add_argument("--playback-auth-dir", type=Path)
+    parser.add_argument("--jellyfin-port", type=int, default=18096)
+    parser.add_argument(
+        "--jellyfin-logging-policy",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "config/jellyfin/logging.json",
+    )
     parser.add_argument("--db-identity")
     parser.add_argument("--database")
     parser.add_argument("--redis-run-id")

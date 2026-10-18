@@ -299,6 +299,10 @@ def authority_config(core_config, monkeypatch):
 
 def test_authority_profile_binds_separate_role_secrets_and_exact_instances(authority_config):
     module.validate_application(*authority_config)
+    assert (
+        authority_config[0]["services"]["maxwell_core"]["environment"]["PIXAV_RESOLVER_BASE_URL"]
+        == "http://playback-gateway:8080"
+    )
 
 
 @pytest.mark.parametrize("defect", ["admin-secret", "legacy-mode", "wrong-run-id", "raw-password", "database-mount"])

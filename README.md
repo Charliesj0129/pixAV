@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,138 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,162 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -619,11 +619,41 @@ repository 已退休舊隔離 Compose 模板。新的 managed deployment 必須�
 
 ### 私有 Jellyfin 部署
 
-目前沒有 repository 內的 Jellyfin 部署 Compose；新隔離部署只向認證 gateway 開放 loopback，Jellyfin origin 不對外發布，錄影 client 不得直連 origin 或讀 staging。library root 整體唯讀掛載，保留 publication 相對 symlink，設定與觀看紀錄納入加密備份。
+[managed Compose](docker-compose.managed.yml) 的 `resolver` profile 只選 `strm_resolver`，`library` 選 `playback-gateway`、`jellyfin`、`jellyfin-client-gateway`；仍逐一明確啟動當階段必要服務。只有 client gateway 發布 `127.0.0.1` 的指定 HTTP port，origin／resolver／token injector 不發布 port。capture client 只加入 internal `client_capture`，不能直連 origin 或讀 staging；額外的 ingress bridge 僅讓 loopback port 可用，不給 capture client 外部網路。library root 整體唯讀掛載，保留 publication 相對 symlink；原 Jellyfin 設定與觀看紀錄不由新空目錄取代。
 
-managed resolver factory 必須同時提供 DB／Redis 連線、expected instance IDs、reader role、私有認證與 token file，缺一即拒絕啟動。工作區已用專用 PostgreSQL／Redis 與獨立非 superuser reader login 驗證完整 startup：錯誤 cluster／database／Redis run ID 拒絕，正確 pool 重建仍重驗；未授權 service 請求及旋轉前的 token 被拒絕，旋轉後的新 token 可進入正常路由。此為 resolver service 認證，未證明 Jellyfin 裝置撤銷、任何媒體 READY 或實播；當次測試沒有 provider 請求，新部署與 client gateway 驗收仍待完成。
+| 服務 | 可達網路 | 資料／認證 |
+| --- | --- | --- |
+| resolver | internal core、playback backend | 獨立 reader login、Redis file reference、verified cache、專用 token 目錄 |
+| playback gateway | internal playback backend、library media | 唯讀專用 token 目錄；只轉發穩定 `/stream/` |
+| Jellyfin origin | internal library media、library origin | 私有 config／觀看紀錄、可重建 cache、唯讀 library 與 logging policy |
+| client gateway | internal library origin、client capture，另接 loopback ingress | 不掛媒體或 service token，逐請求向 origin 驗證裝置 |
+
+[gateway Dockerfile](docker/playback-gateway.Dockerfile) 固定 Nginx base digest；當次 binary 為 Nginx 1.30.5，含 [auth_request](https://nginx.org/en/docs/http/ngx_http_auth_request_module.html)，採 [BSD 2-clause](https://nginx.org/LICENSE)。沿用 [stream template](docker/playback-gateway/default.conf.template) 注入 service header、[client auth config](docker/playback-gateway/jellyfin-auth.conf) 委派 Jellyfin 裝置認證，不新增認證或媒體 proxy framework。兩種入口均在 UID 1000、唯讀 root、drop ALL 下實測啟動及 `nginx -t`；profile 各限 0.25 CPU／128 MiB／64 PIDs，只有 `/tmp` 與 rendered config 的有限 tmpfs 可寫。config 由 077 umask 建立，token 不進 URL／projection／access log；service token 改變後須重建 gateway 的 rendered config，舊 token 不作匿名 fallback。
+
+`PIXAV_MANAGED_PLAYBACK_AUTH_DIR` 是專用 0700 目錄，只含 0600 `resolver_token`，整個目錄唯讀掛至 `/run/playback-auth`，讓原子替換 token file 能被 resolver 的每次請求觀察到；不能把整個 DB／cookie secrets 目錄掛入。resolver 使用同一 immutable app image、獨立 `pixav_reader`，不掛 Docker socket、staging、guest 或 Photos cookie。它關閉 Uvicorn access log，internal gateway 共用流量的 rate limit 明確設為 6,000 rpm；private roles 明確清空 proxy 環境並將 `NO_PROXY` 設為 `*`，不依賴操作者全域 proxy 路由。
+
+authority 的 projection base URL 固定為 `http://playback-gateway:8080`，只加上 `video_id` 的 `/stream/` 路徑；不把容器內 localhost 或 service token 寫入 STRM。preflight 同時檢查 cache 必須是既有目錄，不能拿同名 regular file 通過掛載驗證。
+
+當次保留的 Jellyfin image 以官方 registry manifest 與 platform config digest 交叉核對，binary 為 12.1.0.0，server 採 [GPLv2](https://github.com/jellyfin/jellyfin/blob/master/LICENSE)；新 profile 固定該 digest。origin 限一 CPU／1 GiB／256 PIDs、非 root、唯讀 root、drop ALL，config／cache 使用明確既有 bind；實測該版本的 data filesystem 至少須有 2 GiB 可用容量，仍不能取代本輪實體 D 槽 25 GiB 停止線。`PIXAV_MANAGED_JELLYFIN_LOGGING_POLICY` 以唯讀 file bind 覆蓋 `/config/config/logging.json`，其 host target 與父目錄須先核對存在與 ownership，禁止以 auto-create 製造空掛載。config／cache、完整 library 與 token 目錄的 actual device／inode、內容仍須在 runtime 另驗。
+
+Jellyfin 預設 INFO 的 session logout 會記錄 access token；[logging policy](config/jellyfin/logging.json) 因此明確保留 Warning／Error 並限制 session／user logger。依 [官方 logging 設定](https://jellyfin.org/docs/general/administration/troubleshooting/#debug-logging) 在啟動前套用，preflight 拒絕 INFO policy；不藉刪除警告或錯誤診斷通過保密檢查。當次在全新 tmpfs 資料與兩個合成裝置實測：匿名 user／media 被拒絕、兩 token 原可使用、exact device 撤銷後其 header／media／cookie 新請求被拒絕、另一裝置仍有效，且 capture network 無法以 DNS 或 TCP 直連 origin。console 與 runtime 檔案日誌均未含合成密碼、token 或 user ID，無效登入的 Warning 仍存在。此測試沒有掛原 config／觀看紀錄或媒體，不抵實播、正式資料遷移或 Golden Path。
+
+同一份 managed Compose 已用獨立新資料逐段實際啟動 core、schema、resolver、library：六個長駐服務健康，migration 與分離角色 provision 通過，十四組 bind 的 host／container device／inode 相符，host loopback ingress 可達；service header 注入成功，直接匿名 resolver 被拒絕，provider resolve route 不轉發，前述兩裝置撤銷也在此拓樸重驗。未啟動 executor，未掛原資料或真實媒體，驗證完成只移除這個 exact 臨時 project 的容器／network；原 deployment 的 authority 仍在自有 pause 下。
+
+當次也實測原子替換 service token file：舊 token 與未重載的 injector 都被拒絕，新 token 可通過 resolver 認證；重啟 exact injector 後恢復。停止 exact resolver 時 gateway 回 502，原 container 重啟並重新核對實例後恢復，沒有匿名 fallback、額外 executor 或 queue replay。這些是隔離認證／故障恢復證據，未宣告存在可播放的 READY 內容。
+
+resolver health／metrics 在 internal 8000，gateway liveness 在 8080、client gateway 與 origin 在 8096；Nginx connect timeout 十秒、send／read 各三百秒、DNS 五秒。resolver／gateway health 每五秒、timeout 四秒；origin grace 六十秒，單次 health request 三秒。gateway／Jellyfin 尚無 managed metrics exporter；health 200 不證明已有已設定帳號或 READY 媒體，當次初始化完成前的 origin 也會回 health 200。
+
+managed resolver factory 必須同時提供 DB／Redis 連線、expected instance IDs、reader role、私有認證與 token file，缺一即拒絕啟動。工作區已用專用 PostgreSQL／Redis 與獨立非 superuser reader login 驗證完整 startup：錯誤 cluster／database／Redis run ID 拒絕，正確 pool 重建仍重驗；未授權 service 請求及旋轉前的 token 被拒絕，旋轉後的新 token 可進入正常路由。這組 startup 測試只涵蓋 resolver service 認證；client gateway 與裝置撤銷另依前述隔離實測判定。沒有 provider 請求或 READY 媒體，正式資料部署與實播仍待驗收。
 
 Jellyfin 只取得 pixAV 穩定 URL，不取得 provider URL、cookie 或 token。未授權 client 與撤銷裝置必須實測拒絕；多段、seek、resume 及全部交界須有新錄影與人工確認。[官方容器說明](https://jellyfin.org/docs/general/installation/container/)的部署限制與當次 live contract 仍適用，工具或容器健康不代表 production promotion。
+
+```bash
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV --profile resolver --db-identity IDENTIFIER --database MANAGED_DATABASE --redis-run-id RUN_ID --data-root PRIVATE_DATA --secrets-root PRIVATE_SECRETS --playback-auth-dir PRIVATE_PLAYBACK_AUTH
+uv run python -m scripts.manage_managed_deployment --context default --project MANAGED_PROJECT --daemon-id DAEMON_ID --env-file PRIVATE_ENV --profile library --data-root PRIVATE_DATA --playback-auth-dir PRIVATE_PLAYBACK_AUTH --jellyfin-logging-policy LOGGING_POLICY --jellyfin-port LOOPBACK_PORT
+```
+
+client gateway 的公開 bootstrap routes 只供一般登入；全新隔離 server 的首次設定須在受限 origin network 核對空資料後，使用當次版本的初始化 API。先初始化 first user，再設定帳密，不對保留的舊 server 重跑 wizard。只有驗證過當次帳號／裝置與 network binding 後才交給 client。Windows Docker Desktop 不在 Jellyfin 官方支援範圍，硬體轉碼未驗收；本輪依 CPU 路徑的實測判斷，不據此宣稱 production。rollback 先維持 domain pause、停止 exact clients／gateways／origin／resolver 並核對 reader 釋放，再用相容 immutable images；保留原 config、觀看紀錄、library、auth 與未知效果，不清 queue。本輪依操作者指示不新增實際備份，既有保全資料保留。
 
 ### Library projection
 

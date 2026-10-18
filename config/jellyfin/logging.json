@@ -1,0 +1,11 @@
+{
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Warning",
+      "Override": {
+        "Emby.Server.Implementations.Session.SessionManager": "Warning",
+        "Jellyfin.Server.Implementations.Users.UserManager": "Warning"
+      }
+    }
+  }
+}

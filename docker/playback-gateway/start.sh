@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
-PIXAV_RESOLVER_BEARER=$(cat /run/secrets/resolver_token)
+PIXAV_RESOLVER_BEARER=$(cat "${PIXAV_RESOLVER_TOKEN_FILE:-/run/secrets/resolver_token}")
 case "$PIXAV_RESOLVER_BEARER" in
     ''|*[!A-Za-z0-9_-]*) exit 1 ;;
 esac
