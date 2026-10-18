@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,162 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,181 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -478,11 +478,24 @@ AVD userdata、system image／SDK rebuild manifest、設定、ADB keys、runtime
 
 - `docker-compose.android-runner.yml`：Windows Emulator 的 ADB／Maestro 工具，設定及合成媒體守衛見前文。
 - `docker-compose.integration.yml`：固定映像的專用 PostgreSQL／Redis，loopback ports、資源限制及 tmpfs 資料。只供本機測試／CI，結束以 exact container ID 清除，不碰既有 volumes。
-- `docker-compose.managed.yml`：受管部署的分段入口，目前有 `windows-tools` 及只含 PostgreSQL／Redis 的 `core`；原生 readiness、runtime 登錄與完整應用部署分別驗收。
+- `docker-compose.managed.yml`：受管部署的分段入口，依前述已驗收的 profile 逐一啟動必要服務；原生 readiness、runtime 登錄與完整應用部署分別驗收。
 
 CI 先依序建立 PostgreSQL、Redis，從 exact container 取得 DB identifier／Redis run ID，再啟用 `PIXAV_RUN_INTEGRATION=1`。本機完整檢查依 [AGENTS.md](AGENTS.md#驗證)。新 application 部署尚待依目前設計補齊，不能由 CI 或 Android runner 健康推定 Photos 上傳／quota 契約通過。
 
 所有資料修改仍核對 daemon／DB／Redis 身分並先 dry-run；秘密只用私有 reference。保留 `manage_execution`、`manage_playback`、`manage_library`、migration、backup／reconciliation 工具及業務模組，執行前遵循各 CLI 的身分／ownership 守衛。禁止為了恢復舊影片自動解除 pause、replay DLQ 或重做未知上傳。
+
+[system pause 工具](scripts/manage_system_pause.py) 的 `status` 只讀；`pause`／`resume` 必須提供 `--token-file` 與已核對的 `PIXAV_EXPECTED_REDIS_RUN_ID`。token file 使用絕對路徑，現存父目錄須屬於操作者且為 0700，檔案從建立起為 0600；已存在的檔案只讀取，不覆寫。新 pause 只保存 owner digest；舊格式仍須核對原 token 及 Redis run ID。Redis Lua 在同一次操作中重核 run ID，建立時不覆寫任何現存值，解除時比對完整原 record，併發替換即拒絕。CLI 的 Redis 操作上限十五秒，錯誤或逾時保留 token file，先用 `status` reconciliation；不將 token 放入命令列、輸出或日誌。
+
+專用 Redis 已實測 CLI 的 pause／status／resume、舊格式恢復、外來 token 拒絕、同一 Lua 內的錯誤 run ID 拒絕，以及讀取後併發替換的建立／解除競態；原部署的 pause 未被解除。這是操作守衛證據，完整 deployment rollback 仍依 BDD-141 另行驗收。
+
+```bash
+# 先以私有設定綁定 Redis URL 與已核對的 PIXAV_EXPECTED_REDIS_RUN_ID。
+uv run python -m scripts.manage_system_pause status
+uv run python -m scripts.manage_system_pause pause --token-file /absolute/private/system-pause-token
+uv run python -m scripts.manage_system_pause status --token-file /absolute/private/system-pause-token
+# 僅在此次維護及唯一 execution ownership 驗收完成後，由原操作者明確解除：
+uv run python -m scripts.manage_system_pause resume --token-file /absolute/private/system-pause-token
+```
 
 ### 本次 Photos 驗收範圍
 
