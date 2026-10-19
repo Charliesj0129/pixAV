@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from pixav.library_projection.repository import RECONCILE_LOCK
 from pixav.library_projection.writer import publication_is_complete
+from pixav.shared.cleanup_binding import CleanupTargetBinding, capture_cleanup_binding
 from pixav.shared.client_playback_evidence import client_matches_current_manifest, parse_client_playback_evidence
 from pixav.shared.enums import TaskState
 from pixav.shared.media_file import descriptor_facts, file_version, open_media_directory, open_media_file
@@ -278,10 +279,9 @@ class LocalFileJanitor:
         """
         if not await self._table_available(conn, "cleanup_authorizations"):
             return False
-        # playback_verified_at and the backup reference are NOT NULL in the
-        # schema, so a row that exists already carries both.
         row = await conn.fetchrow(
-            """SELECT a.artifact_sha256, a.size_bytes FROM cleanup_authorizations a
+            """SELECT a.artifact_sha256, a.size_bytes, to_jsonb(a)->'target_binding' AS target_binding
+            FROM cleanup_authorizations a
             JOIN remote_assets r ON r.id = a.remote_asset_id
             JOIN playable_assets p ON p.remote_asset_id=r.id AND p.video_id=a.video_id AND p.state='READY'
             WHERE a.video_id=$1 AND a.path=$2 AND a.expires_at > now()
@@ -295,10 +295,25 @@ class LocalFileJanitor:
         target, missing = safe_cleanup_candidate(self._download_dir, path)
         if target is None or missing:
             return False
-        # Only reached once an authorization exists, so the cost of reading the
-        # artifact back is paid for a decision that is actually about to be made.
-        observed = await _artifact_facts_async(target, descriptor)
-        return observed == (row["artifact_sha256"], int(row["size_bytes"]))
+        try:
+            # Legacy free-text rows, including schemas before migration 025,
+            # remain readable but cannot authorize a newly observed inode.
+            binding = row["target_binding"]
+            approved = (
+                CleanupTargetBinding.model_validate_json(binding)
+                if isinstance(binding, str)
+                else CleanupTargetBinding.model_validate(binding)
+            )
+            with ExitStack() as resources:
+                if descriptor is None:
+                    descriptor = resources.enter_context(open_media_file(target)).descriptor
+                observed = await _artifact_facts_async(target, descriptor)
+                if observed is None or observed != (row["artifact_sha256"], int(row["size_bytes"])):
+                    return False
+                current = await capture_cleanup_binding(conn, video_id, target, descriptor, observed, domain_path=path)
+                return current == approved
+        except (OSError, ValueError):
+            return False
 
     async def _single_path_reference(self, conn: asyncpg.Connection, video_id, path: str) -> bool:
         """Refuse shared files until group authorization and recovery are available.

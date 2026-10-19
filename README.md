@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,240 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,253 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -625,6 +625,8 @@ Photos 原件回載的 browser navigation timeout 為 60 秒、選單操作 30 �
 resolver 有設定 PostgreSQL 時，啟動連線最多等待 10 秒；失敗即退出，待依部署策略明確重啟，避免 DB 恢復後仍持續回 503。每個新 connection 在 codec 初始化前核對預期 cluster／database，pool connection 重建也必須重驗。Redis instance 檢查最多 10 秒、PING 最多 3 秒；有設定 expected run ID 時，錯誤實例或無法核對就退出，僅未綁定的 legacy 模式可降級為無 cache。`/health` 在有設定 DB 時，以最多 2 秒的 `SELECT 1` 核對依賴，讀不到 facts 就回 503。
 
 cleanup 增補 [021 migration](migrations/021_cleanup_journal.sql) 與單檔 `cleanup_journal`。janitor 在 publication advisory lock 後取得 video row lock，重查掃描時的 `local_path`；依 canonical path 核對其他 video、workflow artifact、remote segment 與有效 reader 引用。共用路徑目前一律拒絕，尚未提供整組授權／一次 unlink。單一目標在 unlink 前以獨立交易提交 intent，保存 device／inode、size、mtime／ctime、hash 與 parent identity；unlink 後 fsync parent，domain 路徑、audit 與 journal 完成狀態在同一交易提交。`LocalFileJanitor.recover()` 預設唯讀，只接受已有 committed intent、parent identity 及 domain path 一致的缺檔；存在或被替換的檔案保留 pending，不重刪。此功能須先套用 expand migration；正式 cleanup apply 維持關閉。
+
+[025 migration](migrations/025_cleanup_target_binding.sql) 增加可空的 `target_binding`，由 [immutable binding](src/pixav/shared/cleanup_binding.py) 綁定當次 database identifier／name、canonical path、檔案與 parent 的 device／inode、size／mtime／ctime／hash，以及 DURABLE remote、READY playable identity／preparation／hash／size、實播登錄時間與 publication version／digest。janitor 從持鎖 descriptor 重算並核對目前 domain facts；同 bytes 換 inode、重新準備、重新登錄播放、publication 更新或不同資料庫都需要重新核准。舊列保留但不回填授權，缺欄位的舊 schema、空值或無效 binding 均拒絕。合成 full dump／restore 保留新舊列及權限，還原到另一 database name 的授權不能直接沿用。部署先 expand、維持 cleanup 關閉並停止不相容 process；rollback 仍保持 cleanup 關閉，不能交給忽略 binding 的舊 janitor。binding 只限定授權指向的物件，`backup_reference` 仍未驗證 restore receipt，操作入口與完整授權契約尚未完成。
 
 Linux 的 [共同檔案協定](src/pixav/shared/media_file.py) 使用不建立 sidecar 的非阻塞 shared／exclusive `flock`，拒絕 symlink、非普通檔案及不同 owner，並以固定 parent descriptor 核對 name／inode 後 unlink／fsync。[串流 reader](src/pixav/strm_resolver/playback.py) 複製已鎖 descriptor；hash、ffprobe、remux 與本地 PartMedia 將 descriptor 經 `pass_fds` 傳給工具，以 `/proc/self/fd` 存取，子程序未結束時不因父程序關閉而解鎖。janitor 的 exclusive inode lock 持有至 domain transaction commit，缺檔 recovery 另持有 parent directory lock；[cache eviction](src/pixav/strm_resolver/cache_janitor.py) 重查掃描時的完整 fingerprint／access time，[cache publisher](src/pixav/pixel_injector/playback_activity.py) 也須取得既有物件的 exclusive lock。舊外部工具 prefix 僅有父程序鎖，不具備 namespace 內 descriptor 繼承保證，不作 cleanup 驗收。
 

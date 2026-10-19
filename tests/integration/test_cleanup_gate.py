@@ -8,9 +8,9 @@ the last tests hold every guarantee at once, and only then is a file removed.
 """
 
 import asyncio
-import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,6 +27,7 @@ from pixav.library_projection.render import render_projection
 from pixav.library_projection.repository import ArtworkRecord
 from pixav.library_projection.writer import ProjectionWriter
 from pixav.maxwell_core.gc import LocalFileJanitor
+from pixav.shared.cleanup_binding import capture_cleanup_binding
 from pixav.shared.media_file import open_media_file
 from pixav.shared.playable_assets import PlayableAssetRepository
 from pixav.shared.remote_assets import RemoteAssetRepository
@@ -264,8 +265,8 @@ async def test_eligible_dry_run_keeps_staging_metadata_and_database_unchanged(db
     video, media = await artifact(db, tmp_path)
     await publish(db, video)
     await playback_verified(db, video)
-    await authorize(db, video, media)
     os.utime(media, ns=(1_000_000_000, media.stat().st_mtime_ns))
+    await authorize(db, video, media)
     before = media.stat()
     names = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
     snapshot_sql = """SELECT md5(jsonb_build_array(
@@ -292,13 +293,90 @@ async def test_eligible_dry_run_keeps_staging_metadata_and_database_unchanged(db
     assert await db.fetchval(snapshot_sql) == database_before
 
 
-async def test_inode_lock_remains_held_through_unlink_and_domain_commit(db, tmp_path):
+async def test_same_bytes_at_a_new_inode_do_not_reuse_an_earlier_authorization(db, tmp_path):
     video, media = await artifact(db, tmp_path)
     await publish(db, video)
     await playback_verified(db, video)
     await authorize(db, video, media)
+    media.rename(tmp_path / "retained-original.mp4")
+    media.write_bytes(b"the only local copy")
+
+    stats = await janitor(db, tmp_path).cleanup()
+
+    assert stats["deleted"] == 0 and stats["rejected"] == 1
+    assert media.read_bytes() == b"the only local copy"
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal") == 0
+    assert '"exact_target_backup_authorization": false' in await reasons_for(db)
+
+
+@pytest.mark.parametrize("old_schema", [False, True])
+async def test_legacy_free_text_approval_cannot_authorize_cleanup(db, tmp_path, old_schema):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    if old_schema:
+        await db.execute("ALTER TABLE cleanup_authorizations DROP COLUMN target_binding")
+    else:
+        await db.execute("UPDATE cleanup_authorizations SET target_binding=NULL")
+
+    stats = await janitor(db, tmp_path).cleanup()
+
+    assert stats["deleted"] == 0 and stats["rejected"] == 1
+    assert media.exists()
+    assert '"exact_target_backup_authorization": false' in await reasons_for(db)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("database_identifier", "1"),
+        ("database_name", "another_database"),
+        ("playable_asset_id", "11111111-1111-4111-8111-111111111111"),
+        ("remote_asset_id", "22222222-2222-4222-8222-222222222222"),
+        ("publication_digest", "f" * 64),
+    ],
+)
+async def test_approval_cannot_be_transplanted_between_instances_or_assets(db, tmp_path, field, value):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    binding = json.loads(await db.fetchval("SELECT target_binding FROM cleanup_authorizations"))
+    binding[field] = value
+    await db.execute("UPDATE cleanup_authorizations SET target_binding=$1::jsonb", json.dumps(binding))
+
+    stats = await janitor(db, tmp_path).cleanup()
+
+    assert stats["deleted"] == 0 and stats["rejected"] == 1
+    assert media.exists()
+    assert '"exact_target_backup_authorization": false' in await reasons_for(db)
+
+
+@pytest.mark.parametrize("change", ["preparation", "playback_verification", "publication"])
+async def test_new_domain_revision_requires_new_target_approval(db, tmp_path, change):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    if change == "preparation":
+        await db.execute("UPDATE playable_assets SET preparation_version='replacement-version'")
+    elif change == "playback_verification":
+        await db.execute("UPDATE playable_assets SET playback_verified_at=now()")
+    else:
+        await db.execute("UPDATE library_publications SET active_version='2-aaaaaaaaaaaa'")
+
+    assert not await janitor(db, tmp_path)._authorized_target(db, video, str(media))
+    assert media.exists()
+
+
+async def test_inode_lock_remains_held_through_unlink_and_domain_commit(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
     alias = tmp_path / "retained-alias.mp4"
     os.link(media, alias)
+    await authorize(db, video, media)
     observed = []
 
     class InspectCommit(LocalFileJanitor):
@@ -316,6 +394,25 @@ async def test_inode_lock_remains_held_through_unlink_and_domain_commit(db, tmp_
     with open_media_file(alias) as reader:
         assert reader.facts()[1] == 19
     assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
+
+
+async def test_binding_keeps_the_configured_staging_root_symlink_contract(db, tmp_path):
+    root = tmp_path / "actual-staging"
+    root.mkdir()
+    video, media = await artifact(db, root)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    configured = tmp_path / "configured-staging"
+    configured.symlink_to(root, target_is_directory=True)
+    domain_path = str(configured / media.name)
+    await db.execute("UPDATE videos SET local_path=$1 WHERE id=$2", domain_path, video)
+    await db.execute("UPDATE cleanup_authorizations SET path=$1 WHERE video_id=$2", domain_path, video)
+
+    operator = LocalFileJanitor(db, download_dir=str(configured), library_root=str(root / "library"))
+
+    assert (await operator.cleanup(apply=True))["deleted"] == 1
+    assert not media.exists()
 
 
 async def test_publication_row_cannot_substitute_for_playback_evidence_bdd_005_131(db, tmp_path):
@@ -564,25 +661,29 @@ async def playback_verified(db, video):
 
 async def authorize(db, video, media, **overrides):
     """Write one exact-target cleanup authorization for this artifact."""
+    with open_media_file(media) as source:
+        facts = source.facts()
+        binding = await capture_cleanup_binding(db, video, media, source.descriptor, facts)
     fields = {
         "path": str(media),
-        "artifact_sha256": hashlib.sha256(media.read_bytes()).hexdigest(),
-        "size_bytes": media.stat().st_size,
+        "artifact_sha256": facts[0],
+        "size_bytes": facts[1],
         "expires": "now()+interval '1 hour'",
     }
     fields.update(overrides)
     asset = await db.fetchval("SELECT id FROM remote_assets WHERE video_id=$1", video)
     await db.execute(
         f"""INSERT INTO cleanup_authorizations(id,video_id,path,artifact_sha256,size_bytes,remote_asset_id,
-        playback_verified_at,backup_reference,approved_by,reason,expires_at)
+        playback_verified_at,backup_reference,approved_by,reason,expires_at,target_binding)
         VALUES($1,$2,$3,$4,$5,$6,now(),'offsite-vault','fixture-operator','integration fixture',
-        {fields["expires"]})""",  # noqa: S608 - interval literal comes from this module only
+        {fields["expires"]},$7::jsonb)""",  # noqa: S608 - interval literal comes from this module only
         uuid.uuid4(),
         video,
         fields["path"],
         fields["artifact_sha256"],
         fields["size_bytes"],
         asset,
+        binding.model_dump_json(),
     )
 
 
@@ -947,7 +1048,7 @@ async def test_replacement_after_committed_intent_is_preserved(db, tmp_path):
     assert (await operator.cleanup(apply=True))["failed"] == 1
     assert media.read_bytes() == b"the only local copy"
     assert await db.fetchval("SELECT state FROM cleanup_journal") == "INTENT"
-    assert (await janitor(db, tmp_path).cleanup())["failed"] == 1
+    assert (await janitor(db, tmp_path).cleanup())["rejected"] == 1
     assert media.exists()
     assert (await operator.recover(apply=True))["pending"] == 1
 
@@ -956,10 +1057,11 @@ async def test_publication_of_a_superseded_object_is_not_complete_bdd_005_131(db
     """The library must stream the object that is READY now, not one it replaced."""
     video, media = await artifact(db, tmp_path)
     await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
     old = await db.fetchval("SELECT id FROM playable_assets WHERE video_id=$1", video)
     await db.execute("UPDATE playable_assets SET state='STALE' WHERE id=$1", old)
     await playback_verified(db, video)
-    await authorize(db, video, media)
 
     stats = await janitor(db, tmp_path).cleanup()
 
@@ -978,3 +1080,98 @@ async def test_deleted_poster_blocks_cleanup_even_with_published_row(db, tmp_pat
         gates = await janitor(db, tmp_path)._evaluate(conn, video, str(media))
     assert gates["complete_publication"] is False
     assert media.exists()
+
+
+async def test_binding_expand_and_full_synthetic_restore_preserve_approvals(db, integration_redis, tmp_path):
+    """A restored approval is preserved as history, not consent for another DB."""
+    import asyncpg
+
+    import docker
+    from pixav.shared.instance import database_identity
+    from scripts.integration_guard import require_test_database, require_test_redis
+
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    legacy_id = await db.fetchval("SELECT id FROM cleanup_authorizations")
+    await db.execute("ALTER TABLE cleanup_authorizations DROP COLUMN target_binding")
+    await db.execute(Path("migrations/025_cleanup_target_binding.sql").read_text())
+    assert await db.fetchval("SELECT target_binding FROM cleanup_authorizations WHERE id=$1", legacy_id) is None
+    await authorize(db, video, media)
+    bindings = await db.fetch("SELECT id,target_binding FROM cleanup_authorizations ORDER BY id")
+    assert len(bindings) == 2
+    assert await db.fetchval(
+        "SELECT has_column_privilege('pixav_execution_authority','cleanup_authorizations','target_binding','SELECT')"
+    )
+    assert not await db.fetchval(
+        "SELECT has_table_privilege('pixav_execution_authority','cleanup_authorizations','INSERT')"
+    )
+    redis, _ = integration_redis
+    await require_test_redis(redis)
+    database = await db.fetchval("SELECT current_database()")
+    endpoint = urlsplit(os.environ["PIXAV_E2E_ADMIN_DSN"])
+    admin = await asyncpg.connect(os.environ["PIXAV_E2E_ADMIN_DSN"])
+    target = "pixav_test_" + uuid.uuid4().hex
+    client = docker.from_env(timeout=15)
+    created = False
+    try:
+        await require_test_database(admin)
+        containers = client.containers.list(
+            all=True,
+            filters={"label": ["com.docker.compose.project=pixav-integration", "com.docker.compose.service=postgres"]},
+        )
+        assert len(containers) == 1
+        container = containers[0]
+        assert not any(m["Type"] in ("bind", "volume") for m in container.attrs["Mounts"])
+        identity = container.exec_run(
+            [
+                "psql",
+                "-U",
+                "pixav_test",
+                "-d",
+                "pixav_integration",
+                "-Atc",
+                "SELECT system_identifier FROM pg_control_system()",
+            ]
+        )
+        assert identity.exit_code == 0 and identity.output.decode().strip() == await database_identity(db)
+        docker_bin = shutil.which("docker")
+        assert docker_bin is not None
+        cli = subprocess.run(  # noqa: S603 -- fixed read-only Docker identity query
+            [docker_bin, "info", "--format", "{{.ID}}"], capture_output=True, check=True, timeout=15
+        )
+        assert cli.stdout.decode().strip() == client.info()["ID"]
+        dump = subprocess.run(  # noqa: S603 -- exact guarded CI container and synthetic database
+            [docker_bin, "exec", container.id, "pg_dump", "-U", "pixav_test", "-Fc", database],
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        await admin.execute(f'CREATE DATABASE "{target}"')
+        created = True
+        subprocess.run(  # noqa: S603 -- restore only this test's freshly created database
+            [docker_bin, "exec", "-i", container.id, "pg_restore", "-U", "pixav_test", "-d", target, "--exit-on-error"],
+            input=dump.stdout,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        restored = await asyncpg.connect(urlunsplit(endpoint._replace(path=f"/{target}")))
+        try:
+            assert await database_identity(restored) == await database_identity(admin)
+            assert await restored.fetch("SELECT id,target_binding FROM cleanup_authorizations ORDER BY id") == bindings
+            assert not await janitor(restored, tmp_path)._authorized_target(restored, video, str(media))
+            assert media.exists()
+        finally:
+            await restored.close()
+    finally:
+        try:
+            if created:
+                await require_test_database(admin)
+                await require_test_redis(redis)
+                assert cli.stdout.decode().strip() == client.info()["ID"]
+                await admin.execute(f'DROP DATABASE "{target}"')
+        finally:
+            await admin.close()
+            client.close()
