@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from pixav.shared.exceptions import MediaDependencyError, RemuxError
+from pixav.shared.media_file import open_media_file, open_media_output
 
 logger = logging.getLogger(__name__)
 
@@ -90,53 +91,58 @@ class FFmpegRemuxer:
         # Ensure output directory exists
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            self._ffmpeg_bin,
-            "-y",  # overwrite output
-            "-i",
-            input_path,
-            "-map",
-            "0",  # preserve every stream
-            "-c",
-            "copy",  # stream copy — no re-encoding
-            "-movflags",
-            "+faststart",  # web-friendly MP4
-            output_path,
-        ]
+        with open_media_file(input_path) as source, open_media_output(output_path) as destination:
+            cmd = [
+                self._ffmpeg_bin,
+                "-y",  # overwrite output
+                "-i",
+                f"/proc/self/fd/{source.descriptor}",
+                "-map",
+                "0",  # preserve every stream
+                "-c",
+                "copy",  # stream copy — no re-encoding
+                "-movflags",
+                "+faststart",  # web-friendly MP4
+                "-f",
+                "mp4",
+                f"/proc/self/fd/{destination.descriptor}",
+            ]
 
-        logger.info("remuxing %s → %s", input_path, output_path)
+            logger.info("media remux started")
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=self._timeout,
-            )
-        except asyncio.TimeoutError as exc:
-            proc.kill()
-            await proc.wait()
-            raise MediaDependencyError(f"FFmpeg timed out after {self._timeout}s") from exc
-        except asyncio.CancelledError:
-            proc.kill()
-            await proc.wait()
-            raise
-        except FileNotFoundError as exc:
-            raise MediaDependencyError(f"FFmpeg binary not found: {self._ffmpeg_bin}") from exc
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    pass_fds=(source.descriptor, destination.descriptor),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=self._timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                proc.kill()
+                await proc.wait()
+                raise MediaDependencyError(f"FFmpeg timed out after {self._timeout}s") from exc
+            except asyncio.CancelledError:
+                proc.kill()
+                await proc.wait()
+                raise
+            except FileNotFoundError as exc:
+                raise MediaDependencyError(f"FFmpeg binary not found: {self._ffmpeg_bin}") from exc
 
-        if proc.returncode != 0:
-            err_msg = stderr.decode(errors="replace")[-500:] if stderr else "unknown error"
-            raise MediaDependencyError(f"FFmpeg failed (rc={proc.returncode}): {err_msg}")
+            if proc.returncode != 0:
+                err_msg = stderr.decode(errors="replace")[-500:] if stderr else "unknown error"
+                raise MediaDependencyError(f"FFmpeg failed (rc={proc.returncode}): {err_msg}")
 
-        # Verify output was created
-        if not os.path.isfile(output_path):
-            raise RemuxError(f"FFmpeg produced no output file: {output_path}")
-
-        out_size = os.path.getsize(output_path)
-        logger.info("remux complete: %s (%.1f MB)", output_path, out_size / 1_048_576)
+            source.assert_current()
+            destination.assert_current()
+            os.fsync(destination.descriptor)
+            out_size = os.fstat(destination.descriptor).st_size
+            if not out_size:
+                raise RemuxError("FFmpeg produced an empty output")
+            logger.info("media remux completed (%.1f MB)", out_size / 1_048_576)
 
     @staticmethod
     def make_output_path(input_path: str, output_dir: str, *, unique_key: str | None = None) -> str:

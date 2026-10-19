@@ -166,3 +166,44 @@ async def test_deleting_the_cache_changes_no_domain_row_bdd_079(pool, tmp_path):
 
     assert pool.states == before
     assert list((tmp_path / "objects").iterdir()) == []
+
+
+async def test_republished_object_is_not_evicted_using_the_previous_inode_plan(pool, tmp_path):
+    path = cached(pool, tmp_path, age_hours=100)
+    fetch = pool.fetch
+
+    async def replace_after_scan(sql, ids):
+        replacement = tmp_path / "new-publication.mp4"
+        replacement.write_bytes(b"fresh-copy")
+        os.utime(replacement, (NOW, NOW))
+        replacement.replace(path)
+        return await fetch(sql, ids)
+
+    pool.fetch = replace_after_scan
+    assert await janitor(pool, tmp_path).sweep() == {}
+    assert path.read_bytes() == b"fresh-copy"
+
+
+def test_reader_rejects_a_name_replaced_before_its_shared_lock(tmp_path, monkeypatch):
+    import fcntl
+    import stat
+
+    playable = uuid.uuid4()
+    path = cache_object_path(tmp_path, playable)
+    path.parent.mkdir()
+    path.write_bytes(b"old-copy")
+    lock = fcntl.flock
+
+    def replace_before_lock(descriptor, operation):
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            replacement = tmp_path / "replacement.mp4"
+            replacement.write_bytes(b"new-copy")
+            replacement.replace(path)
+        lock(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", replace_before_lock)
+    reader = PlaybackCache(tmp_path).open_reader(playable, 8)
+    if reader is not None:
+        reader.close()
+    assert reader is None
+    assert path.read_bytes() == b"new-copy"

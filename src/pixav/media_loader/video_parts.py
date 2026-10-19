@@ -13,11 +13,12 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from pixav.shared.media_file import open_media_file, open_media_output
 from pixav.shared.models import VideoPart
 
 TARGET_BYTES = 9_500_000_000
@@ -26,11 +27,8 @@ TRANSFER_SECONDS = 6 * 3600
 
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with open_media_file(path) as source:
+        return source.facts()[0]
 
 
 class IncompatibleMediaError(ValueError):
@@ -119,6 +117,7 @@ def monitored_run(
     *,
     data: bytes | None = None,
     output: Any = subprocess.PIPE,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Bound a tools process and stop its owned Docker container on guard failure."""
     check()
@@ -136,6 +135,7 @@ def monitored_run(
         stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
         stdout=output,
         stderr=subprocess.PIPE,
+        pass_fds=pass_fds,
     ) as process:
         try:
             pending = data
@@ -207,14 +207,53 @@ class PartMedia:
             raise IncompatibleMediaError("native stream clocks exceed the lossless MP4 movie clock limit")
         return timescale
 
-    def command(self, args: list[str], timeout: int, *, output: Any = subprocess.PIPE) -> bytes:
+    @contextmanager
+    def _inputs(self, paths: tuple[Path, ...]) -> Iterator[tuple[list[str], tuple[int, ...]]]:
+        with ExitStack() as resources:
+            sources = [resources.enter_context(open_media_file(path)) for path in paths]
+            yield (
+                [
+                    str(path) if self.prefix else f"/proc/self/fd/{source.descriptor}"
+                    for path, source in zip(paths, sources, strict=True)
+                ],
+                () if self.prefix else tuple(source.descriptor for source in sources),
+            )
+            for source in sources:
+                source.assert_current()
+
+    def command(
+        self,
+        args: list[str],
+        timeout: int,
+        *,
+        output: Any = subprocess.PIPE,
+        inputs: tuple[Path, ...] = (),
+        inherited_fds: tuple[int, ...] = (),
+    ) -> bytes:
+        """Bind explicit local inputs to descriptors inherited by the tool.
+
+        The retired external tools prefix keeps parent-side locks only; its
+        namespace cannot inherit host descriptors and is not cleanup-qualified.
+        """
+        if self.prefix and inherited_fds:
+            raise MediaOperationError(
+                "external tool cannot inherit local media descriptors", category="unsafe_namespace"
+            )
+        with self._inputs(inputs) as (names, descriptors):
+            replacements = {str(path): name for path, name in zip(inputs, names, strict=True)}
+            bound = [replacements.get(arg, arg) for arg in args]
+            return self._command(bound, timeout, output=output, pass_fds=descriptors + inherited_fds)
+
+    def _command(self, args: list[str], timeout: int, *, output: Any, pass_fds: tuple[int, ...]) -> bytes:
         if self.check:
             self.check()
         operation = "probe" if args[0] == self.ffprobe else "ffmpeg"
         try:
             command = self.prefix + (["timeout", "--kill-after=5s", str(timeout)] if self.prefix else []) + args
             if self.check:
-                result = monitored_run(command, timeout + (15 if self.prefix else 0), self.check, output=output)
+                result = monitored_run(
+                    command, timeout + (15 if self.prefix else 0), self.check, output=output, pass_fds=pass_fds
+                )
             else:
                 result = subprocess.run(  # noqa: S603 - argv only, controlled FFmpeg tools
                     command,
@@ -223,6 +262,7 @@ class PartMedia:
                     stderr=subprocess.PIPE,
                     timeout=timeout + (15 if self.prefix else 0),
                     check=False,
+                    pass_fds=pass_fds,
                 )
         except subprocess.TimeoutExpired as exc:
             raise MediaOperationError(
@@ -252,6 +292,7 @@ class PartMedia:
             self.command(
                 [self.ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
                 120,
+                inputs=(path,),
             )
         )
         duration = float(raw["format"]["duration"])
@@ -316,6 +357,7 @@ class PartMedia:
                 str(path),
             ],
             self.deadline(duration),
+            inputs=(path,),
         )
         stamps: list[int] = []
         for line in raw.decode().splitlines():
@@ -390,6 +432,7 @@ class PartMedia:
                 ],
                 self.deadline(duration),
                 output=output,
+                inputs=(path,),
             )
             output.seek(0)
             digest = hashlib.sha256()
@@ -457,6 +500,7 @@ class PartMedia:
                 "-",
             ],
             self.deadline(duration),
+            inputs=(path,),
         )
         result["audio_sha256"] = hashlib.sha256(audio).hexdigest()
         encoded = self.command(
@@ -478,6 +522,7 @@ class PartMedia:
                 "-",
             ],
             self.deadline(duration),
+            inputs=(path,),
         )
         result["encoded_sha256"] = hashlib.sha256(encoded).hexdigest()
         raw = self.probe(path)
@@ -515,21 +560,32 @@ class PartMedia:
             raise ValueError("merge output already exists")
         if spans is not None and (len(spans) != len(paths) or any(not math.isfinite(s) or s <= 0 for s in spans)):
             raise ValueError("invalid concat timeline")
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", dir=destination.parent) as listing:
+        with self._inputs(tuple(paths)) as (names, descriptors), ExitStack() as resources:
+            listing = resources.enter_context(
+                tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", dir=destination.parent)
+            )
             listing.write("ffconcat version 1.0\n")
-            for index, path in enumerate(paths):
+            for index, name in enumerate(names):
                 # New part names are controlled; escape apostrophes in the root as FFmpeg requires.
-                listing.write("file '" + str(path.absolute()).replace("'", "'\\''") + "'\n")
+                listing.write("file '" + str(Path(name).absolute()).replace("'", "'\\''") + "'\n")
                 if spans is not None:
                     listing.write(f"duration {spans[index]:.9f}\n")
             listing.flush()
+            output = None
+            output_name, listing_name, overwrite = str(destination), listing.name, "-n"
+            if not self.prefix:
+                output = resources.enter_context(open_media_output(destination, must_create=True))
+                output_name = f"/proc/self/fd/{output.descriptor}"
+                listing_name = f"/proc/self/fd/{listing.fileno()}"
+                descriptors += (listing.fileno(), output.descriptor)
+                overwrite = "-y"
             self.command(
                 [
                     self.ffmpeg,
                     "-v",
                     "error",
                     "-xerror",
-                    "-n",
+                    overwrite,
                     "-copyts",
                     "-f",
                     "concat",
@@ -538,7 +594,7 @@ class PartMedia:
                     "-safe",
                     "0",
                     "-i",
-                    listing.name,
+                    listing_name,
                     "-map",
                     "0",
                     "-c",
@@ -549,10 +605,16 @@ class PartMedia:
                     "0",
                     "-movflags",
                     "+faststart",
-                    str(destination),
+                    "-f",
+                    "mp4",
+                    output_name,
                 ],
                 self.deadline(duration),
+                inherited_fds=descriptors,
             )
+            if output is not None:
+                output.assert_current()
+                os.fsync(output.descriptor)
 
     def prepare(
         self,
@@ -628,6 +690,7 @@ class PartMedia:
                         str(root / "part-%06d.mp4"),
                     ],
                     self.deadline(duration),
+                    inputs=(source,),
                 )
                 with listing.open() as handle:
                     entries = list(csv.reader(handle))

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
 import json
 import os
 from collections.abc import Sequence
@@ -14,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from pixav.shared.exceptions import MediaDependencyError, RemuxError
+from pixav.shared.media_file import open_media_file
 
 
 class MediaStream(BaseModel):
@@ -157,11 +157,8 @@ def segment_plan(artifact: PreparedArtifact) -> tuple[PreparedSegment, ...]:
 
 
 def _hash_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with open_media_file(path) as source:
+        return source.facts()[0]
 
 
 async def inspect_media(path: str) -> MediaFacts:

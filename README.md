@@ -8,7 +8,7 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,219 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+目前已完成舊隔離媒體重置，保留資料的 D 槽加密備份與實際還原、原 DB 三十張表及 roles、Redis checkpoint 已核對；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整加密備份、獨立還原、原 daemon／容器／volumes／映像及二十個實際掛載核對通過後，已精確刪除 C 槽舊資料磁碟。當次 feature 檢查為 2,240 passed／8 skipped，完整 coverage 約 84%；Ruff／Black／isort／mypy 與工具／CI／managed worker／VPN／private playback Compose 檢查通過。live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -303,7 +303,7 @@ worker 每輪在 queue recovery／claim 前檢查 system pause 與同一個持�
 
 工作區的 managed media-loader 也將 queue recovery 延至 system pause／disk latch 放行後，容量查詢期間新設的 pause 仍會攔住 recovery／claim；恢復期間新設的 pause 會在後續 claim 前再次攔住兩個 consumer。兩個 consumer 共用一次恢復程序，避免重搬另一個 consumer 正在處理的 receipt；低磁碟時下載與 preparation 都停止新增工作。四個回歸情境在修正前失敗、修正後通過；專用 Redis 另核對暫停期間 pending／in-flight 的完整 bytes 不變、放行後 FIFO 恢復一次、兩個 consumer 各取得不同工作，取消後保留 in-flight 待 reconciliation。這組測試使用合成活動，沒有 torrent／provider 請求，不抵 media-loader 的實際部署與完整故障恢復（BDD-024、034、141）。
 
-實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。當前 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用；完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
+實際部署驗證包含獨立 DB migration、角色 dry-run／apply、authority health／metrics、第二個 authority 拒絕。managed tick 已停用 legacy dispatcher／orphan maintenance，既有 legacy task／queue 保留待 reconciliation；合成 pending task 的回歸測試在修正前變成 dispatched，修正後保持 pending，原 queue bytes 亦未改動。該次 authority 保留本輪操作者自己持有的 pause，未啟動 worker 或媒體副作用。2026-10-19 操作者確認曾刻意停止或重啟，當次原 PostgreSQL／Redis／Maxwell 均已停止並維持停止；後續恢復須重新核對實際 bind、DB identifier、Redis run ID 與 pause ownership，不能沿用先前 health 或 runtime 收據。完整 worker／VPN／private playback 及 Golden Path 保持 OPEN。
 
 Windows 磁碟守衛以本地 download filesystem 與 enrolled AVD 所在的實體 Windows volume 同時檢查 100 GiB／10% 門檻。`PIXAV_WINDOWS_CONTROL_IDENTITY_SHA256` 固定 native environment，`PIXAV_WINDOWS_CAPACITY_VOLUME_DEVICE` 固定 volume identity；本輪已核對 AVD、SDK 與 Docker／WSL VHD 都位於同一 D 槽。新 `/v1/capacity` 使用既有 mTLS、runtime generation 與 fresh nonce，五秒 timeout，不經 ADB、不取得 UI ticket、不改 journal。容量未知或分區身分改變就 latch，不能用容器虛擬餘額放行；移動 VHD 或 AVD 前必須重核此對應。
 
@@ -626,7 +626,9 @@ resolver 有設定 PostgreSQL 時，啟動連線最多等待 10 秒；失敗即�
 
 cleanup 增補 [021 migration](migrations/021_cleanup_journal.sql) 與單檔 `cleanup_journal`。janitor 在 publication advisory lock 後取得 video row lock，重查掃描時的 `local_path`；依 canonical path 核對其他 video、workflow artifact、remote segment 與有效 reader 引用。共用路徑目前一律拒絕，尚未提供整組授權／一次 unlink。單一目標在 unlink 前以獨立交易提交 intent，保存 device／inode、size、mtime／ctime、hash 與 parent identity；unlink 後 fsync parent，domain 路徑、audit 與 journal 完成狀態在同一交易提交。`LocalFileJanitor.recover()` 預設唯讀，只接受已有 committed intent、parent identity 及 domain path 一致的缺檔；存在或被替換的檔案保留 pending，不重刪。此功能須先套用 expand migration；正式 cleanup apply 維持關閉。
 
-真 PostgreSQL 的合成媒體測試涵蓋共用引用／路徑 alias、掃描後換路徑、intent 前後／unlink 後／domain commit 後 SIGKILL、唯讀 recovery、可重入 audit 與同 bytes 換 inode 拒絕。這些是隔離軟體證據。所有 reader／writer 的共同檔案鎖、安全 parent descriptor unlink、整組 exact binding、備份 restore receipt 授權與 operator CLI 尚未完成，不能據此宣告 cleanup race gate 或 production staging 刪除通過。離機備份保持 OPEN；本次操作者授權的隔離媒體重置不替代正式 cleanup 驗收。
+Linux 的 [共同檔案協定](src/pixav/shared/media_file.py) 使用不建立 sidecar 的非阻塞 shared／exclusive `flock`，拒絕 symlink、非普通檔案及不同 owner，並以固定 parent descriptor 核對 name／inode 後 unlink／fsync。[串流 reader](src/pixav/strm_resolver/playback.py) 複製已鎖 descriptor；hash、ffprobe、remux 與本地 PartMedia 將 descriptor 經 `pass_fds` 傳給工具，以 `/proc/self/fd` 存取，子程序未結束時不因父程序關閉而解鎖。janitor 的 exclusive inode lock 持有至 domain transaction commit，缺檔 recovery 另持有 parent directory lock；[cache eviction](src/pixav/strm_resolver/cache_janitor.py) 重查掃描時的完整 fingerprint／access time，[cache publisher](src/pixav/pixel_injector/playback_activity.py) 也須取得既有物件的 exclusive lock。舊外部工具 prefix 僅有父程序鎖，不具備 namespace 內 descriptor 繼承保證，不作 cleanup 驗收。
+
+[共同鎖測試](tests/shared/test_media_file.py) 與真 PostgreSQL 的合成媒體測試涵蓋活躍程序 reader、hash await 取消後仍在執行的 thread、重複 descriptor、parent／name 替換、共用引用／路徑 alias、掃描後換路徑、intent 前後／unlink 後／domain commit 後 SIGKILL、唯讀 recovery、可重入 audit 與同 bytes 換 inode 拒絕；eligible dry-run 保留 staging 的 inode／size／atime／mtime／ctime、檔案集合及 domain／authorization／journal／audit 資料。當次 WSL／Docker bind 實測雙向鎖、實際 ffprobe／remux、分段／完整解碼與無損合併，以及父程序 SIGKILL 後 FFmpeg 的讀寫鎖延續，全部使用獨立合成資料。這些是隔離證據；尚未涵蓋全部 reader／writer、qBittorrent quiescence、其他 filesystem／native Windows、整組 exact binding、備份 restore receipt 授權及 operator CLI，不能宣告完整 cleanup race gate 或 production staging 刪除通過。離機備份保持 OPEN；本次操作者授權的隔離媒體重置不替代正式 cleanup 驗收。
 
 managed authority 在 DURABLE 提交交易中，以 `durable_at + PIXAV_LOCAL_CLEANUP_SUCCESS_HOURS` 設定本地保留期限（預設 24 小時，至少 1 小時），保留既有較長期限；重新驗證不重設 durability 時間，也不縮短期限。`pixav-local://` 或沒有本地檔案的項目不排程。到期只是 cleanup 候選，仍須完整實播登錄、publication、exact-target 備份授權及所有 reader／execution 守衛通過。此排程不補寫已完成 execution 的歷史事實，既有缺期限資產須由後續 authority re-verification 收斂。
 

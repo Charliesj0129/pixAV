@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import fcntl
 import logging
 import os
-import stat
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -25,6 +23,7 @@ import asyncpg
 from fastapi import HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from pixav.shared.media_file import MediaFileChangedError, MediaFileUnsafeError, open_media_file
 from pixav.shared.metrics import record_playback_request
 from pixav.shared.playback_models import cache_object_path
 
@@ -129,31 +128,25 @@ class PlaybackCache:
         """
         path = cache_object_path(self.root, playable_asset_id)
         try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with open_media_file(path) as source:
+                if os.fstat(source.descriptor).st_size != size_bytes:
+                    return None
+                # A duplicate retains the same shared kernel lock after the
+                # directory guard closes, until this reader itself closes.
+                handle = source.reader()
+                try:
+                    os.utime(source.descriptor)
+                except OSError:
+                    logger.warning("could not record playback cache access")
+                return handle
         except FileNotFoundError:
             return None
-        except OSError as exc:
-            if exc.errno != errno.ELOOP:
-                raise PlaybackCacheError(type(exc).__name__) from exc
-            logger.warning("playback cache object %s is a link; waiting for a rebuild", playable_asset_id)
+        except (BlockingIOError, MediaFileChangedError, MediaFileUnsafeError):
             return None
-        handle = os.fdopen(descriptor, "rb", buffering=0)
-        try:
-            facts = os.fstat(descriptor)
-            if not stat.S_ISREG(facts.st_mode) or facts.st_size != size_bytes:
-                logger.warning("playback cache object %s is not the READY object", playable_asset_id)
-                handle.close()
-                return None
-            fcntl.flock(descriptor, fcntl.LOCK_SH)
-            try:
-                # Access time drives expiry; atime alone is unreliable on relatime mounts.
-                os.utime(descriptor)
-            except OSError as exc:
-                logger.warning("could not record access to playback object %s: %s", playable_asset_id, exc)
-        except BaseException:
-            handle.close()
-            raise
-        return handle
+        except OSError as exc:
+            if exc.errno not in {errno.ELOOP, errno.ENOTDIR}:
+                raise PlaybackCacheError(type(exc).__name__) from exc
+            return None
 
     async def wait_for(self, playable_asset_id: uuid.UUID, size_bytes: int, seconds: float) -> BinaryIO | None:
         """Poll for a rebuilt object until the deadline; the rebuild continues after it."""

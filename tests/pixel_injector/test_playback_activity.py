@@ -29,6 +29,29 @@ STREAMS = [
 ]
 
 
+def test_publication_waits_for_a_reader_of_the_existing_object(tmp_path):
+    from pixav.strm_resolver.playback import PlaybackCache
+
+    worker, playable, _ = build(tmp_path, FakeMaterializer())
+    old = cache_object_path(worker.cache_root, playable["id"])
+    old.parent.mkdir(parents=True)
+    old.write_bytes(CONTENT)
+    replacement = tmp_path / "new-publication.mp4"
+    replacement.write_bytes(CONTENT)
+    reader = PlaybackCache(worker.cache_root).open_reader(playable["id"], len(CONTENT))
+    assert reader is not None
+    before = old.stat().st_ino
+    try:
+        with pytest.raises(BlockingIOError):
+            worker._publish(replacement, playable["id"], uuid.uuid4())
+        assert old.stat().st_ino == before
+        assert reader.read() == CONTENT
+    finally:
+        reader.close()
+    worker._publish(replacement, playable["id"], uuid.uuid4())
+    assert old.read_bytes() == CONTENT
+
+
 def facts(size: int = len(CONTENT), digest: str = DIGEST) -> dict:
     return {"container": "mov,mp4", "size_bytes": size, "duration_seconds": 10.0, "sha256": digest, "streams": STREAMS}
 
@@ -174,10 +197,10 @@ async def test_separate_mounts_offer_a_verified_private_copy(tmp_path, monkeypat
     source = verified_readback(tmp_path, segment)
     real_link = os.link
 
-    def separate_mounts(original, destination):
+    def separate_mounts(original, destination, **kwargs):
         if "cloud" in Path(destination).parts:
             raise OSError(errno.EXDEV, "separate mounts")
-        return real_link(original, destination)
+        return real_link(original, destination, **kwargs)
 
     monkeypatch.setattr(os, "link", separate_mounts)
     result = await worker.execute(request_for(playable, "prepare"))
@@ -195,10 +218,10 @@ async def test_corrupted_cross_mount_copy_and_symlink_session_are_not_offered(tm
     source.parent.joinpath("session-symlink").symlink_to(original, target_is_directory=True)
     real_link = os.link
 
-    def separate_mounts(original, destination):
+    def separate_mounts(original, destination, **kwargs):
         if "cloud" in Path(destination).parts:
             raise OSError(errno.EXDEV, "separate mounts")
-        return real_link(original, destination)
+        return real_link(original, destination, **kwargs)
 
     def bad_copy(reader, writer):
         writer.write(b"untrusted copy")

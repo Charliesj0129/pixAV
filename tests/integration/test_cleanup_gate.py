@@ -27,6 +27,7 @@ from pixav.library_projection.render import render_projection
 from pixav.library_projection.repository import ArtworkRecord
 from pixav.library_projection.writer import ProjectionWriter
 from pixav.maxwell_core.gc import LocalFileJanitor
+from pixav.shared.media_file import open_media_file
 from pixav.shared.playable_assets import PlayableAssetRepository
 from pixav.shared.remote_assets import RemoteAssetRepository
 
@@ -192,6 +193,33 @@ async def test_active_reader_rejects_bdd_060(db, tmp_path):
     assert media.exists()
 
 
+async def test_live_filesystem_reader_blocks_cleanup_without_a_database_lease(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import fcntl,sys;f=open(sys.argv[1],'rb');fcntl.flock(f,fcntl.LOCK_SH);print('READY',flush=True);sys.stdin.read();f.close()",
+        str(media),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        assert await asyncio.wait_for(process.stdout.readline(), timeout=5) == b"READY\n"
+        assert process.returncode is None
+        stats = await janitor(db, tmp_path).cleanup()
+        assert stats["deleted"] == 0 and stats["rejected"] == 1
+        assert media.read_bytes() == b"the only local copy"
+        assert await db.fetchval("SELECT count(*) FROM cleanup_journal") == 0
+        assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) == str(media)
+    finally:
+        process.stdin.close()
+        await asyncio.wait_for(process.wait(), timeout=5)
+
+
 async def test_expired_reader_lease_no_longer_blocks_bdd_060(db, tmp_path):
     video, media = await artifact(db, tmp_path)
     await publish(db, video)
@@ -230,6 +258,64 @@ async def test_dry_run_changes_nothing_bdd_133(db, tmp_path):
     assert media.read_bytes() == b"the only local copy"
     assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) == str(media)
     assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 0
+
+
+async def test_eligible_dry_run_keeps_staging_metadata_and_database_unchanged(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    os.utime(media, ns=(1_000_000_000, media.stat().st_mtime_ns))
+    before = media.stat()
+    names = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    snapshot_sql = """SELECT md5(jsonb_build_array(
+        (SELECT jsonb_agg(to_jsonb(v) ORDER BY id) FROM videos v),
+        (SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM cleanup_authorizations a),
+        (SELECT jsonb_agg(to_jsonb(j) ORDER BY id) FROM cleanup_journal j),
+        (SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM cleanup_audit a)
+    )::text)"""
+    database_before = await db.fetchval(snapshot_sql)
+
+    stats = await janitor(db, tmp_path, apply=False).cleanup()
+
+    assert stats["eligible"] == 1 and stats["deleted"] == stats["rejected"] == 0
+    after = media.stat()
+    assert (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_atime_ns,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) == (after.st_dev, after.st_ino, after.st_size, after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns)
+    assert names == sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert await db.fetchval(snapshot_sql) == database_before
+
+
+async def test_inode_lock_remains_held_through_unlink_and_domain_commit(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    await authorize(db, video, media)
+    alias = tmp_path / "retained-alias.mp4"
+    os.link(media, alias)
+    observed = []
+
+    class InspectCommit(LocalFileJanitor):
+        async def _audit(self, conn, video, path, decision, applied, reasons):
+            if decision == "deleted":
+                assert not media.exists()
+                with pytest.raises(BlockingIOError), open_media_file(alias):
+                    pytest.fail("reader opened the inode before the domain transaction committed")
+                observed.append("locked")
+            await super()._audit(conn, video, path, decision, applied, reasons)
+
+    operator = InspectCommit(db, download_dir=str(tmp_path), library_root=str(tmp_path / "library"))
+    assert (await operator.cleanup(apply=True))["deleted"] == 1
+    assert observed == ["locked"]
+    with open_media_file(alias) as reader:
+        assert reader.facts()[1] == 19
+    assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
 
 
 async def test_publication_row_cannot_substitute_for_playback_evidence_bdd_005_131(db, tmp_path):
@@ -727,7 +813,7 @@ async def test_cleanup_sigkill_recovery_uses_only_committed_intents(db, tmp_path
     dsn = urlunsplit(endpoint._replace(path=f"/{database}"))
     ready = tmp_path / "kill-ready"
     child = tmp_path / "cleanup-child.py"
-    child.write_text("""
+    child.write_text(r"""
 import asyncio, json, os, sys
 from pathlib import Path
 import asyncpg
@@ -735,7 +821,8 @@ from pixav.maxwell_core.gc import LocalFileJanitor
 from pixav.shared.instance import database_identity
 from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
 
-dsn, root, stage, ready = sys.argv[1:]
+root, stage, ready = sys.argv[1:]
+dsn = sys.stdin.readline().rstrip("\n")
 async def checkpoint():
     Path(ready).write_text("ready")
     await asyncio.sleep(60)
@@ -768,11 +855,14 @@ async def main():
 asyncio.run(main())
 """)
     process = subprocess.Popen(  # noqa: S603 -- guarded child uses only this test's database and files
-        [sys.executable, str(child), dsn, str(tmp_path), stage, str(ready)],
+        [sys.executable, str(child), str(tmp_path), stage, str(ready)],
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
+        process.stdin.write((dsn + "\n").encode())
+        process.stdin.close()
         for _ in range(200):
             if ready.exists():
                 break

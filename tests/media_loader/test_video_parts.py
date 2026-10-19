@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -148,6 +150,28 @@ def test_media_tool_failure_is_bounded_and_redacted(failure, expected):
     assert "private" not in str(error.value)
     assert media.deadline(100) == 1800
     assert media.deadline(3600) == 14400
+
+
+@pytest.mark.parametrize("monitored", [False, True])
+def test_media_tool_inherits_a_locked_input_descriptor(tmp_path, monitored):
+    path = tmp_path / "synthetic.mp4"
+    path.write_bytes(b"synthetic")
+    code = """
+import fcntl, os, sys
+assert sys.argv[1].startswith('/proc/self/fd/')
+descriptor = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    assert os.read(descriptor, 9) == b'synthetic'
+    print('READ_LOCK_INHERITED')
+else:
+    raise AssertionError('input was not locked')
+"""
+    media = PartMedia()
+    if monitored:
+        media.check = lambda: None
+    assert media.command([sys.executable, "-c", code, str(path)], 5, inputs=(path,)) == b"READ_LOCK_INHERITED\n"
 
 
 @pytest.mark.parametrize(
@@ -306,7 +330,7 @@ def test_split_merge_keeps_the_gap_before_the_next_source_segment(tmp_path, monk
     monkeypatch.setattr(media, "probe", lambda *_: raw)
     merged_spans = []
 
-    def split(args, timeout):
+    def split(args, timeout, **kwargs):
         listing = Path(args[args.index("-segment_list") + 1])
         listing.write_text("part-000000.mp4,0.000000,5.000000\npart-000001.mp4,5.000467,10.000000\n")
         for index in range(2):
@@ -499,8 +523,10 @@ class TestTimelinePrecheck:
 
     def _scan(self, stdout: bytes):
         completed = subprocess.CompletedProcess(args=["ffprobe"], returncode=0, stdout=stdout, stderr=b"")
-        with patch("subprocess.run", return_value=completed):
-            return PartMedia().validate_timeline(Path("film.mp4"), self._raw())
+        with tempfile.TemporaryDirectory() as directory, patch("subprocess.run", return_value=completed):
+            path = Path(directory) / "film.mp4"
+            path.write_bytes(b"synthetic")
+            return PartMedia().validate_timeline(path, self._raw())
 
     def test_a_strictly_increasing_timeline_is_accepted(self):
         assert self._scan(b"0\n1\n2\n3\n") == {"packets": 4, "first_pts": 0, "last_pts": 3}
@@ -537,10 +563,12 @@ class TestTimelinePrecheck:
         # stream ends with a newline. Neither is a defect in the media.
         assert self._scan(b"0,\n1,\n\n2,\n")["packets"] == 3
 
-    def test_a_tool_deadline_does_not_reject_the_film(self):
+    def test_a_tool_deadline_does_not_reject_the_film(self, tmp_path):
+        path = tmp_path / "film.mp4"
+        path.write_bytes(b"synthetic")
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="ffprobe", timeout=1)):
             with pytest.raises(MediaOperationError) as error:
-                PartMedia().validate_timeline(Path("film.mp4"), self._raw())
+                PartMedia().validate_timeline(path, self._raw())
         assert error.value.operation == "probe"
         assert not isinstance(error.value, IncompatibleMediaError)
 

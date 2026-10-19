@@ -11,7 +11,6 @@ the cache is never domain truth.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
 import re
@@ -23,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pixav.shared.media_file import file_version, open_media_file
 from pixav.shared.metrics import record_playback_cache_eviction
 from pixav.shared.playback_models import CACHE_OBJECTS
 
@@ -49,31 +49,20 @@ class CacheEntry:
     name: str
     size: int
     last_access: float
+    fingerprint: tuple[int, ...]
 
 
-def _evict(path: Path) -> bool:
+def _evict(path: Path, fingerprint: tuple[int, ...]) -> bool:
     """Unlink one regular file only while no reader holds it."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
+        with open_media_file(path, exclusive=True) as source:
+            facts = os.fstat(source.descriptor)
+            if (*file_version(facts), facts.st_atime_ns) != fingerprint:
+                return False
+            source.unlink()
+            return True
+    except (OSError, ValueError):
         return False
-    try:
-        facts = os.fstat(descriptor)
-        if not stat.S_ISREG(facts.st_mode):
-            return False
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        # A republish may have replaced the name since it was opened; only the
-        # locked object itself may be removed.
-        current = os.lstat(path)
-        if (current.st_dev, current.st_ino) != (facts.st_dev, facts.st_ino):
-            return False
-        os.unlink(path)
-        return True
-    finally:
-        os.close(descriptor)
 
 
 class PlaybackCacheJanitor:
@@ -96,21 +85,21 @@ class PlaybackCacheJanitor:
         """Evict what the policy allows now; return evictions by reason."""
         entries, partials = await asyncio.to_thread(self._scan)
         states = await self._states([entry.playable_asset_id for entry in entries])
-        planned = [(entry.name, reason) for entry, reason in self._plan(entries, states)]
-        planned += [(name, "orphan") for name in partials]
+        planned = [(entry.name, reason, entry.fingerprint) for entry, reason in self._plan(entries, states)]
+        planned += [(name, "orphan", fingerprint) for name, fingerprint in partials]
         evicted = await asyncio.to_thread(self._evict_planned, planned)
         for reason, count in evicted.items():
             for _ in range(count):
                 record_playback_cache_eviction(reason)
         return evicted
 
-    def _scan(self) -> tuple[list[CacheEntry], list[str]]:
+    def _scan(self) -> tuple[list[CacheEntry], list[tuple[str, tuple[int, ...]]]]:
         try:
             names = os.listdir(self.objects)
         except FileNotFoundError:
             return [], []
         entries: list[CacheEntry] = []
-        partials: list[str] = []
+        partials: list[tuple[str, tuple[int, ...]]] = []
         now = self._clock()
         for name in names:
             try:
@@ -122,9 +111,17 @@ class PlaybackCacheJanitor:
             match = _OBJECT_NAME.fullmatch(name)
             if match:
                 last_access = max(facts.st_atime, facts.st_mtime)
-                entries.append(CacheEntry(uuid.UUID(match.group(1)), name, facts.st_size, last_access))
+                entries.append(
+                    CacheEntry(
+                        uuid.UUID(match.group(1)),
+                        name,
+                        facts.st_size,
+                        last_access,
+                        (*file_version(facts), facts.st_atime_ns),
+                    )
+                )
             elif _PARTIAL_NAME.fullmatch(name) and now - facts.st_ctime > _PARTIAL_GRACE_SECONDS:
-                partials.append(name)
+                partials.append((name, (*file_version(facts), facts.st_atime_ns)))
         return entries, partials
 
     async def _states(self, ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[str, str]]:
@@ -162,10 +159,10 @@ class PlaybackCacheJanitor:
                 total -= entry.size
         return doomed
 
-    def _evict_planned(self, planned: list[tuple[str, str]]) -> dict[str, int]:
+    def _evict_planned(self, planned: list[tuple[str, str, tuple[int, ...]]]) -> dict[str, int]:
         evicted: dict[str, int] = {}
-        for name, reason in planned:
-            if _evict(self.objects / name):
+        for name, reason, fingerprint in planned:
+            if _evict(self.objects / name, fingerprint):
                 evicted[reason] = evicted.get(reason, 0) + 1
             else:
                 logger.info("playback cache object %s kept for now (%s): in use or replaced", name, reason)

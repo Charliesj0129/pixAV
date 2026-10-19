@@ -17,7 +17,7 @@ import logging
 import os
 import shutil
 import uuid
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Protocol
 
@@ -28,6 +28,7 @@ from pixav.media_loader.video_parts import contained_file, sha256
 from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
 from pixav.pixel_injector.photos_storage import COLD_MOUNTS, ColdProcessError, PhotosColdReadback
 from pixav.shared.activity_context import activity_context
+from pixav.shared.media_file import open_media_directory, open_media_file
 from pixav.shared.playable_assets import playable_from_row
 from pixav.shared.playback_models import (
     CACHE_OBJECTS,
@@ -222,7 +223,9 @@ class PlaybackActivityWorker:
         try:
             receipt, inputs = await self._run(request, playable, expected, segments, work)
             output = await asyncio.to_thread(self._verify_output, work, playable, receipt)
-            await asyncio.to_thread(self._publish, output, playable.id, request.attempt_id)
+            await asyncio.to_thread(
+                self._publish, output, playable.id, request.attempt_id, (receipt["sha256"], int(receipt["size"]))
+            )
         except PlaybackRefusedError:
             # Bytes that are not the film are evidence; keep them for inspection.
             raise
@@ -282,27 +285,53 @@ class PlaybackActivityWorker:
             raise PlaybackRefusedError("PLAYBACK_INTEGRITY_MISMATCH")
         return output
 
-    def _publish(self, output: Path, playable_id: uuid.UUID, attempt_id: uuid.UUID) -> None:
-        """Make the verified object visible under its identity in one rename.
-
-        A reader that already holds the previous object keeps its own open file;
-        the rename only changes what the next open finds.
-        """
+    def _publish(
+        self, output: Path, playable_id: uuid.UUID, attempt_id: uuid.UUID, expected: tuple[str, int] | None = None
+    ) -> None:
+        """Publish verified bytes while coordinating existing readers and eviction."""
         objects = self.cache_root / CACHE_OBJECTS
         objects.mkdir(parents=True, exist_ok=True, mode=0o700)
         if objects.is_symlink():
             raise ValueError("playback cache objects directory is a symlink")
         staged = objects / f".{attempt_id}.partial"
-        os.link(output, staged)
-        # Expiry counts unread time from publication, not from when a reused
-        # read-back file (the same inode) was first written.
-        os.utime(staged)
-        os.replace(staged, objects / cache_object_name(playable_id))
-        descriptor = os.open(objects, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        target = objects / cache_object_name(playable_id)
+        with open_media_file(output) as source:
+            if expected is not None and source.facts() != expected:
+                raise PlaybackRefusedError("PLAYBACK_INTEGRITY_MISMATCH")
+            with open_media_directory(target, exclusive=True) as directory, ExitStack() as guards:
+                source_info = os.fstat(source.descriptor)
+                try:
+                    existing = os.stat(target.name, dir_fd=directory.descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (existing.st_dev, existing.st_ino) == (source_info.st_dev, source_info.st_ino):
+                        return
+                    guards.enter_context(open_media_file(target, exclusive=True, directory=directory))
+                created = False
+                try:
+                    source.assert_current()
+                    os.link(
+                        source.path.name,
+                        staged.name,
+                        src_dir_fd=source.parent_descriptor,
+                        dst_dir_fd=directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                    created = True
+                    linked = os.stat(staged.name, dir_fd=directory.descriptor, follow_symlinks=False)
+                    if (linked.st_dev, linked.st_ino) != (source_info.st_dev, source_info.st_ino):
+                        raise PlaybackRefusedError("PLAYBACK_INTEGRITY_MISMATCH")
+                    os.utime(staged.name, dir_fd=directory.descriptor, follow_symlinks=False)
+                    directory.assert_current()
+                    os.replace(
+                        staged.name, target.name, src_dir_fd=directory.descriptor, dst_dir_fd=directory.descriptor
+                    )
+                    os.fsync(directory.descriptor)
+                finally:
+                    if created:
+                        with suppress(FileNotFoundError):
+                            os.unlink(staged.name, dir_fd=directory.descriptor)
 
     async def run_one(self, queue: TaskQueue) -> bool:
         claimed = await queue.pop_claim(timeout=1)

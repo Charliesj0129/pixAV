@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from pixav.shared.exceptions import CrawlError
+from pixav.shared.media_file import open_media_file
 
 logger = logging.getLogger(__name__)
 
@@ -133,65 +134,68 @@ async def probe_media(path: str, *, ffprobe_bin: str = "ffprobe", timeout: int =
         raise RemuxError("symlink in media input path")
     if not target.is_file():
         raise RemuxError("media file does not exist")
-    before = target.stat()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            ffprobe_bin,
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except OSError as exc:
-        raise MediaDependencyError("ffprobe unavailable") from exc
-    try:
-        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-        if isinstance(exc, asyncio.CancelledError):
-            raise
-        raise MediaDependencyError("ffprobe timed out") from exc
-    if proc.returncode != 0:
-        raise RemuxError("ffprobe rejected media")
-    try:
-        raw = json.loads(stdout)
-        streams = tuple(
-            {
-                "kind": s["codec_type"],
-                "codec": s["codec_name"],
-                "width": s.get("width", 0),
-                "height": s.get("height", 0),
-            }
-            for s in raw["streams"]
-        )
-        facts = MediaFacts(
-            container=raw["format"]["format_name"],
-            size_bytes=raw["format"]["size"],
-            duration_seconds=raw["format"]["duration"],
-            streams=streams,
-            sha256=await hash_file(path),
-        )
-        video = next(s for s in facts.streams if s.kind == "video")
-    except (ValueError, TypeError, KeyError, StopIteration) as exc:
-        raise RemuxError("invalid ffprobe media facts") from exc
-    after = target.stat()
-    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
-        raise RemuxError("media changed during inspection")
-    if facts.size_bytes != after.st_size or not video.width or not video.height:
-        raise RemuxError("invalid media size or video dimensions")
-    return {
-        **facts.model_dump(mode="json"),
-        "path": path,
-        "filename": os.path.basename(path),
-        "codec": video.codec,
-        "width": video.width,
-        "height": video.height,
-        "resolution": f"{video.width}x{video.height}",
-    }
+    with open_media_file(target) as source:
+        before = os.fstat(source.descriptor)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_format",
+                "-of",
+                "json",
+                f"/proc/self/fd/{source.descriptor}",
+                pass_fds=(source.descriptor,),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise MediaDependencyError("ffprobe unavailable") from exc
+        try:
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise MediaDependencyError("ffprobe timed out") from exc
+        if proc.returncode != 0:
+            raise RemuxError("ffprobe rejected media")
+        try:
+            raw = json.loads(stdout)
+            streams = tuple(
+                {
+                    "kind": s["codec_type"],
+                    "codec": s["codec_name"],
+                    "width": s.get("width", 0),
+                    "height": s.get("height", 0),
+                }
+                for s in raw["streams"]
+            )
+            facts = MediaFacts(
+                container=raw["format"]["format_name"],
+                size_bytes=raw["format"]["size"],
+                duration_seconds=raw["format"]["duration"],
+                streams=streams,
+                sha256=await hash_file(path),
+            )
+            video = next(s for s in facts.streams if s.kind == "video")
+        except (ValueError, TypeError, KeyError, StopIteration) as exc:
+            raise RemuxError("invalid ffprobe media facts") from exc
+        source.assert_current()
+        after = os.fstat(source.descriptor)
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise RemuxError("media changed during inspection")
+        if facts.size_bytes != after.st_size or not video.width or not video.height:
+            raise RemuxError("invalid media size or video dimensions")
+        return {
+            **facts.model_dump(mode="json"),
+            "path": path,
+            "filename": os.path.basename(path),
+            "codec": video.codec,
+            "width": video.width,
+            "height": video.height,
+            "resolution": f"{video.width}x{video.height}",
+        }
