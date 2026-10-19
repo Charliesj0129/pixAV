@@ -28,7 +28,7 @@ from pixav.media_loader.video_parts import contained_file, sha256
 from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
 from pixav.pixel_injector.photos_storage import COLD_MOUNTS, ColdProcessError, PhotosColdReadback
 from pixav.shared.activity_context import activity_context
-from pixav.shared.media_file import open_media_directory, open_media_file
+from pixav.shared.media_file import file_version, open_media_directory, open_media_file, open_media_output
 from pixav.shared.playable_assets import playable_from_row
 from pixav.shared.playback_models import (
     CACHE_OBJECTS,
@@ -80,6 +80,10 @@ class PlaybackRefusedError(Exception):
         self.code = code
 
 
+class PlaybackWorkConflictError(Exception):
+    """Retain changed, foreign or busy work; it is not a remote media verdict."""
+
+
 def _redacted(segment: RemoteAssetSegment, *, account_bound: bool = False) -> dict:
     """What the isolated process may know: the provider location and the facts."""
     clean = segment.model_copy(
@@ -123,8 +127,42 @@ def _link_verified_readback(segment: RemoteAssetSegment, readback_root: Path, cl
     return False
 
 
+def _offer_file(original: Path, destination: Path, created: dict[Path, tuple[int, ...]]) -> None:
+    with open_media_file(original) as source:
+        try:
+            os.link(original, destination)
+            created[destination] = file_version(os.fstat(source.descriptor))
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            with open_media_output(destination, must_create=True) as output:
+                try:
+                    with source.reader() as reader, os.fdopen(os.dup(output.descriptor), "wb") as writer:
+                        shutil.copyfileobj(reader, writer)
+                        writer.flush()
+                        os.fsync(output.descriptor)
+                finally:
+                    created[destination] = file_version(os.fstat(output.descriptor))
+        source.assert_current()
+
+
+def _discard_offered(created: dict[Path, tuple[int, ...]]) -> None:
+    """Remove only this call's exact objects; changed or busy work needs review."""
+    try:
+        for path, fingerprint in created.items():
+            with open_media_file(path, exclusive=True) as source:
+                if file_version(os.fstat(source.descriptor)) != fingerprint:
+                    raise ValueError("offered work changed")
+                source.unlink()
+    except (OSError, ValueError) as exc:
+        raise PlaybackWorkConflictError("PLAYBACK_WORK_REQUIRES_RECONCILIATION") from exc
+
+
 def _offer_readback(segment: RemoteAssetSegment, root: Path, folder: Path, cloud: Path) -> bool:
     source, receipt = folder / segment.filename, folder / (segment.filename + ".json")
+    if any(os.path.lexists(cloud / path.name) for path in (source, receipt)):
+        raise PlaybackWorkConflictError("PLAYBACK_WORK_REQUIRES_RECONCILIATION")
+    created: dict[Path, tuple[int, ...]] = {}
     try:
         contained_file(root, source)
         contained_file(root, receipt)
@@ -138,27 +176,17 @@ def _offer_readback(segment: RemoteAssetSegment, root: Path, folder: Path, cloud
         ):
             return False
         for original in (source, receipt):
-            destination = cloud / original.name
-            try:
-                os.link(original, destination)
-            except OSError as exc:
-                if exc.errno != errno.EXDEV:
-                    raise
-                fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with original.open("rb") as reader, os.fdopen(fd, "wb") as writer:
-                    shutil.copyfileobj(reader, writer)
-                    writer.flush()
-                    os.fsync(writer.fileno())
+            _offer_file(original, cloud / original.name, created)
         if (cloud / segment.filename).stat().st_size != segment.size_bytes or sha256(
             cloud / segment.filename
         ) != segment.sha256:
             raise ValueError("read-back changed while it was offered")
         if json.loads((cloud / receipt.name).read_text()) != report:
             raise ValueError("read-back receipt changed while it was offered")
+    except FileExistsError as exc:
+        raise PlaybackWorkConflictError("PLAYBACK_WORK_REQUIRES_RECONCILIATION") from exc
     except (OSError, ValueError, UnicodeError):
-        for stray in (cloud / segment.filename, cloud / (segment.filename + ".json")):
-            with suppress(FileNotFoundError):
-                stray.unlink()
+        _discard_offered(created)
         return False
     return True
 
@@ -191,6 +219,10 @@ class PlaybackActivityWorker:
             return ActivityResult(**fields, outcome="success", evidence=evidence)
         except PlaybackRefusedError as refused:
             return ActivityResult(**fields, outcome="verification_failed", error_code=refused.code)
+        except PlaybackWorkConflictError:
+            return ActivityResult(
+                **fields, outcome="infrastructure", error_code="PLAYBACK_WORK_REQUIRES_RECONCILIATION"
+            )
         except AccountSessionRequiredError:
             return ActivityResult(**fields, outcome="user_action", error_code="PHOTOS_ACCOUNT_SESSION_REQUIRED")
         except Exception:
@@ -226,8 +258,8 @@ class PlaybackActivityWorker:
             await asyncio.to_thread(
                 self._publish, output, playable.id, request.attempt_id, (receipt["sha256"], int(receipt["size"]))
             )
-        except PlaybackRefusedError:
-            # Bytes that are not the film are evidence; keep them for inspection.
+        except (PlaybackRefusedError, PlaybackWorkConflictError):
+            # Integrity failures and work ownership conflicts retain their evidence.
             raise
         except BaseException:
             await asyncio.to_thread(shutil.rmtree, work, True)

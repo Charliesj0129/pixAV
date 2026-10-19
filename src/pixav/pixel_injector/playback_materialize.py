@@ -25,6 +25,7 @@ from pathlib import Path
 from pixav.media_loader.preparation import MediaFacts, PreparationPolicy, timeline_defect
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary
 from pixav.pixel_injector.parts_download import download_original, observed_media
+from pixav.shared.media_file import open_media_file
 from pixav.shared.playback_models import MATERIALIZATION_METHOD, validate_materialization
 from pixav.shared.storage_models import IntegrityError, RemoteAssetSegment
 
@@ -62,8 +63,8 @@ def _join(segments: list[RemoteAssetSegment], cloud: Path, destination: Path, ex
             whole.duration_seconds,
             spans=[s.end_seconds - s.start_seconds for s in segments],
         )
-        with partial.open("rb") as handle:
-            os.fsync(handle.fileno())
+        with open_media_file(partial) as source:
+            os.fsync(source.descriptor)
         os.link(partial, destination)
 
 

@@ -170,6 +170,40 @@ def test_directory_mutation_blocks_reader_handoff(tmp_path):
             pytest.fail("reader cannot race an active name mutation")
 
 
+async def test_legacy_local_stream_blocks_inode_deletion_until_stream_closes(tmp_path):
+    from pixav.strm_resolver.routes import _stream_file
+
+    path = tmp_path / "synthetic.mp4"
+    path.write_bytes(b"synthetic")
+    stream = _stream_file(str(path), start=0, end=8)
+    try:
+        assert await anext(stream) == b"synthetic"
+        with pytest.raises(BlockingIOError), open_media_file(path, exclusive=True):
+            pytest.fail("the local route is still serving this inode")
+    finally:
+        await stream.aclose()
+    with open_media_file(path, exclusive=True):
+        pass
+
+
+def test_complete_original_decoder_cannot_open_an_active_writer(tmp_path, monkeypatch):
+    from pixav.pixel_injector.parts_download import decode_original
+
+    path = tmp_path / "synthetic.mp4"
+    path.write_bytes(b"synthetic")
+    called = []
+
+    def completed(*args, **kwargs):
+        called.append(True)
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(subprocess, "run", completed)
+    with open_media_file(path, exclusive=True):
+        with pytest.raises(BlockingIOError):
+            decode_original(path)
+    assert not called
+
+
 async def test_cancelled_hash_keeps_its_duplicate_locked_until_thread_finishes(tmp_path, monkeypatch):
     path = tmp_path / "synthetic.mp4"
     path.write_bytes(b"synthetic")

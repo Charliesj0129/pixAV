@@ -8,6 +8,7 @@ is offered as input, what is recomputed, what is published -- runs for real.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -161,6 +162,104 @@ def verified_readback(tmp_path: Path, segment: dict, *, digest: str = DIGEST) ->
         json.dumps({"method": "photos-original-browser", "size": len(CONTENT), "sha256": digest})
     )
     return folder / name
+
+
+@pytest.mark.parametrize("existing", ["media", "receipt"])
+def test_offering_readback_preserves_unowned_work_files(tmp_path, existing):
+    from pixav.pixel_injector.playback_activity import PlaybackWorkConflictError, _offer_readback
+    from pixav.shared.remote_assets import segment_from_row
+
+    worker, _, row = build(tmp_path, FakeMaterializer())
+    source = verified_readback(tmp_path, row)
+    cloud = tmp_path / "cloud"
+    cloud.mkdir()
+    foreign = cloud / (source.name if existing == "media" else source.name + ".json")
+    foreign.write_bytes(b"retained work from another owner")
+    before = foreign.stat().st_ino
+
+    with pytest.raises(PlaybackWorkConflictError, match="RECONCILIATION"):
+        _offer_readback(segment_from_row(row), worker.readback_root, source.parent, cloud)
+
+    assert foreign.stat().st_ino == before
+    assert foreign.read_bytes() == b"retained work from another owner"
+
+
+async def test_work_conflict_is_infrastructure_and_retains_the_work_directory(tmp_path, monkeypatch):
+    from pixav.pixel_injector import playback_activity
+
+    materializer = FakeMaterializer()
+    worker, playable, row = build(tmp_path, materializer)
+    verified_readback(tmp_path, row)
+    original = playback_activity._link_verified_readback
+    retained = []
+
+    def conflict(segment, root, cloud):
+        foreign = cloud / segment.filename
+        foreign.write_bytes(b"work requiring reconciliation")
+        retained.append(foreign)
+        return original(segment, root, cloud)
+
+    monkeypatch.setattr(playback_activity, "_link_verified_readback", conflict)
+    result = await worker.execute(request_for(playable, "prepare"))
+
+    assert result.outcome == "infrastructure"
+    assert result.error_code == "PLAYBACK_WORK_REQUIRES_RECONCILIATION"
+    assert len(retained) == 1 and retained[0].read_bytes() == b"work requiring reconciliation"
+    assert materializer.seen_cloud == []
+
+
+def test_a_file_created_after_the_work_check_is_preserved(tmp_path, monkeypatch):
+    from pixav.pixel_injector.playback_activity import PlaybackWorkConflictError, _offer_readback
+    from pixav.shared.remote_assets import segment_from_row
+
+    worker, _, row = build(tmp_path, FakeMaterializer())
+    source = verified_readback(tmp_path, row)
+    cloud = tmp_path / "cloud"
+    cloud.mkdir()
+    foreign = cloud / source.name
+
+    def raced_link(*args, **kwargs):
+        foreign.write_bytes(b"created after the empty-work check")
+        raise FileExistsError(errno.EEXIST, "work appeared")
+
+    monkeypatch.setattr(os, "link", raced_link)
+    with pytest.raises(PlaybackWorkConflictError, match="RECONCILIATION"):
+        _offer_readback(segment_from_row(row), worker.readback_root, source.parent, cloud)
+    assert foreign.read_bytes() == b"created after the empty-work check"
+
+
+async def test_cross_mount_copy_protects_both_active_input_and_output(tmp_path, monkeypatch):
+    import shutil
+
+    from pixav.pixel_injector import playback_activity
+
+    materializer = FakeMaterializer()
+    worker, playable, row = build(tmp_path, materializer)
+    verified_readback(tmp_path, row)
+    real_link, real_copy = os.link, shutil.copyfileobj
+    checked = []
+
+    def separate_mounts(original, destination, **kwargs):
+        if "cloud" in Path(destination).parts:
+            raise OSError(errno.EXDEV, "separate mounts")
+        return real_link(original, destination, **kwargs)
+
+    def copy(reader, writer):
+        for handle, mode in ((reader, fcntl.LOCK_EX), (writer, fcntl.LOCK_SH)):
+            descriptor = os.open(f"/proc/self/fd/{handle.fileno()}", os.O_RDONLY)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+        checked.append(True)
+        real_copy(reader, writer)
+
+    monkeypatch.setattr(os, "link", separate_mounts)
+    monkeypatch.setattr(playback_activity.shutil, "copyfileobj", copy)
+    result = await worker.execute(request_for(playable, "prepare"))
+    assert result.outcome == "success" and result.evidence["inputs"] == "verified-readback"
+    assert checked == [True, True]
 
 
 async def test_prepare_offers_the_verified_readback_by_hard_link_bdd_066(tmp_path):

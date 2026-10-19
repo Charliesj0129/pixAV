@@ -307,6 +307,7 @@ def test_full_decoder_refuses_exit_failure_or_error_output(tmp_path, monkeypatch
         return SimpleNamespace(returncode=exit_code)
 
     monkeypatch.setattr("pixav.pixel_injector.parts_download.subprocess.run", run)
+    (tmp_path / "synthetic.mp4").write_bytes(b"synthetic media")
     with pytest.raises(OriginalMismatchError):
         decode_original(tmp_path / "synthetic.mp4")
 
@@ -374,6 +375,7 @@ def test_real_original_decoder_preserves_native_frame_clock(tmp_path):
     import subprocess
 
     from pixav.pixel_injector.parts_download import decode_original
+    from pixav.shared import media_file
 
     if os.getenv("PIXAV_RUN_MEDIA_TESTS") != "1":
         pytest.skip("opt-in real FFmpeg tools container")
@@ -393,6 +395,7 @@ old = subprocess.run(base + ['-xerror', '-i', '/work/synthetic.mp4',
     '-map', '0:v:0', '-f', 'null', '-'], capture_output=True, check=True)
 assert b'non monotonically increasing dts' in old.stderr
 """
+    code = inspect.getsource(media_file) + "\n" + code
     code += inspect.getsource(decode_original)
     code += "\ndecode_original(Path('/work/synthetic.mp4'))\n"
     subprocess.run(  # noqa: S603 - explicit opt-in, isolated synthetic media only

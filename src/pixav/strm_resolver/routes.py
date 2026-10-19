@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse, Response, StreamingResponse
 
 from pixav.shared.exceptions import ResolveError
+from pixav.shared.media_file import open_media_file
 from pixav.shared.metrics import get_metrics_output, record_playback_request
 from pixav.strm_resolver.cache import CdnCache
 from pixav.strm_resolver.playback import parse_byte_range, resolve_eligibility, serve_managed
@@ -77,7 +78,7 @@ def _local_share_scheme(request: Request) -> str:
 async def _stream_file(path: str, *, start: int, end: int) -> AsyncIterator[bytes]:
     """Yield a bounded local-file segment without relying on anyio's worker pool."""
     remaining = max(0, end - start + 1)
-    with open(path, "rb") as handle:  # noqa: PTH123 - path is a DB-backed media path
+    with open_media_file(path) as source, source.reader() as handle:
         handle.seek(start)
         while remaining:
             chunk = handle.read(min(_FILE_CHUNK_BYTES, remaining))

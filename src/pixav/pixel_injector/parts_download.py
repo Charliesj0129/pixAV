@@ -29,6 +29,7 @@ from pixav.pixel_injector.photos_auth import (
     verify_browser_account,
 )
 from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT
+from pixav.shared.media_file import open_media_file
 from pixav.shared.models import VideoPart
 from pixav.shared.storage_models import TransferableFile
 
@@ -65,7 +66,7 @@ def observed_media(path: Path) -> dict:
 
 def decode_original(path: Path) -> None:
     """Decode the complete provider original; diagnostics stay out of receipts."""
-    with tempfile.TemporaryFile() as errors:
+    with open_media_file(path) as source, tempfile.TemporaryFile() as errors:
         result = subprocess.run(  # noqa: S603 - fixed image tool, argv only, verified local provider output
             [
                 "/usr/bin/ffmpeg",
@@ -75,7 +76,7 @@ def decode_original(path: Path) -> None:
                 "-threads",
                 "2",
                 "-i",
-                str(path),
+                f"/proc/self/fd/{source.descriptor}",
                 "-map",
                 "0:v:0",
                 "-map",
@@ -94,7 +95,9 @@ def decode_original(path: Path) -> None:
             stderr=errors,
             timeout=21600,
             check=False,
+            pass_fds=(source.descriptor,),
         )
+        source.assert_current()
         if result.returncode or errors.tell():
             raise OriginalMismatchError("Photos original failed complete decoding")
 
@@ -218,7 +221,7 @@ def download_original(part: TransferableFile, root: Path, *, authentication: dic
         signal.alarm(21600)
         original = Path(temporary) / "original.mp4"
         version, account_binding = _browser_original(part, Path(temporary), original, auth)
-        with contained_file(Path(temporary), original).open("rb") as stream:
+        with open_media_file(contained_file(Path(temporary), original)) as source, source.reader() as stream:
             copy_original(stream, destination, part.size_bytes, part.sha256)
         signal.alarm(0)
     report = {
@@ -273,8 +276,8 @@ def prepare(manifest: dict, root: Path) -> dict:
                 spans=[p.end_seconds - p.start_seconds for p in parts],
             )
             media.compare(reference, media.fingerprint(partial, root, reference["duration"]))
-            with partial.open("rb") as handle:
-                os.fsync(handle.fileno())
+            with open_media_file(partial) as source:
+                os.fsync(source.descriptor)
             os.link(partial, destination)
     return {
         "parts": reports,

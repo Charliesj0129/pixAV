@@ -39,6 +39,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - staging cleanup 必須同時滿足遠端 DURABLE、有效完整性證據、播放 READY 且實播驗證完成、完整 publication、retention 到期、無 active execution/reader、path/ownership 與操作守衛通過。資格檢查到 unlink 之間防止競態；cleanup crash 後核對 filesystem 並留下 audit。
 - Linux 媒體 reader／writer 使用共同 descriptor 鎖協定；子程序須繼承鎖，unlink 以固定 parent descriptor 執行並持鎖至 domain commit。尚未接入的 reader、qBittorrent 或其他 filesystem 不能以現有隔離鎖證據放行 cleanup；完整 coverage 與操作授權仍依 README 分別驗收。
 - cleanup 授權須符合當次 inode、DB／資產／publication binding；舊文字授權不回填成新核准。套用 025 expand migration 或 rollback 時維持 cleanup 關閉，停止會忽略 binding 的不相容 janitor；binding 不代替備份還原收據或操作者授權。
+- playback work 失敗清理只處理該次建立、身分未變且無 reader 的精確檔案；既存或被替換的 work 保留待 reconciliation，視為基礎設施／ownership 問題，不污染遠端完整性判定。
 - 磁碟餘額須同時核對 WSL／Docker VHD 所在實體分區；虛擬檔案系統餘額不代替實體容量。Docker 資料磁碟搬移須先完整盤點、獨立備份還原與容量守衛，再取得明確搬移授權；停止的其他專案不得隨 daemon 恢復而自動啟動。
 - 本輪已授權的 Docker 搬移及精確舊 C 副本清除已完成，資料與開機 distro 位於 D 槽，未重啟全 WSL；後續新搬移或新增其他專案中斷範圍須另行核對授權。可重建 build／工具 cache 的清理須逐筆核對 manifest，保留映像、設定與重建入口；不可藉精簡清除媒體、guest、intents 或驗收 evidence，未核實 VHD 實體餘額前不宣稱已騰出 Windows 空間。
 - 保留 local retention、100 GiB／10% disk latch、symlink/path containment、open-task guard、FIFO/in-flight recovery、有限 retry。磁碟壓力或 terminal failure 不豁免 durability gate。DB clock 決定 quota/retry 與持久期限；heartbeat 用 monotonic clock。
