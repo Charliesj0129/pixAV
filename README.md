@@ -8,7 +8,9 @@ Windows 開發方案已改為 [Windows Android Emulator + Docker Runner](#開發
 
 ## 設計 checkpoint 與重跑起點
 
-舊隔離媒體已重置，保留資料的 D 槽加密備份、獨立還原、原 DB 三十張表及 roles／Redis checkpoint 已有先前核對證據；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整備份／還原與當時身分／掛載驗證通過後，已精確刪除 C 槽舊資料磁碟。2026-10-20 的程式 checkpoint `5cc7f02` 通過完整專用 PostgreSQL／Redis 檢查：2,368 passed／8 skipped，coverage 85%，Ruff／Black／isort／mypy 與 integration／Android runner Compose 設定檢查通過。Docker Desktop 已恢復至同一 daemon，本輪重新核對 CI source bind 的 device／inode／內容與原五十九個 volumes 的 metadata；原四個 managed 服務仍停止，其 DB／Redis live identity 與全部實際 bind 尚未重驗。對應不可變映像已核對完整 Python 原始碼，斷網 child 取消／保全及實際 FFmpeg 檔案鎖契約通過，未部署應用、登入或上傳。Photos live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+舊隔離媒體已重置，保留資料的 D 槽加密備份與獨立還原已有先前核對證據；不備份影片本體。Docker 資料磁碟已搬到 D 槽，完整備份／還原與當時身分／掛載驗證通過後，已精確刪除 C 槽舊資料磁碟。2026-10-20 的程式 checkpoint `5cc7f02` 通過完整專用 PostgreSQL／Redis 檢查：2,368 passed／8 skipped，coverage 85%，Ruff／Black／isort／mypy 與 integration／Android runner Compose 設定檢查通過。Docker Desktop 已恢復至同一 daemon，CI source bind 的 device／inode／內容及原五十九個 volumes 的 metadata 已重核。對應不可變映像已核對完整 Python 原始碼，斷網 child 取消／保全及實際 FFmpeg 檔案鎖契約通過，未部署應用、登入或上傳。Photos live、人工實播、二十四小時 quota、Windows managed adapter 與 production 保持 OPEN。
+
+本輪唯讀重核保留的原 PostgreSQL named volume：offline identifier、三十張表的完整內容摘要、二十一個 roles 屬性與 migration ledger 均符合 checkpoint。原 Redis 的三個持久鍵 DUMP 相符，另兩個原 TTL 已過的鍵在 RAM 查詢副本中到期；來源檔案指紋前後一致。保留 guest bind 的 host／container device、inode 及五千三百八十個檔案的完整 size／SHA-256 相符，未啟動 guest。DB／queue 只在斷網 tmpfs 副本查詢，未新增備份或啟動原服務。新 managed bind DB 是另一個 cluster／database，其隔離資料不代表原 domain 已遷移；原四個 managed 服務保持停止，恢復前仍須核對其 live instance／pause ownership 與其餘實際 bind。舊記錄的保全不抵當次未知上傳結果 reconciliation、guest 開機恢復或完整 Stage 0 驗收。
 
 2026-10-12 操作者授權保存目前設計、退休舊部署入口，並把既有影片、分段、回載、播放 cache 與影音錄影視為可丟棄的隔離驗收資料，不備份影片本體。這是人工重置，不能記成安全 staging cleanup 或 Golden Path PASS，也不改變正式 durability／cleanup 契約。新一輪必須使用新 cohort，重新取得全部 cold read-back、完整性、播放／seek、故障恢復與連續二十四小時 quota 證據。
 
@@ -45,6 +47,8 @@ cold child 只掛該次 `/work:rw`、2 CPU／4 GiB，登入與匿名模式均適
 當前 Windows Docker Desktop 資料磁碟為 `D:\DockerDesktopData\disk\docker_data.vhdx`，其開機 distro 亦位於同一 D 槽根目錄；Ubuntu-24.04 的 Docker WSL 整合已核對。Android SDK 位於 `D:\Android\Sdk`，原 C 槽 SDK 路徑只是相容 junction。專案、保留 guest、備份及還原均實際位於 D 槽。不能沿用已不存在的 `docker-desktop-data` registration 或舊 `wsl/data/ext4.vhdx` 搬移腳本；每次操作仍核對當前 daemon 與實體位置。
 
 2026-10-13 盤點發現十四個 pixAV 舊容器已被移除，2026-10-14 操作者確認因認為不再需要而人工刪除；當次核對原 daemon、五十九個保留 volumes、離線 DB system identifier、當前 DB 三十張表的內容與完整 roles／認證、保留資料內容及十四個可定位的實際 bind；隔離查詢使用原 DB volume 的唯讀 tmpfs 複本，原檔案 fingerprint 不變。舊播放 cache／tools staging 的三個 binding 已失去原暫時路徑，維持未核實；新部署須重新核對其 host／container device、inode 與內容。保留 guest 資料、journal、operation／generation，缺失容器引用先 reconciliation；刪除容器不能授權重傳。2026-10-14 重查時另有其他專案的既有服務運行，保留當前狀態，不沿用舊停機集合操作。WSL 內刪檔與 trim 不代表 Windows D 槽已回收同量實體空間，未取得實體容量證據不得宣稱。
+
+Docker volume 的 `Mountpoint` 字串經直接 bind 後，本輪實測與 named-volume 掛載的 device／inode 不同；該 bind alias 不能證明原 volume 內容。原 DB／queue 由既有 exact named volume 唯讀掛載並停用 copy-up，再核對 checkpoint 身分與內容；不對另一目錄初始化或覆寫。新 managed DB 的 bind root 與實際 `PGDATA` 子目錄須分開核對；其離線 control 為未乾淨關閉，不能用 control 識別或 RAM 副本查詢代替原服務恢復驗收。
 
 搬移前核對當前 daemon、原容器／volume 集合、DB identifier／ledger、queue checkpoint 與實際 bind 身分；一致離線加密備份和獨立完整還原通過後，才改變資料位置並精確清除原 C 副本。目的地、備份、還原及 staging 均核對底層實體磁碟，保留 100 GiB／10% reserve。全 WSL 釋鎖若新增其他專案中斷範圍，須取得當次授權。搬移成功、刪檔與 Windows 實體容量釋放各自以收據判定。
 

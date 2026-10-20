@@ -16,6 +16,8 @@ segment staging 的 prepared／copy 輸出與 release 亦使用共同鎖；原�
 
 canary ZIP、original copy、驗收 hash 與 HTTP movie acceptance 已接共同鎖；partial 被替換或發布衝突時保留 work，不能判為遠端完整性失敗。real A/V reference 與 recording／JSON 的整輪 session 鎖、FFmpeg descriptor 繼承及 0600 clip 已通過合成多窗口／父程序 SIGKILL 契約。synthetic recording 分析、canary probe／decode、ADB 與其他 reader 覆蓋仍待完成，不能以單次 hash 或隔離證據開啟 cleanup。
 
-取消會等待已開始的檔案 thread 與 cold child 收斂，重複取消不能跳過；child 移除未確認或 cache rename 已越界時保留 work 供 reconciliation，不宣告 domain 成功。未確認 child 另存私有 sibling 記錄，取消仍向外傳遞；pending 記錄阻擋同一 work 重建 child。Docker Desktop 已恢復同一 daemon，CI source bind 已重核；程式 checkpoint `5cc7f02` 的完整檢查為 2,368 passed／8 skipped、coverage 85%，對應不可變映像已核對 source，實際斷網 child 取消／保全及 FFmpeg 檔案鎖契約通過。原 managed 服務保持停止，DB／Redis live identity 與全部 bind 未重驗；上述隔離證據不抵 Photos／完整 cleanup PASS。
+取消會等待已開始的檔案 thread 與 cold child 收斂，重複取消不能跳過；child 移除未確認或 cache rename 已越界時保留 work 供 reconciliation，不宣告 domain 成功。未確認 child 另存私有 sibling 記錄，取消仍向外傳遞；pending 記錄阻擋同一 work 重建 child。Docker Desktop 已恢復同一 daemon，CI source bind 已重核；程式 checkpoint `5cc7f02` 的完整檢查為 2,368 passed／8 skipped、coverage 85%，對應不可變映像已核對 source，實際斷網 child 取消／保全及 FFmpeg 檔案鎖契約通過。上述隔離證據不抵 Photos／完整 cleanup PASS。
+
+原 checkpoint named-volume DB 的 offline identifier、三十張表內容摘要、二十一個 roles 屬性與 migration ledger 已唯讀重核；Redis 持久鍵相符，原 TTL 已過的鍵只在 RAM 查詢副本中到期，來源指紋不變。保留 guest bind 的實際 device／inode 與五千三百八十個檔案 size／SHA-256 相符。新 managed bind DB 是另一個 cluster／database，不能把其隔離空表當成原資料遷移；Mountpoint 字串的 bind alias 也不能代替 named-volume 身分。原 managed 服務保持停止，未新增備份、未啟動 guest；live instance／pause ownership、其餘 bind、未知副作用 reconciliation 與完整 Stage 0 仍待驗收。
 
 備份及還原不得放 C 槽。Ubuntu 的 C 槽 LocalState 是指向 D 槽的 junction；Docker 資料磁碟已移至 `D:\DockerDesktopData`，Android SDK 已移至 `D:\Android\Sdk`，原 C 槽資料副本已清除。每次仍依當前檔案及成功收據核實，不能沿用舊 registration 或搬移腳本。私有 cleanup manifest／備份收據不進 Git。
