@@ -118,7 +118,7 @@ def test_copy_never_overwrites_preexisting_pending_work(tmp_path):
     assert partial.read_bytes() == b"earlier work" and not destination.exists()
 
 
-def test_canary_probe_holds_and_inherits_the_same_reader_without_changing_atime(tmp_path, monkeypatch):
+def test_canary_probe_holds_and_inherits_the_same_reader(tmp_path, monkeypatch):
     from pixav.pixel_injector import canary_download as module
 
     source = tmp_path / "synthetic.mp4"
@@ -131,7 +131,10 @@ def test_canary_probe_holds_and_inherits_the_same_reader_without_changing_atime(
             pytest.fail("canary probe source was not locked")
         descriptor = int(command[-1].removeprefix("/proc/self/fd/"))
         assert descriptor in kwargs["pass_fds"]
-        assert os.pread(descriptor, 15, 0) == b"synthetic media"
+        # FFprobe reopens this path, so a real read may advance atime even
+        # though the inherited descriptor keeps the reader lock alive.
+        with open(command[-1], "rb") as reader:
+            assert reader.read() == b"synthetic media"
         return SimpleNamespace(
             stdout=json.dumps(
                 {
@@ -153,8 +156,10 @@ def test_canary_probe_holds_and_inherits_the_same_reader_without_changing_atime(
     monkeypatch.setattr(module.subprocess, "run", run)
     assert module.probe(source)["duration"] == 12
     after = source.stat()
-    assert (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns) == (
-        after.st_atime_ns,
+    assert (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
         after.st_mtime_ns,
         after.st_ctime_ns,
     )
