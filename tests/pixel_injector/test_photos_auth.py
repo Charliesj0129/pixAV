@@ -306,7 +306,7 @@ def test_full_decoder_refuses_exit_failure_or_error_output(tmp_path, monkeypatch
         kwargs["stderr"].write(diagnostic)
         return SimpleNamespace(returncode=exit_code)
 
-    monkeypatch.setattr("pixav.pixel_injector.parts_download.subprocess.run", run)
+    monkeypatch.setattr("pixav.pixel_injector.canary_download.subprocess.run", run)
     (tmp_path / "synthetic.mp4").write_bytes(b"synthetic media")
     with pytest.raises(OriginalMismatchError):
         decode_original(tmp_path / "synthetic.mp4")

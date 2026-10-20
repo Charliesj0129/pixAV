@@ -161,10 +161,51 @@ def _probe(source: MediaFile) -> dict[str, Any]:
     }
 
 
+def decode_original(path: Path | MediaFile, *, timeout: int = 21600) -> None:
+    """Decode the complete provider original; diagnostics stay out of receipts."""
+    with ExitStack() as files, tempfile.TemporaryFile() as errors:
+        source = path if isinstance(path, MediaFile) else files.enter_context(open_media_file(path))
+        source.assert_current()
+        before = file_version(os.fstat(source.descriptor))
+        result = subprocess.run(  # noqa: S603 - fixed image tool, argv only, verified local provider output
+            [
+                "/usr/bin/ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-threads",
+                "2",
+                "-i",
+                f"/proc/self/fd/{source.descriptor}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                # Preserve native frame timestamps, including VFR frames that
+                # would otherwise collide on the nominal frame-rate grid.
+                "-fps_mode:v",
+                "passthrough",
+                "-enc_time_base:v",
+                "-1",
+                "-f",
+                "null",
+                "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=errors,
+            timeout=timeout,
+            check=False,
+            pass_fds=(source.descriptor,),
+        )
+        source.assert_current()
+        if file_version(os.fstat(source.descriptor)) != before:
+            raise ValueError("Photos original changed during complete decoding")
+        if result.returncode or errors.tell():
+            raise OriginalMismatchError("Photos original failed complete decoding")
+
+
 def main() -> int:
     from playwright.sync_api import sync_playwright
-
-    from pixav.pixel_injector.parts_download import decode_original
 
     os.umask(0o077)
     root = Path(tempfile.mkdtemp(prefix="cloud-verify-", dir="/work"))

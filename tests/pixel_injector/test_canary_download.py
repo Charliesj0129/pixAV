@@ -234,6 +234,10 @@ def test_canary_collector_keeps_one_source_locked_through_decode_and_receipt(tmp
     playwright = ModuleType("playwright.sync_api")
     playwright.sync_playwright = lambda: manager
     monkeypatch.setitem(sys.modules, "playwright.sync_api", playwright)
+    if fault is None:
+        # The isolated collector ships only its byte/file helpers and browser
+        # tools; importing domain preparation must not be a prerequisite.
+        monkeypatch.setitem(sys.modules, "pixav.pixel_injector.parts_download", None)
     calls = []
     descriptors = []
     original = root / "cloud-original.mp4"

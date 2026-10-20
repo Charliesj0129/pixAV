@@ -12,17 +12,14 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
-import tempfile
 import uuid
-from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pixav.media_loader.preparation import inspect_media
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary, sha256
-from pixav.pixel_injector.canary_download import OriginalMismatchError, copy_original
+from pixav.pixel_injector.canary_download import OriginalMismatchError, copy_original, decode_original
 from pixav.pixel_injector.photos_auth import (
     AccountCookieSecret,
     AccountSessionMismatchError,
@@ -30,7 +27,7 @@ from pixav.pixel_injector.photos_auth import (
     verify_browser_account,
 )
 from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT
-from pixav.shared.media_file import MediaFile, file_version, open_media_file
+from pixav.shared.media_file import open_media_file
 from pixav.shared.models import VideoPart
 from pixav.shared.storage_models import TransferableFile
 
@@ -63,49 +60,6 @@ def observed_media(path: Path) -> dict:
     duplicated as a second ffprobe call site.
     """
     return json.loads(asyncio.run(inspect_media(str(path))).model_dump_json())
-
-
-def decode_original(path: Path | MediaFile, *, timeout: int = 21600) -> None:
-    """Decode the complete provider original; diagnostics stay out of receipts."""
-    with ExitStack() as files, tempfile.TemporaryFile() as errors:
-        source = path if isinstance(path, MediaFile) else files.enter_context(open_media_file(path))
-        source.assert_current()
-        before = file_version(os.fstat(source.descriptor))
-        result = subprocess.run(  # noqa: S603 - fixed image tool, argv only, verified local provider output
-            [
-                "/usr/bin/ffmpeg",
-                "-v",
-                "error",
-                "-xerror",
-                "-threads",
-                "2",
-                "-i",
-                f"/proc/self/fd/{source.descriptor}",
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                # Preserve native frame timestamps, including VFR frames that
-                # would otherwise collide on the nominal frame-rate grid.
-                "-fps_mode:v",
-                "passthrough",
-                "-enc_time_base:v",
-                "-1",
-                "-f",
-                "null",
-                "-",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=errors,
-            timeout=timeout,
-            check=False,
-            pass_fds=(source.descriptor,),
-        )
-        source.assert_current()
-        if file_version(os.fstat(source.descriptor)) != before:
-            raise ValueError("Photos original changed during complete decoding")
-        if result.returncode or errors.tell():
-            raise OriginalMismatchError("Photos original failed complete decoding")
 
 
 def _browser_original(
