@@ -14,6 +14,7 @@ import os
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import uuid
@@ -425,7 +426,7 @@ async def test_inode_lock_remains_held_through_unlink_and_domain_commit(db, tmp_
     assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
 
 
-async def test_binding_keeps_the_configured_staging_root_symlink_contract(db, tmp_path):
+async def test_binding_refuses_a_configured_staging_root_symlink_without_following_it(db, tmp_path):
     root = tmp_path / "actual-staging"
     root.mkdir()
     video, media = await artifact(db, root)
@@ -437,6 +438,8 @@ async def test_binding_keeps_the_configured_staging_root_symlink_contract(db, tm
     domain_path = str(configured / media.name)
     await db.execute("UPDATE videos SET local_path=$1 WHERE id=$2", domain_path, video)
     await db.execute("UPDATE cleanup_authorizations SET path=$1 WHERE video_id=$2", domain_path, video)
+    os.utime(configured, ns=(1_000_000_000, 2_000_000_000), follow_symlinks=False)
+    before = configured.lstat()
 
     operator = LocalFileJanitor(
         db,
@@ -446,8 +449,8 @@ async def test_binding_keeps_the_configured_staging_root_symlink_contract(db, tm
         allow_operator_exception=True,
     )
 
-    assert (await operator.cleanup(apply=True))["deleted"] == 1
-    assert not media.exists()
+    assert (await operator.cleanup(apply=True))["unsafe"] == 1
+    assert media.exists() and configured.lstat() == before
 
 
 async def test_publication_row_cannot_substitute_for_playback_evidence_bdd_005_131(db, tmp_path):
@@ -825,6 +828,7 @@ async def selected_cleanup_fixture(db, root, *, count=2):
 
 async def test_exact_selection_preview_delete_and_replay_leave_eligible_neighbour_untouched(db, tmp_path):
     selection, operator, _, files = await selected_cleanup_fixture(db, tmp_path)
+    _age_operator_directories(tmp_path)
     database_before, files_before = await _operator_domain_snapshot(db), _operator_file_metadata(tmp_path)
     preview = await operator.execute(selection)
     assert preview["result"] == "ELIGIBLE_FOR_CLEANUP" and preview["eligible"] == 2
@@ -925,6 +929,12 @@ async def test_selection_locks_execution_admission_and_remote_invalidation_until
                         "INSERT INTO executions(id,task_id,max_retries,state) VALUES($1,$2,1,'READY')",
                         uuid.uuid4(),
                         task,
+                    )
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await writer.execute(
+                        "UPDATE videos SET local_path=$1 WHERE id<>$2",
+                        str(files[0]) if video == selection.requests[0].target.video_id else str(files[1]),
+                        video,
                     )
             attempts.append(video)
             return result
@@ -1137,19 +1147,41 @@ async def _operator_domain_snapshot(db):
 
 
 def _operator_file_metadata(root):
+    """Snapshot every inode without following links or changing directory atime."""
     result = {}
-    for path in root.rglob("*"):
-        if path.is_file() and not path.is_symlink():
-            info = path.stat()
-            result[str(path.relative_to(root))] = (
-                info.st_dev,
-                info.st_ino,
-                info.st_size,
-                info.st_atime_ns,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
-            )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOATIME
+
+    def metadata(info):
+        return (*info, info.st_atime_ns, info.st_mtime_ns, info.st_ctime_ns)
+
+    def visit(descriptor, relative):
+        result[relative] = metadata(os.fstat(descriptor))
+        for name in sorted(os.listdir(descriptor)):
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            key = f"{relative}/{name}" if relative != "." else name
+            result[key] = metadata(info)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, flags, dir_fd=descriptor)
+                try:
+                    visit(child, key)
+                finally:
+                    os.close(child)
+
+    descriptor = os.open(root, flags)
+    try:
+        visit(descriptor, ".")
+    finally:
+        os.close(descriptor)
     return result
+
+
+def _age_operator_directories(root):
+    # Do not alter a regular file's ctime after exact-target approval. Directory
+    # and symlink times are not approval inputs, and must still survive dry-run.
+    for name, info in _operator_file_metadata(root).items():
+        if stat.S_ISDIR(info[0]) or stat.S_ISLNK(info[0]):
+            path = root if name == "." else root / name
+            os.utime(path, ns=(1_000_000_000, path.lstat().st_mtime_ns), follow_symlinks=False)
 
 
 async def test_real_cleanup_cli_uses_live_instances_and_only_its_owned_pause(db, integration_redis, tmp_path):
@@ -1480,6 +1512,7 @@ async def test_real_selection_cli_observes_stops_and_fences_a_noncooperating_rea
         code, result = await action("execute", selection_path, apply=True)
         assert code == 2 and result["code"] == "CLEANUP_DOWNLOADER_NOT_QUIESCENT" and media.exists()
         await asyncio.to_thread(actor.stop, timeout=10)
+        _age_operator_directories(tmp_path)
         before, files_before, pause_before = (
             await _operator_domain_snapshot(db),
             _operator_file_metadata(tmp_path),

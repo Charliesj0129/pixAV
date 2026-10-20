@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock
@@ -99,6 +100,56 @@ def test_safe_cleanup_rejects_absolute_parent_traversal(tmp_path) -> None:
     assert target is None
     assert missing is False
     assert outside.read_bytes() == b"keep"
+
+
+def test_safe_cleanup_rejects_a_configured_symlink_without_changing_its_metadata(tmp_path):
+    root = tmp_path / "actual"
+    root.mkdir()
+    (root / "synthetic.mp4").write_bytes(b"synthetic")
+    configured = tmp_path / "configured"
+    configured.symlink_to(root, target_is_directory=True)
+    os.utime(configured, ns=(1_000_000_000, 2_000_000_000), follow_symlinks=False)
+    before = configured.lstat()
+
+    assert safe_cleanup_candidate(str(configured), str(configured / "synthetic.mp4")) == (None, False)
+
+    assert configured.lstat() == before
+
+
+@pytest.mark.parametrize("alias", ["symlink", "parent-symlink", "hardlink", "parent-traversal"])
+async def test_other_video_alias_refuses_cleanup_without_following_or_reading_the_alias(tmp_path, alias):
+    media = tmp_path / "synthetic.mp4"
+    media.write_bytes(b"synthetic")
+    if alias == "parent-traversal":
+        base, nested = tmp_path / "base", tmp_path / "nested"
+        base.mkdir()
+        nested.mkdir()
+        (base / media.name).write_bytes(b"different file at the lexical path")
+        link = base / "directory-alias"
+        link.symlink_to(nested, target_is_directory=True)
+        reference = link / ".." / media.name
+    elif alias == "parent-symlink":
+        link = tmp_path / "alias-directory"
+        link.symlink_to(tmp_path, target_is_directory=True)
+        reference = link / media.name
+    else:
+        link = tmp_path / "alias.mp4"
+        if alias == "hardlink":
+            os.link(media, link)
+        else:
+            link.symlink_to(media)
+        reference = link
+    os.utime(link, ns=(1_000_000_000, 2_000_000_000), follow_symlinks=False)
+    before = link.lstat()
+    connection = AsyncMock()
+    connection.fetchval.return_value = None
+    connection.fetch.return_value = [{"video_id": uuid.uuid4(), "path": str(reference)}]
+
+    assert not await LocalFileJanitor(None, download_dir=str(tmp_path))._single_path_reference(
+        connection, uuid.uuid4(), str(media)
+    )
+
+    assert link.lstat() == before
 
 
 class _FakeTransaction:

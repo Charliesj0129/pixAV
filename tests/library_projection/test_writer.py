@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import uuid
 
 import pytest
@@ -43,6 +45,14 @@ def spec(title: str = "Synthetic", artwork=()):
 
 def item(writer) -> str:
     return str(writer.library / f"pixav-{VIDEO}")
+
+
+def filesystem_metadata(paths):
+    result = []
+    for path in paths:
+        info = path.lstat()
+        result.append((*info, info.st_atime_ns, info.st_mtime_ns, info.st_ctime_ns))
+    return result
 
 
 def test_publish_activates_a_complete_verified_version(tmp_path, store, writer):
@@ -208,3 +218,108 @@ def test_cleanup_publication_verification_refuses_an_active_writer(tmp_path, sto
     poster = writer.versions / str(VIDEO) / version / "poster.png"
     with open_media_file(poster, exclusive=True):
         assert not publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)
+
+
+def test_cleanup_publication_verification_preserves_symlink_and_directory_metadata(tmp_path, store, writer):
+    projection = spec(artwork=[retained_poster(tmp_path, store)])
+    version = writer.publish(projection, 1)
+    directory = writer.versions / str(VIDEO) / version
+    paths = [
+        writer.library.parent,
+        writer.library,
+        writer.library / f"pixav-{VIDEO}",
+        writer.versions,
+        directory.parent,
+        directory,
+        *directory.iterdir(),
+    ]
+    for path in paths:
+        os.utime(path, ns=(1_000_000_000, path.lstat().st_mtime_ns), follow_symlinks=False)
+    before = filesystem_metadata(paths)
+    flags = os.statvfs(writer.library.parent).f_flag
+
+    assert publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)
+
+    assert filesystem_metadata(paths) == before
+    assert os.statvfs(writer.library.parent).f_flag == flags
+
+
+def test_cleanup_rejects_a_projection_parent_symlink_without_accessing_its_target(tmp_path, store, writer):
+    projection = spec(artwork=[retained_poster(tmp_path, store)])
+    version = writer.publish(projection, 1)
+    outside = tmp_path / "outside-versions"
+    writer.versions.rename(outside)
+    writer.versions.symlink_to(outside, target_is_directory=True)
+    paths = [writer.versions, outside, outside / str(VIDEO), writer.library / f"pixav-{VIDEO}"]
+    for path in paths:
+        os.utime(path, ns=(1_000_000_000, path.lstat().st_mtime_ns), follow_symlinks=False)
+    before = filesystem_metadata(paths)
+
+    assert not publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)
+
+    assert filesystem_metadata(paths) == before
+
+
+def test_cleanup_refuses_when_readonly_namespace_is_unavailable_without_touching_the_link(
+    tmp_path, store, writer, monkeypatch
+):
+    from pixav.library_projection import readonly_cleanup
+
+    projection = spec(artwork=[retained_poster(tmp_path, store)])
+    version = writer.publish(projection, 1)
+    link = writer.library / f"pixav-{VIDEO}"
+    os.utime(link, ns=(1_000_000_000, link.lstat().st_mtime_ns), follow_symlinks=False)
+    before = filesystem_metadata([link, writer.library])
+    monkeypatch.setattr(readonly_cleanup.shutil, "which", lambda _: None)
+
+    assert not publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)
+
+    assert filesystem_metadata([link, writer.library]) == before
+
+
+def test_cleanup_refuses_a_real_nested_mount_instead_of_checking_hidden_underlying_files(tmp_path, store, writer):
+    projection = spec(artwork=[retained_poster(tmp_path, store)])
+    version = writer.publish(projection, 1)
+    mounted = tmp_path / "different-versions"
+    mounted.mkdir()
+    payload = r"""
+import subprocess,sys
+from pathlib import Path
+from uuid import UUID
+from pixav.library_projection.readonly_cleanup import _has_nested_mount
+from pixav.library_projection.writer import publication_is_complete
+root,mounted,video,version,digest=sys.argv[1:]
+subprocess.run(['/usr/bin/mount','--bind',mounted,str(Path(root)/'versions')],check=True,capture_output=True)
+assert _has_nested_mount(Path(root))
+assert not publication_is_complete(Path(root),UUID(video),version,digest)
+print('NESTED_MOUNT_REFUSED')
+"""
+    result = subprocess.run(  # noqa: S603 -- actual private namespace and synthetic projection only
+        [
+            "/usr/bin/unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--propagation=private",
+            "--",
+            sys.executable,
+            "-c",
+            payload,
+            str(writer.library.parent),
+            str(mounted),
+            str(VIDEO),
+            version,
+            projection.digest,
+        ],
+        env={
+            "PATH": os.defpath,
+            "LANG": "C.UTF-8",
+            "PYTHONPATH": os.pathsep.join(sys.path),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+    assert result.stdout == b"NESTED_MOUNT_REFUSED\n" and not result.stderr
+    assert (writer.versions / str(VIDEO) / version / "poster.png").is_file()

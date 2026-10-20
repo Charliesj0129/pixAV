@@ -26,8 +26,9 @@ import uuid
 from pathlib import Path
 
 from pixav.library_projection.artwork import ArtworkStore
+from pixav.library_projection.readonly_cleanup import verify_in_readonly_namespace
 from pixav.library_projection.render import ProjectionFile, ProjectionSpec, item_name, projection_digest
-from pixav.shared.media_file import open_media_file
+from pixav.shared.media_file import file_version, open_media_directory, open_media_file
 
 LIBRARY = "library"
 VERSIONS = "versions"
@@ -219,22 +220,60 @@ class ProjectionWriter:
 
 
 def publication_is_complete(root: Path, video_id: uuid.UUID, version: str, digest: str) -> bool:
-    """Check the committed projection's full bytes before permitting staging cleanup."""
-    writer = ProjectionWriter(root, ArtworkStore(root / "unused-artwork"))
+    """Check the full projection without modifying even symlink/directory atime."""
+    root = Path(os.path.abspath(root))
     try:
-        if writer.active_version(video_id) != version:
-            return False
-        directory = writer.versions / str(video_id) / version
-        # Parent links must not redirect a valid-looking publication outside its root.
-        if directory.resolve() != root.resolve() / VERSIONS / str(video_id) / version:
-            return False
-        files = []
-        for path in directory.iterdir():
-            facts = _file_digest(path)
-            if facts is None:
+        with open_media_directory(root / ".pixav-cleanup-root") as directory:
+            flags = os.fstatvfs(directory.descriptor).f_flag
+            complete = (
+                _publication_on_readonly_mount(root, video_id, version, digest)
+                if flags & (os.ST_RDONLY | os.ST_NOATIME)
+                else verify_in_readonly_namespace(root, video_id, version, digest)
+            )
+            directory.assert_current()
+            return complete
+    except (OSError, ValueError):
+        return False
+
+
+def _publication_on_readonly_mount(root: Path, video_id: uuid.UUID, version: str, digest: str) -> bool:
+    if not _VERSION_NAME.fullmatch(version) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        return False
+    link = root / LIBRARY / item_name(video_id)
+    directory = root / VERSIONS / str(video_id) / version
+    try:
+        with (
+            open_media_directory(link) as library,
+            open_media_directory(directory / ".pixav-cleanup-version") as committed,
+        ):
+            # readlink has no O_NOATIME equivalent. Check its actual mount
+            # before reading it, including on the already-read-only fast path.
+            if not os.fstatvfs(library.descriptor).f_flag & (os.ST_RDONLY | os.ST_NOATIME):
                 return False
-            size, sha256 = facts
-            files.append(ProjectionFile(name=path.name, size=size, sha256=sha256))
+            before = os.stat(link.name, dir_fd=library.descriptor, follow_symlinks=False)
+            if not stat.S_ISLNK(before.st_mode):
+                return False
+            if os.readlink(link.name, dir_fd=library.descriptor) != f"../{VERSIONS}/{video_id}/{version}":
+                return False
+            files = []
+            listing = os.open(
+                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOATIME, dir_fd=committed.descriptor
+            )
+            try:
+                entries = os.listdir(listing)
+            finally:
+                os.close(listing)
+            for name in entries:
+                facts = _file_digest(directory / name)
+                if facts is None:
+                    return False
+                size, sha256 = facts
+                files.append(ProjectionFile(name=name, size=size, sha256=sha256))
+            after = os.stat(link.name, dir_fd=library.descriptor, follow_symlinks=False)
+            library.assert_current()
+            committed.assert_current()
+        if file_version(before) != file_version(after):
+            return False
         names = {f.name for f in files}
         required = {f"{item_name(video_id)}.strm", f"{item_name(video_id)}.nfo"}
         return (
@@ -242,5 +281,5 @@ def publication_is_complete(root: Path, video_id: uuid.UUID, version: str, diges
             and bool(names & {"poster.png", "poster.jpg", "poster.webp"})
             and projection_digest(files) == digest
         )
-    except (OSError, ValueError, ForeignContentError):
+    except (OSError, ValueError):
         return False

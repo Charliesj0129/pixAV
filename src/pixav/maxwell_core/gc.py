@@ -137,17 +137,14 @@ def safe_cleanup_candidate(download_dir: str, local_path: str) -> tuple[Path | N
     except ValueError:
         return None, False
 
-    # Resolving the configured root itself is intentional: deployments may
-    # mount it through a stable symlink. Candidate components are still walked
-    # one by one and are never resolved through symlinks.
-    root = configured_root.resolve(strict=False)
-    current = root
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            return None, False
-
+    # Even resolving a configured root symlink changes its atime. Require the
+    # actual directory path and refuse before following any root component.
+    current = Path(configured_root.anchor)
     try:
+        for part in (*configured_root.parts[1:], *relative.parts):
+            current = current / part
+            if current.is_symlink():
+                return None, False
         mode = current.lstat().st_mode
     except FileNotFoundError:
         return current, True
@@ -177,6 +174,24 @@ def artifact_facts(path: Path, descriptor: int | None = None) -> tuple[str, int]
         return facts
     except (OSError, ValueError):
         return None
+
+
+def _reference_is_distinct(path: str, canonical: str, target: os.stat_result | None) -> bool:
+    other = Path(os.path.abspath(path))
+    if str(other) == canonical or not Path(path).is_absolute() or ".." in Path(path).parts:
+        return False
+    try:
+        with open_media_directory(other) as directory:
+            facts = os.stat(other.name, dir_fd=directory.descriptor, follow_symlinks=False)
+            return stat.S_ISREG(facts.st_mode) and (
+                target is None or (facts.st_dev, facts.st_ino) != (target.st_dev, target.st_ino)
+            )
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        # An ambiguous/inaccessible reference needs reconciliation. Never read
+        # through a possible alias in order to authorize an unlink.
+        return False
 
 
 async def _artifact_facts_async(path: Path, descriptor: int | None = None) -> tuple[str, int] | None:
@@ -294,6 +309,13 @@ class LocalFileJanitor:
             "SELECT id FROM reader_leases WHERE video_id=$1 ORDER BY id FOR UPDATE NOWAIT",
         )
         try:
+            # File paths are plain text references, with no FK to the selected
+            # inode. Fence inserts/updates from other videos as well as readers
+            # while we check the complete set. Maintenance already owns the
+            # global pause; a concurrent writer makes this NOWAIT lock refuse.
+            await conn.execute(
+                "LOCK TABLE videos,workflow_artifacts,remote_asset_segments,reader_leases IN SHARE MODE NOWAIT"
+            )
             for query in queries:
                 await conn.fetch(query, video_id)
         except asyncpg.LockNotAvailableError:
@@ -428,8 +450,8 @@ class LocalFileJanitor:
 
         Eligibility belongs to the file, not merely the due video row. Include
         retained workflow/segment references and readers, even when the other
-        video has no due cleanup timestamp. Resolve aliases only to identify
-        references; deletion itself still refuses symlink components.
+        video has no due cleanup timestamp. Do not resolve an unknown symlink:
+        it could alias this inode, and reading it would change dry-run atime.
         """
         sources = ["SELECT id AS video_id, local_path AS path FROM videos WHERE local_path IS NOT NULL"]
         if await self._table_available(conn, "workflow_artifacts"):
@@ -444,11 +466,19 @@ class LocalFileJanitor:
             )
         if await self._table_available(conn, "reader_leases"):
             sources.append("SELECT video_id, path FROM reader_leases WHERE lease_until > now()")
-        canonical = os.path.realpath(path)
+        canonical = os.path.abspath(path)
+        try:
+            with open_media_directory(canonical) as directory:
+                target = os.stat(Path(canonical).name, dir_fd=directory.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            target = None
+        except (OSError, ValueError):
+            return False
         for reference in await conn.fetch(" UNION ALL ".join(sources)):
-            if reference["path"] and os.path.realpath(reference["path"]) == canonical:
-                if reference["video_id"] != video_id:
-                    return False
+            if reference["video_id"] == video_id or not reference["path"]:
+                continue
+            if not _reference_is_distinct(reference["path"], canonical, target):
+                return False
         return True
 
     async def _evaluate(
