@@ -14,6 +14,7 @@ import pytest
 
 from pixav.pixel_injector.maestro_parts import UploadReviewRequiredError, UserActionRequiredError
 from pixav.pixel_injector.photos_storage import MaestroSegmentUploader
+from pixav.pixel_injector.segment_staging import SegmentStagingError
 from pixav.pixel_injector.storage_activity import QuotaExhaustedError, StorageActivityWorker
 from pixav.shared.activity_context import require_activity_context
 from pixav.shared.exceptions import UploadError
@@ -297,6 +298,16 @@ async def test_unknown_remote_effect_is_not_reported_as_plain_failure_bdd_044_11
     activity = worker(pool, uploader=Uploader(UploadError("adb connection lost mid-transfer")))
     result = await activity.execute(request(), uuid.uuid4())
     assert result.outcome == "unknown_effect"
+
+
+async def test_local_staging_conflict_does_not_claim_a_remote_integrity_or_upload_result():
+    pool = FakePool(segment_row())
+    result = await worker(pool, uploader=Uploader(SegmentStagingError("local staging busy"))).execute(
+        request(), uuid.uuid4()
+    )
+    assert result.outcome == "infrastructure"
+    assert result.error_code == "SEGMENT_STAGING_REQUIRES_RECONCILIATION"
+    assert result.share_url is None
 
 
 async def test_readback_hash_mismatch_fails_verification_bdd_054_055():

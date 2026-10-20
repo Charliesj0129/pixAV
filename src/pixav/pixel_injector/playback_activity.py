@@ -18,10 +18,9 @@ import os
 import shutil
 import threading
 import uuid
-from collections.abc import Callable
 from contextlib import ExitStack, suppress
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 import asyncpg
 from pydantic import ValidationError
@@ -36,6 +35,7 @@ from pixav.pixel_injector.photos_storage import (
 )
 from pixav.shared.activity_context import activity_context
 from pixav.shared.media_file import file_version, open_media_directory, open_media_file, open_media_output
+from pixav.shared.media_file import run_media_work as _file_work
 from pixav.shared.playable_assets import playable_from_row
 from pixav.shared.playback_models import (
     CACHE_OBJECTS,
@@ -97,26 +97,6 @@ class _FileWorkCancelledError(Exception):
 def _check_file_work(stopped: threading.Event | None) -> None:
     if stopped is not None and stopped.is_set():
         raise _FileWorkCancelledError("PLAYBACK_FILE_WORK_CANCELLED")
-
-
-async def _file_work(function: Callable[..., Any], *args: Any) -> Any:
-    """Keep cancellation from abandoning a thread that owns media descriptors."""
-    stopped = threading.Event()
-    task = asyncio.create_task(asyncio.to_thread(function, *args, stopped=stopped))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        stopped.set()
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except (asyncio.CancelledError, Exception):
-                if task.done():
-                    break
-        # Retrieve a completed failure even if it raced the cancellation.
-        with suppress(asyncio.CancelledError, Exception):
-            task.result()
-        raise
 
 
 def _clear_work(work: Path, *, stopped: threading.Event | None = None) -> None:

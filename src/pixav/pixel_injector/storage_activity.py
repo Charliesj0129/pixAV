@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from pixav.pixel_injector.canary import CanaryBlockedError
 from pixav.pixel_injector.maestro_parts import UploadReviewRequiredError
 from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
+from pixav.pixel_injector.segment_staging import SegmentStagingError
 from pixav.shared.activity_context import activity_context
 from pixav.shared.exceptions import ReadbackUnavailableError, RedroidError, UploadError, VerificationError
 from pixav.shared.models import Account
@@ -182,7 +183,7 @@ class StorageActivityWorker:
             return ActivityResult(**fields, outcome="quota_exhausted", error_code="QUOTA_EXHAUSTED")
         except IntegrityError:
             return ActivityResult(**fields, outcome="verification_failed", error_code="INTEGRITY_MISMATCH")
-        except (ReadbackUnavailableError, asyncio.TimeoutError) as exc:
+        except (ReadbackUnavailableError, asyncio.TimeoutError, SegmentStagingError) as exc:
             return self._unavailable(request, fields, exc)
         except VerificationError:
             return ActivityResult(**fields, outcome="verification_failed", error_code="READBACK_FAILED")
@@ -196,6 +197,10 @@ class StorageActivityWorker:
 
     @staticmethod
     def _unavailable(request, fields: dict, error: Exception) -> ActivityResult:
+        if isinstance(error, SegmentStagingError):
+            return ActivityResult(
+                **fields, outcome="infrastructure", error_code="SEGMENT_STAGING_REQUIRES_RECONCILIATION"
+            )
         if request.stage != "verify":
             return ActivityResult(**fields, outcome="unknown_effect", error_code="REMOTE_EFFECT_TIMEOUT")
         kind = error.error_type if isinstance(error, ReadbackUnavailableError) else "TimeoutError"

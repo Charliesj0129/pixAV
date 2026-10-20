@@ -31,7 +31,7 @@ from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT, validate_account_cold_receipt
 from pixav.shared.exceptions import ReadbackUnavailableError, UploadError, VerificationError
 from pixav.shared.host_paths import host_path
-from pixav.shared.media_file import open_media_directory
+from pixav.shared.media_file import open_media_directory, run_media_work
 from pixav.shared.models import Account
 from pixav.shared.photos_ui_ownership import photos_ui_ownership
 from pixav.shared.photos_ui_session import current_photos_ui_lease
@@ -151,7 +151,7 @@ class MaestroSegmentUploader:
             raise UploadError("configured upload environment is not the Pixel-compatible one")
         # Link the prepared bytes under the name the guest will verify, before
         # asking for a runtime: a missing artifact must not cost a container.
-        staged = await asyncio.to_thread(stage_segment, segment, root=self._staging_root)
+        staged = await run_media_work(stage_segment, segment, root=self._staging_root)
         guest, runner = await self._runtime(account.id)
         recovery = dict(segment.recovery)
 
@@ -210,7 +210,7 @@ class MaestroSegmentUploader:
 
     async def release(self, segment: RemoteAssetSegment) -> None:
         """Drop the staged link once the authority has committed the usage."""
-        await asyncio.to_thread(release_segment, segment, root=self._staging_root)
+        await run_media_work(release_segment, segment, root=self._staging_root)
 
 
 class PhotosColdReadback:

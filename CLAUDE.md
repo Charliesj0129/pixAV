@@ -12,6 +12,8 @@ Linux 媒體共同鎖、固定 parent descriptor unlink 與 FFmpeg 子程序繼�
 
 local stream、Photos 完整解碼與 read-back copy 亦納入 Linux 鎖協定；既存或被替換的 playback work 保留待覆核，不能由錯誤清理刪除或當成遠端完整性失敗。
 
+segment staging 的 prepared／copy 輸出與 release 亦使用共同鎖；原件缺失、reader、異內容、foreign target、pending 或取消均保留相應副本。真跨 tmpfs 與取消只有本機合成證據，ADB push 全程、native Windows 與完整 reader 覆蓋仍待驗收。
+
 取消會等待已開始的檔案 thread 與 cold child 收斂，重複取消不能跳過；child 移除未確認或 cache rename 已越界時保留 work 供 reconciliation，不宣告 domain 成功。未確認 child 另存私有 sibling 記錄，取消仍向外傳遞；pending 記錄阻擋同一 work 重建 child。目前 Docker Desktop 關閉，本版完整整合與新映像未重驗；先前斷網 child 證據不升級為本版或 Photos／完整 cleanup PASS。
 
 備份及還原不得放 C 槽。Ubuntu 的 C 槽 LocalState 是指向 D 槽的 junction；Docker 資料磁碟已移至 `D:\DockerDesktopData`，Android SDK 已移至 `D:\Android\Sdk`，原 C 槽資料副本已清除。每次仍依當前檔案及成功收據核實，不能沿用舊 registration 或搬移腳本。私有 cleanup manifest／備份收據不進 Git。

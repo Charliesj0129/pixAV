@@ -9,15 +9,17 @@ filesystem, not protection against arbitrary processes that ignore the lock.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import os
 import stat
-from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 
 class MediaFileChangedError(ValueError):
@@ -26,6 +28,29 @@ class MediaFileChangedError(ValueError):
 
 class MediaFileUnsafeError(ValueError):
     """A target is not an owned ordinary media file."""
+
+
+async def run_media_work(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Drain a started file thread before propagating even repeated cancellation.
+
+    The operation checks ``stopped`` before its next publication or mutation.
+    A completed mutation is retained for reconciliation by the caller.
+    """
+    stopped = threading.Event()
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs, stopped=stopped))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stopped.set()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                if task.done():
+                    break
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+        raise
 
 
 def file_version(info: os.stat_result) -> tuple[int, int, int, int, int]:
