@@ -8,7 +8,7 @@
 
 下一個 agent 從 README 的「設計 checkpoint 與重跑起點」開始，以新 cohort 跑完整 Golden Path。軟體檢查、Photos cold integrity、人工影音／seek、二十四小時 quota、backup／restore、rollback 與 production gate 分開驗收，未取得當次證據保持 OPEN。
 
-Linux 媒體共同鎖、固定 parent descriptor unlink 與 FFmpeg 子程序繼承鎖已有合成隔離證據；025 expand migration 另要求當次 inode／DB／資產／publication binding，舊授權不回填。全部 reader、qBittorrent quiescence、receipt 授權及 cleanup CLI 仍待完成，正式 cleanup 未開啟。操作者確認刻意停止或重啟後，原 core 維持停止；恢復前重新核對掛載與 instance／pause ownership。
+Linux 媒體共同鎖、固定 parent descriptor unlink 與 FFmpeg 子程序繼承鎖已有合成隔離證據；025 expand migration 另要求當次 inode／DB／資產／publication binding，舊授權不回填。026 收據核准、私有 `manage_cleanup files / authorize` 入口及 intent／audit 授權摘要已有本機實作，尚未跑新版 PostgreSQL／restore；入口不刪媒體、不新增備份。全部 reader、qBittorrent quiescence、整組授權及完整 cleanup apply／recover 操作仍待完成，正式 cleanup 未開啟。操作者確認刻意停止或重啟後，原 core 維持停止；恢復前重新核對掛載與 instance／pause ownership。
 
 local stream、Photos 完整解碼與 read-back copy 亦納入 Linux 鎖協定；既存或被替換的 playback work 保留待覆核，不能由錯誤清理刪除或當成遠端完整性失敗。
 

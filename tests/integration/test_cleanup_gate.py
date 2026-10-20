@@ -8,6 +8,7 @@ the last tests hold every guarantee at once, and only then is a file removed.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ import sys
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -26,13 +28,24 @@ from pixav.library_projection.metadata import EffectiveMetadata
 from pixav.library_projection.render import render_projection
 from pixav.library_projection.repository import ArtworkRecord
 from pixav.library_projection.writer import ProjectionWriter
+from pixav.maxwell_core.cleanup_authorization import CleanupAuthorizer
 from pixav.maxwell_core.gc import LocalFileJanitor
 from pixav.shared.cleanup_binding import capture_cleanup_binding
+from pixav.shared.cleanup_recovery import (
+    CleanupApprovalError,
+    CleanupApprovalRequest,
+    CleanupRecoveryAuthorization,
+    CleanupRuntimeBinding,
+    target_binding_digest,
+)
 from pixav.shared.media_file import open_media_file
 from pixav.shared.playable_assets import PlayableAssetRepository
 from pixav.shared.remote_assets import RemoteAssetRepository
 
 pytestmark = pytest.mark.integration
+
+# Policy fixtures only; these values do not attest a live daemon or restore.
+RUNTIME = CleanupRuntimeBinding(docker_context="synthetic", docker_daemon_id="synthetic-daemon", redis_run_id="a" * 40)
 
 
 @pytest.fixture
@@ -126,7 +139,12 @@ async def publish(db, video):
 
 def janitor(db, tmp_path, *, apply=True):
     return LocalFileJanitor(
-        db, download_dir=str(tmp_path), library_root=str(tmp_path / "library"), apply_deletions=apply
+        db,
+        download_dir=str(tmp_path),
+        library_root=str(tmp_path / "library"),
+        apply_deletions=apply,
+        recovery_runtime=RUNTIME,
+        allow_operator_exception=True,
     )
 
 
@@ -310,15 +328,16 @@ async def test_same_bytes_at_a_new_inode_do_not_reuse_an_earlier_authorization(d
 
 
 @pytest.mark.parametrize("old_schema", [False, True])
-async def test_legacy_free_text_approval_cannot_authorize_cleanup(db, tmp_path, old_schema):
+@pytest.mark.parametrize("column", ["target_binding", "recovery_authorization", "approval_sha256"])
+async def test_legacy_free_text_approval_cannot_authorize_cleanup(db, tmp_path, old_schema, column):
     video, media = await artifact(db, tmp_path)
     await publish(db, video)
     await playback_verified(db, video)
     await authorize(db, video, media)
     if old_schema:
-        await db.execute("ALTER TABLE cleanup_authorizations DROP COLUMN target_binding")
+        await db.execute(f"ALTER TABLE cleanup_authorizations DROP COLUMN {column}")  # noqa: S608 -- fixed parameters
     else:
-        await db.execute("UPDATE cleanup_authorizations SET target_binding=NULL")
+        await db.execute(f"UPDATE cleanup_authorizations SET {column}=NULL")  # noqa: S608 -- fixed parameters
 
     stats = await janitor(db, tmp_path).cleanup()
 
@@ -388,7 +407,13 @@ async def test_inode_lock_remains_held_through_unlink_and_domain_commit(db, tmp_
                 observed.append("locked")
             await super()._audit(conn, video, path, decision, applied, reasons)
 
-    operator = InspectCommit(db, download_dir=str(tmp_path), library_root=str(tmp_path / "library"))
+    operator = InspectCommit(
+        db,
+        download_dir=str(tmp_path),
+        library_root=str(tmp_path / "library"),
+        recovery_runtime=RUNTIME,
+        allow_operator_exception=True,
+    )
     assert (await operator.cleanup(apply=True))["deleted"] == 1
     assert observed == ["locked"]
     with open_media_file(alias) as reader:
@@ -409,7 +434,13 @@ async def test_binding_keeps_the_configured_staging_root_symlink_contract(db, tm
     await db.execute("UPDATE videos SET local_path=$1 WHERE id=$2", domain_path, video)
     await db.execute("UPDATE cleanup_authorizations SET path=$1 WHERE video_id=$2", domain_path, video)
 
-    operator = LocalFileJanitor(db, download_dir=str(configured), library_root=str(root / "library"))
+    operator = LocalFileJanitor(
+        db,
+        download_dir=str(configured),
+        library_root=str(root / "library"),
+        recovery_runtime=RUNTIME,
+        allow_operator_exception=True,
+    )
 
     assert (await operator.cleanup(apply=True))["deleted"] == 1
     assert not media.exists()
@@ -660,10 +691,26 @@ async def playback_verified(db, video):
 
 
 async def authorize(db, video, media, **overrides):
-    """Write one exact-target cleanup authorization for this artifact."""
+    """Write a synthetic exception stamp to isolate the janitor's live gates.
+
+    This helper does not test the operator/receipt boundary or claim a backup.
+    """
     with open_media_file(media) as source:
         facts = source.facts()
         binding = await capture_cleanup_binding(db, video, media, source.descriptor, facts)
+    now = await db.fetchval("SELECT clock_timestamp()")
+    recovery = CleanupRecoveryAuthorization(
+        version="cleanup-recovery-authorization-v1",
+        mode="operator-exception",
+        scope="isolated-acceptance",
+        target_binding_sha256=target_binding_digest(binding),
+        runtime=RUNTIME,
+        receipt_sha256="b" * 64,
+        proof_sha256="c" * 64,
+        validated_at=now,
+        expires_at=now + timedelta(minutes=30),
+        off_host_attested=False,
+    )
     fields = {
         "path": str(media),
         "artifact_sha256": facts[0],
@@ -674,9 +721,9 @@ async def authorize(db, video, media, **overrides):
     asset = await db.fetchval("SELECT id FROM remote_assets WHERE video_id=$1", video)
     await db.execute(
         f"""INSERT INTO cleanup_authorizations(id,video_id,path,artifact_sha256,size_bytes,remote_asset_id,
-        playback_verified_at,backup_reference,approved_by,reason,expires_at,target_binding)
-        VALUES($1,$2,$3,$4,$5,$6,now(),'offsite-vault','fixture-operator','integration fixture',
-        {fields["expires"]},$7::jsonb)""",  # noqa: S608 - interval literal comes from this module only
+        playback_verified_at,backup_reference,approved_by,reason,expires_at,target_binding,recovery_authorization,approval_sha256)
+        VALUES($1,$2,$3,$4,$5,$6,now(),'synthetic-receipt','fixture-operator','integration fixture',
+        {fields["expires"]},$7::jsonb,$8::jsonb,$9)""",  # noqa: S608 - interval literal comes from this module only
         uuid.uuid4(),
         video,
         fields["path"],
@@ -684,11 +731,105 @@ async def authorize(db, video, media, **overrides):
         fields["size_bytes"],
         asset,
         binding.model_dump_json(),
+        recovery.model_dump_json(),
+        "d" * 64,
     )
 
 
 async def reasons_for(db):
     return await db.fetchval("SELECT reasons FROM cleanup_audit ORDER BY created_at DESC LIMIT 1")
+
+
+async def private_approval_request(db, tmp_path, video, media):
+    """Synthetic operator attestation only; no actual backup/restore operation."""
+    tmp_path.chmod(0o700)
+    with open_media_file(media) as source:
+        binding = await capture_cleanup_binding(db, video, media, source.descriptor, source.facts())
+    now = await db.fetchval("SELECT clock_timestamp()")
+
+    def evidence(name, payload):
+        raw = json.dumps(payload).encode()
+        path = tmp_path / name
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+        return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
+
+    instruction = evidence("instruction.json", {"instruction": "Synthetic operator explicitly waives a backup."})
+    receipt = evidence(
+        "receipt.json",
+        {
+            "kind": "operator-exception",
+            "scope": "isolated-acceptance",
+            "authorized_by": "fixture-operator",
+            "reason": "Synthetic exception",
+            "instruction": instruction,
+            "runtime": RUNTIME.model_dump(),
+            "database_identifier": binding.database_identifier,
+            "database_name": binding.database_name,
+            "target_binding_sha256": target_binding_digest(binding),
+            "observed_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=30)).isoformat(),
+        },
+    )
+    return CleanupApprovalRequest(
+        version="cleanup-approval-v1",
+        id=uuid.uuid4(),
+        scope="isolated-acceptance",
+        expected_count=1,
+        target=binding,
+        runtime=RUNTIME,
+        recovery_receipt=receipt,
+        approved_by="fixture-operator",
+        reason="Synthetic exact-target approval",
+        expires_at=now + timedelta(minutes=20),
+    )
+
+
+async def test_receipt_authorizer_dry_run_apply_idempotence_and_audit(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    approval = await private_approval_request(db, tmp_path, video, media)
+    guard = type("Guard", (), {"check": AsyncMock(return_value=RUNTIME)})()
+    service = CleanupAuthorizer(
+        db, guard, staging_root=tmp_path, library_root=tmp_path / "library", allow_operator_exception=True
+    )
+    before = {p.name: p.stat() for p in tmp_path.iterdir()}
+    assert (await service.authorize(approval))["result"] == "ELIGIBLE_FOR_AUTHORIZATION"
+    for table in ("cleanup_authorizations", "cleanup_journal", "cleanup_audit"):
+        assert await db.fetchval(f"SELECT count(*) FROM {table}") == 0  # noqa: S608 -- fixed names
+    assert {p.name: p.stat() for p in tmp_path.iterdir()} == before
+    assert (await service.authorize(approval, apply=True))["authorized_count"] == 1
+    assert (await service.authorize(approval, apply=True))["result"] == "ALREADY_AUTHORIZED"
+    with pytest.raises(CleanupApprovalError, match="ID_CONFLICT"):
+        await service.authorize(approval.model_copy(update={"reason": "new consent"}), apply=True)
+    assert await db.fetchval("SELECT count(*) FROM cleanup_authorizations") == 1
+    assert media.exists()
+    assert (await janitor(db, tmp_path).cleanup())["deleted"] == 1
+    audit = json.loads(await reasons_for(db))["authorization"]
+    intent = json.loads(await db.fetchval("SELECT gates FROM cleanup_journal"))["authorization"]
+    assert audit == intent
+    assert audit["authorization_id"] == str(approval.id)
+    assert audit["recovery"]["receipt_sha256"] == approval.recovery_receipt.sha256
+    assert not audit["recovery"]["off_host_attested"]
+
+
+async def test_receipt_authorizer_requires_exception_opt_in_and_all_other_live_gates(db, tmp_path):
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    approval = await private_approval_request(db, tmp_path, video, media)
+    guard = type("Guard", (), {"check": AsyncMock(return_value=RUNTIME)})()
+    service = CleanupAuthorizer(db, guard, staging_root=tmp_path, library_root=tmp_path / "library")
+    with pytest.raises(CleanupApprovalError, match="EXCEPTION_NOT_ALLOWED"):
+        await service.authorize(approval, apply=True)
+    await db.execute("UPDATE videos SET local_cleanup_after=now()+interval '1 day' WHERE id=$1", video)
+    service.allow_operator_exception = True
+    with pytest.raises(CleanupApprovalError, match="LIVE_GATES_INCOMPLETE"):
+        await service.authorize(approval, apply=True)
+    assert await db.fetchval("SELECT count(*) FROM cleanup_authorizations") == 0
+    assert media.exists()
 
 
 async def test_the_missing_producer_is_named_rather_than_assumed_bdd_005_131(db, tmp_path):
@@ -921,6 +1062,7 @@ import asyncpg
 from pixav.maxwell_core.gc import LocalFileJanitor
 from pixav.shared.instance import database_identity
 from pixav.shared.client_playback_evidence import ClientPlaybackEvidence
+from pixav.shared.cleanup_recovery import CleanupRuntimeBinding
 
 root, stage, ready = sys.argv[1:]
 dsn = sys.stdin.readline().rstrip("\n")
@@ -950,7 +1092,9 @@ async def main():
     try:
         assert await database_identity(pool) == os.environ["PIXAV_TEST_DB_IDENTITY"]
         assert (await pool.fetchval("SELECT current_database()")).startswith("pixav_test_")
-        await KillJanitor(pool, download_dir=root, library_root=root+"/library").cleanup(apply=True)
+        runtime = CleanupRuntimeBinding(docker_context="synthetic", docker_daemon_id="synthetic-daemon", redis_run_id="a"*40)
+        await KillJanitor(pool, download_dir=root, library_root=root+"/library",
+            recovery_runtime=runtime, allow_operator_exception=True).cleanup(apply=True)
         if stage == "after-commit": await checkpoint()
     finally: await pool.close()
 asyncio.run(main())
@@ -1044,7 +1188,13 @@ async def test_replacement_after_committed_intent_is_preserved(db, tmp_path):
             replacement.replace(media)
             return result
 
-    operator = ReplaceAfterIntent(db, download_dir=str(tmp_path), library_root=str(tmp_path / "library"))
+    operator = ReplaceAfterIntent(
+        db,
+        download_dir=str(tmp_path),
+        library_root=str(tmp_path / "library"),
+        recovery_runtime=RUNTIME,
+        allow_operator_exception=True,
+    )
     assert (await operator.cleanup(apply=True))["failed"] == 1
     assert media.read_bytes() == b"the only local copy"
     assert await db.fetchval("SELECT state FROM cleanup_journal") == "INTENT"
@@ -1096,10 +1246,16 @@ async def test_binding_expand_and_full_synthetic_restore_preserve_approvals(db, 
     await authorize(db, video, media)
     legacy_id = await db.fetchval("SELECT id FROM cleanup_authorizations")
     await db.execute("ALTER TABLE cleanup_authorizations DROP COLUMN target_binding")
+    await db.execute("ALTER TABLE cleanup_authorizations DROP COLUMN recovery_authorization")
+    await db.execute("ALTER TABLE cleanup_authorizations DROP COLUMN approval_sha256")
     await db.execute(Path("migrations/025_cleanup_target_binding.sql").read_text())
+    await db.execute(Path("migrations/026_cleanup_recovery_authorization.sql").read_text())
     assert await db.fetchval("SELECT target_binding FROM cleanup_authorizations WHERE id=$1", legacy_id) is None
     await authorize(db, video, media)
-    bindings = await db.fetch("SELECT id,target_binding FROM cleanup_authorizations ORDER BY id")
+    approval_sql = (
+        "SELECT id,target_binding,recovery_authorization,approval_sha256 FROM cleanup_authorizations ORDER BY id"
+    )
+    bindings = await db.fetch(approval_sql)
     assert len(bindings) == 2
     assert await db.fetchval(
         "SELECT has_column_privilege('pixav_execution_authority','cleanup_authorizations','target_binding','SELECT')"
@@ -1160,7 +1316,7 @@ async def test_binding_expand_and_full_synthetic_restore_preserve_approvals(db, 
         restored = await asyncpg.connect(urlunsplit(endpoint._replace(path=f"/{target}")))
         try:
             assert await database_identity(restored) == await database_identity(admin)
-            assert await restored.fetch("SELECT id,target_binding FROM cleanup_authorizations ORDER BY id") == bindings
+            assert await restored.fetch(approval_sql) == bindings
             assert not await janitor(restored, tmp_path)._authorized_target(restored, video, str(media))
             assert media.exists()
         finally:

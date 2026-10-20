@@ -39,6 +39,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - staging cleanup 必須同時滿足遠端 DURABLE、有效完整性證據、播放 READY 且實播驗證完成、完整 publication、retention 到期、無 active execution/reader、path/ownership 與操作守衛通過。資格檢查到 unlink 之間防止競態；cleanup crash 後核對 filesystem 並留下 audit。
 - Linux 媒體 reader／writer 使用共同 descriptor 鎖協定；子程序須繼承鎖，unlink 以固定 parent descriptor 執行並持鎖至 domain commit。尚未接入的 reader、qBittorrent 或其他 filesystem 不能以現有隔離鎖證據放行 cleanup；完整 coverage 與操作授權仍依 README 分別驗收。
 - cleanup 授權須符合當次 inode、DB／資產／publication binding；舊文字授權不回填成新核准。套用 025 expand migration 或 rollback 時維持 cleanup 關閉，停止會忽略 binding 的不相容 janitor；binding 不代替備份還原收據或操作者授權。
+- 026 expand migration 的收據核准由私有 `manage_cleanup files / authorize` 入口登錄，預設 dry-run，兩者不刪媒體；只有具權限操作者提供的 restore attestation 或明確 opt-in 的隔離例外可成為核准，不把檔案 hash 當實際還原證明。intent／audit 保留核准與收據摘要，缺歷史同意的 intent 不自動 recovery；新版整合驗證及完整 apply 入口通過前維持 cleanup 關閉，不新增備份工作。
 - playback work 失敗清理只處理該次建立、身分未變且無 reader 的精確檔案；既存或被替換的 work 保留待 reconciliation，視為基礎設施／ownership 問題，不污染遠端完整性判定。
 - 取消檔案 thread 或 cold child 時須先收斂已開始的工作，重複取消不得略過等待。child 移除未確認須保留 work 並回報 reconciliation，不視為已停止或完整性失敗；已越過 cache rename 的結果不能推進取消 attempt 的 domain 狀態。
 - 未確認 child 的 sibling 記錄從建立起 0600，不進 cold-input mount、不覆寫既存記錄；pending 記錄阻擋同一 work 再建 child。取消須持續傳遞，不能因保全錯誤轉成一般結果；後續依記錄重新核對 daemon／exact child／實際 bind，不以記錄本身當停止證明。
