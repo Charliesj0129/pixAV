@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from pixav.pixel_injector.photos_auth import (
     verify_browser_account,
 )
 from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT
-from pixav.shared.media_file import open_media_file
+from pixav.shared.media_file import MediaFile, file_version, open_media_file
 from pixav.shared.models import VideoPart
 from pixav.shared.storage_models import TransferableFile
 
@@ -64,9 +65,12 @@ def observed_media(path: Path) -> dict:
     return json.loads(asyncio.run(inspect_media(str(path))).model_dump_json())
 
 
-def decode_original(path: Path) -> None:
+def decode_original(path: Path | MediaFile, *, timeout: int = 21600) -> None:
     """Decode the complete provider original; diagnostics stay out of receipts."""
-    with open_media_file(path) as source, tempfile.TemporaryFile() as errors:
+    with ExitStack() as files, tempfile.TemporaryFile() as errors:
+        source = path if isinstance(path, MediaFile) else files.enter_context(open_media_file(path))
+        source.assert_current()
+        before = file_version(os.fstat(source.descriptor))
         result = subprocess.run(  # noqa: S603 - fixed image tool, argv only, verified local provider output
             [
                 "/usr/bin/ffmpeg",
@@ -93,11 +97,13 @@ def decode_original(path: Path) -> None:
             ],
             stdout=subprocess.DEVNULL,
             stderr=errors,
-            timeout=21600,
+            timeout=timeout,
             check=False,
             pass_fds=(source.descriptor,),
         )
         source.assert_current()
+        if file_version(os.fstat(source.descriptor)) != before:
+            raise ValueError("Photos original changed during complete decoding")
         if result.returncode or errors.tell():
             raise OriginalMismatchError("Photos original failed complete decoding")
 

@@ -21,7 +21,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from pixav.shared.media_file import MediaFile, file_version, open_media_file
+from pixav.shared.media_file import MediaFile, file_version, open_media_file, open_media_output
 
 WIDTH, HEIGHT, RATE = 640, 360, 48000
 FRAME_BYTES = WIDTH * HEIGHT * 3
@@ -72,7 +72,7 @@ def marker_filter(spec: SyntheticAVSpec) -> str:
 
 def generate_media(spec: SyntheticAVSpec, output: Path, *, four_k: bool = True) -> None:
     """Generate into a seeder-only directory; never prepopulate the downloader."""
-    if output.exists():
+    if output.exists() or output.is_symlink():
         raise ValueError("synthetic media output already exists")
     filters = marker_filter(spec) + (",scale=3840:2160" if four_k else "")
     tone = f"aevalsrc='0.25*sin(2*PI*({spec.tone_base_hz}+90*mod(floor(t/5),8))*t)':s={RATE}"
@@ -82,7 +82,7 @@ def generate_media(spec: SyntheticAVSpec, output: Path, *, four_k: bool = True) 
         "-loglevel",
         "error",
         "-nostdin",
-        "-n",
+        "-y",
         "-f",
         "lavfi",
         "-i",
@@ -119,9 +119,19 @@ def generate_media(spec: SyntheticAVSpec, output: Path, *, four_k: bool = True) 
         "aac",
         "-b:a",
         "128k",
-        str(output),
     ]
-    subprocess.run(command, check=True, capture_output=True, timeout=1800)  # noqa: S603 -- argv, no shell
+    with open_media_output(output, must_create=True) as target:
+        result = subprocess.run(  # noqa: S603 -- fixed tool, inherited exclusive output, no shell
+            [*command, "-f", "mp4", f"/proc/self/fd/{target.descriptor}"],
+            check=True,
+            capture_output=True,
+            timeout=1800,
+            pass_fds=(target.descriptor,),
+        )
+        target.assert_current()
+        if not os.fstat(target.descriptor).st_size or result.stderr:
+            raise ValueError("synthetic encoder produced no output or reported errors")
+        os.fsync(target.descriptor)
 
 
 def _pixel(frame: bytes, x: int, y: int) -> tuple[int, int, int]:

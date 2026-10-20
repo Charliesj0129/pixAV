@@ -110,6 +110,38 @@ def test_timecode_alone_cannot_hide_a_frozen_picture():
     assert picture_motion(bytes(FRAME_BYTES), bytes([50]) * FRAME_BYTES) == 50
 
 
+def test_synthetic_generator_exclusively_creates_and_inherits_its_output(tmp_path, monkeypatch):
+    from pixav.strm_resolver import av_acceptance as module
+
+    destination = tmp_path / "synthetic.mp4"
+
+    def encode(command, **kwargs):
+        assert destination.is_file() and destination.stat().st_mode & 0o777 == 0o600
+        with pytest.raises(BlockingIOError), open_media_file(destination):
+            pytest.fail("generator output was available before encoding finished")
+        descriptor = int(command[-1].removeprefix("/proc/self/fd/"))
+        assert descriptor in kwargs["pass_fds"] and command[-3:-1] == ["-f", "mp4"]
+        os.pwrite(descriptor, b"synthetic encoded bytes", 0)
+        return SimpleNamespace(stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(module.subprocess, "run", encode)
+    module.generate_media(SyntheticAVSpec(identity=uuid.uuid4(), duration_seconds=12), destination, four_k=False)
+    assert destination.read_bytes() == b"synthetic encoded bytes"
+
+
+def test_synthetic_generator_refuses_a_dangling_symlink_without_starting_an_encoder(tmp_path, monkeypatch):
+    from pixav.strm_resolver import av_acceptance as module
+
+    destination = tmp_path / "synthetic.mp4"
+    missing = tmp_path / "foreign.mp4"
+    destination.symlink_to(missing)
+    started = []
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: started.append(True))
+    with pytest.raises((OSError, ValueError)):
+        module.generate_media(SyntheticAVSpec(identity=uuid.uuid4(), duration_seconds=12), destination, four_k=False)
+    assert destination.is_symlink() and not missing.exists() and not started
+
+
 @pytest.mark.parametrize("fault", [None, "mute", "wrong-tone", "freeze", "freeze-picture", "seek", "resume"])
 def test_recording_analysis_rejects_audiovisual_faults(tmp_path, monkeypatch, fault):
     spec = SyntheticAVSpec(identity=uuid.uuid4(), duration_seconds=60)

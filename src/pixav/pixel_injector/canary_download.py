@@ -12,6 +12,7 @@ import os
 import subprocess
 import tempfile
 import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 from typing import IO, Any
 
@@ -19,6 +20,7 @@ from pixav.shared.media_file import (
     MediaFile,
     MediaFileChangedError,
     MediaFileUnsafeError,
+    file_version,
     open_media_directory,
     open_media_file,
     open_media_output,
@@ -116,13 +118,37 @@ def _extract_item(bundle: zipfile.ZipFile, destination: Path, filename: str, siz
         copy_original(stream, destination, size, digest)
 
 
-def probe(path: Path) -> dict[str, Any]:
+def probe(path: Path | MediaFile) -> dict[str, Any]:
+    with ExitStack() as files:
+        source = path if isinstance(path, MediaFile) else files.enter_context(open_media_file(path))
+        source.assert_current()
+        before = file_version(os.fstat(source.descriptor))
+        result = _probe(source)
+        source.assert_current()
+        if file_version(os.fstat(source.descriptor)) != before:
+            raise OriginalWorkConflictError("COLD_ORIGINAL_CHANGED_DURING_PROBE")
+        return result
+
+
+def _probe(source: MediaFile) -> dict[str, Any]:
     result = subprocess.run(  # noqa: S603 - fixed executable and private canary path
-        ["/usr/bin/ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        [
+            "/usr/bin/ffprobe",
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            f"/proc/self/fd/{source.descriptor}",
+        ],
         capture_output=True,
         check=True,
         timeout=60,
+        pass_fds=(source.descriptor,),
     )
+    if result.stderr:
+        raise OriginalMismatchError("canary probe reported media errors")
     raw = json.loads(result.stdout)
     video = next(item for item in raw["streams"] if item["codec_type"] == "video")
     return {
@@ -137,6 +163,8 @@ def probe(path: Path) -> dict[str, Any]:
 
 def main() -> int:
     from playwright.sync_api import sync_playwright
+
+    from pixav.pixel_injector.parts_download import decode_original
 
     os.umask(0o077)
     root = Path(tempfile.mkdtemp(prefix="cloud-verify-", dir="/work"))
@@ -157,34 +185,40 @@ def main() -> int:
             browser_version = browser.version
             browser.close()
         extract_original(archive, original, expected["filename"], expected["size"], expected["sha256"])
-        media = probe(original)
-        if any(media[key] != expected[key] for key in ("width", "height", "codec", "duration")):
-            raise OriginalMismatchError("cloud media metadata mismatch")
-        if media["width"] < 3840 or media["height"] < 2160:
-            raise OriginalMismatchError("cloud video is below 4K")
-        subprocess.run(  # noqa: S603 - fixed executable and private canary path
-            ["/usr/bin/ffmpeg", "-v", "error", "-xerror", "-i", str(original), "-f", "null", "-"],
-            capture_output=True,
-            check=True,
-            timeout=180,
-        )
-        report = {
-            "artifact_directory": str(root),
-            "original": "PASS",
-            "method": "anonymous browser / sample-only album / Download all",
-            "independent_of_guest_source": True,
-            "archive_items": 1,
-            "filename": expected["filename"],
-            "size": original.stat().st_size,
-            "sha256": expected["sha256"],
-            "sha256_match": True,
-            "media": media,
-            "full_decode": "PASS",
-            "browser_version": browser_version,
-            "range_support": "NOT_ASSESSED",
-            "used_m22": False,
-        }
-        (root / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        with open_media_file(original) as source:
+            facts = source.facts()
+            if facts != (expected["sha256"], expected["size"]):
+                raise OriginalMismatchError("cloud original changed before verification")
+            media = probe(source)
+            if any(media[key] != expected[key] for key in ("width", "height", "codec", "duration")):
+                raise OriginalMismatchError("cloud media metadata mismatch")
+            if media["width"] < 3840 or media["height"] < 2160:
+                raise OriginalMismatchError("cloud video is below 4K")
+            decode_original(source, timeout=180)
+            if source.facts() != facts:
+                raise OriginalWorkConflictError("COLD_ORIGINAL_CHANGED_DURING_VERIFICATION")
+            report = {
+                "artifact_directory": str(root),
+                "original": "PASS",
+                "method": "anonymous browser / sample-only album / Download all",
+                "independent_of_guest_source": True,
+                "archive_items": 1,
+                "filename": expected["filename"],
+                "size": facts[1],
+                "sha256": facts[0],
+                "sha256_match": True,
+                "media": media,
+                "full_decode": "PASS",
+                "browser_version": browser_version,
+                "range_support": "NOT_ASSESSED",
+                "used_m22": False,
+            }
+            source.assert_current()
+            with (root / "report.json").open("x") as receipt:
+                json.dump(report, receipt, indent=2)
+                receipt.write("\n")
+                receipt.flush()
+                os.fsync(receipt.fileno())
         print(json.dumps(report))
         return 0
     except Exception as exc:
@@ -200,4 +234,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from pixav.pixel_injector.canary_download import main as entrypoint
+
+    raise SystemExit(entrypoint())
