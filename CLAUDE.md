@@ -8,7 +8,7 @@
 
 下一個 agent 從 README 的「設計 checkpoint 與重跑起點」開始，以新 cohort 跑完整 Golden Path。軟體檢查、Photos cold integrity、人工影音／seek、二十四小時 quota、backup／restore、rollback 與 production gate 分開驗收，未取得當次證據保持 OPEN。
 
-Linux 媒體共同鎖、固定 parent descriptor unlink 與 FFmpeg 子程序繼承鎖已有合成隔離證據；025 expand migration 另要求當次 inode／DB／資產／publication binding，舊授權不回填。026 收據核准、私有 `manage_cleanup files / authorize` 入口及 intent／audit 授權摘要已有本機實作，尚未跑新版 PostgreSQL／restore；入口不刪媒體、不新增備份。全部 reader、qBittorrent quiescence、整組授權及完整 cleanup apply／recover 操作仍待完成，正式 cleanup 未開啟。操作者確認刻意停止或重啟後，原 core 維持停止；恢復前重新核對掛載與 instance／pause ownership。
+Linux 媒體共同鎖、固定 parent descriptor unlink 與 FFmpeg 子程序繼承鎖已有合成隔離證據；025 expand migration 另要求當次 inode／DB／資產／publication binding，舊授權不回填。026 的登錄交易、intent／audit 摘要及合成 restore 已通過本輪專用 PostgreSQL；私有 `manage_cleanup files / authorize` 的 CLI runtime／owned-pause live 組合驗證仍待補。原 DB 未套用，入口不刪媒體、不新增備份。全部 reader、qBittorrent quiescence、整組授權及完整 cleanup apply／recover 操作仍待完成，正式 cleanup 未開啟。操作者確認刻意停止或重啟後，原 core 維持停止；恢復前重新核對掛載與 instance／pause ownership。
 
 local stream、Photos 完整解碼與 read-back copy 亦納入 Linux 鎖協定；既存或被替換的 playback work 保留待覆核，不能由錯誤清理刪除或當成遠端完整性失敗。
 
@@ -16,6 +16,6 @@ segment staging 的 prepared／copy 輸出與 release 亦使用共同鎖；原�
 
 canary ZIP、original copy、驗收 hash 與 HTTP movie acceptance 已接共同鎖；partial 被替換或發布衝突時保留 work，不能判為遠端完整性失敗。離線 reference／錄影多次解碼與 canary probe／decode 的全程鎖仍待完成，不能以單次 hash 證據開啟 cleanup。
 
-取消會等待已開始的檔案 thread 與 cold child 收斂，重複取消不能跳過；child 移除未確認或 cache rename 已越界時保留 work 供 reconciliation，不宣告 domain 成功。未確認 child 另存私有 sibling 記錄，取消仍向外傳遞；pending 記錄阻擋同一 work 重建 child。目前 Docker Desktop 關閉，本版完整整合與新映像未重驗；先前斷網 child 證據不升級為本版或 Photos／完整 cleanup PASS。
+取消會等待已開始的檔案 thread 與 cold child 收斂，重複取消不能跳過；child 移除未確認或 cache rename 已越界時保留 work 供 reconciliation，不宣告 domain 成功。未確認 child 另存私有 sibling 記錄，取消仍向外傳遞；pending 記錄阻擋同一 work 重建 child。Docker Desktop 已恢復同一 daemon，CI source bind 已重核；程式 checkpoint `67d4c19` 的完整檢查為 2,358 passed／8 skipped、coverage 84%，對應不可變映像已核對 source，實際斷網 child 取消／保全及 FFmpeg 檔案鎖契約通過。原 managed 服務保持停止，DB／Redis live identity 與全部 bind 未重驗；上述隔離證據不抵 Photos／完整 cleanup PASS。
 
 備份及還原不得放 C 槽。Ubuntu 的 C 槽 LocalState 是指向 D 槽的 junction；Docker 資料磁碟已移至 `D:\DockerDesktopData`，Android SDK 已移至 `D:\Android\Sdk`，原 C 槽資料副本已清除。每次仍依當前檔案及成功收據核實，不能沿用舊 registration 或搬移腳本。私有 cleanup manifest／備份收據不進 Git。
