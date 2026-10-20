@@ -12,12 +12,13 @@ import json
 import math
 import os
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pixav.shared.backup_files import create_backup_file
-from pixav.shared.media_file import open_media_file
+from pixav.shared.media_file import MediaFile, file_version, open_media_file, open_media_output
 
 FFMPEG = "/usr/bin/ffmpeg"
 FRAME_BYTES = 64 * 36
@@ -90,7 +91,16 @@ def save_private(path: Path, value: dict) -> None:
         json.dump(value, handle, indent=2, allow_nan=False)
 
 
-def _decode(path: Path, start: float, duration: float, *, audio: bool, crop: list[int] | None = None) -> bytes:
+def _decode(
+    path: Path | MediaFile, start: float, duration: float, *, audio: bool, crop: list[int] | None = None
+) -> bytes:
+    with ExitStack() as files:
+        source = path if isinstance(path, MediaFile) else files.enter_context(open_media_file(path))
+        return _decode_input(source, start, duration, audio=audio, crop=crop)
+
+
+def _decode_input(source: MediaFile, start: float, duration: float, *, audio: bool, crop: list[int] | None) -> bytes:
+    source.assert_current()
     command = [
         FFMPEG,
         "-v",
@@ -101,7 +111,7 @@ def _decode(path: Path, start: float, duration: float, *, audio: bool, crop: lis
         "-ss",
         str(start),
         "-i",
-        str(path),
+        f"/proc/self/fd/{source.descriptor}",
         "-t",
         str(duration),
     ]
@@ -110,8 +120,14 @@ def _decode(path: Path, start: float, duration: float, *, audio: bool, crop: lis
     else:
         filters = (["crop=" + ":".join(map(str, crop))] if crop else []) + ["fps=2", "scale=64:36", "format=gray"]
         command += ["-map", "0:v:0", "-an", "-vf", ",".join(filters), "-f", "rawvideo", "pipe:1"]
-    result = subprocess.run(command, capture_output=True, timeout=120)  # noqa: S603 -- fixed tool; no shell
-    if result.returncode:
+    result = subprocess.run(  # noqa: S603 -- fixed tool; locked descriptor, no shell
+        command,
+        capture_output=True,
+        timeout=120,
+        pass_fds=(source.descriptor,),
+    )
+    source.assert_current()
+    if result.returncode or result.stderr or not result.stdout:
         raise ValueError("reference or recording decode failed")
     return result.stdout
 
@@ -178,8 +194,12 @@ def audio_candidate(reference: bytes, recording: bytes) -> dict:
 
 def create_reference(source: Path, source_sha256: str, trace: dict, binding: dict, output: Path) -> dict:
     """Extract hash-checked, bounded references; never mount them into capture."""
-    os.umask(0o077)
-    if file_digest(source) != source_sha256:
+    with open_media_file(source) as locked:
+        return _create_reference(locked, source_sha256, trace, binding, output)
+
+
+def _create_reference(source: MediaFile, source_sha256: str, trace: dict, binding: dict, output: Path) -> dict:
+    if source.facts()[0] != source_sha256:
         raise ValueError("reference source hash mismatch")
     spec = validate_capture_windows(trace)
     if trace.get("binding") != binding:
@@ -190,18 +210,38 @@ def create_reference(source: Path, source_sha256: str, trace: dict, binding: dic
         start = max(0, window["expected_seconds"] - 5)
         length = min(window["duration_seconds"] + 10, spec.duration_seconds - start)
         clip = output / f"window-{index:03d}.mkv"
+        digest = _reference_clip(source, clip, start, length)
+        windows.append({"checkpoint": window, "reference_start_seconds": start, "file": clip.name, "sha256": digest})
+    if source.facts()[0] != source_sha256:
+        raise ValueError("reference source changed during extraction")
+    receipt = {
+        "method": "real-av-reference-v2",
+        "binding": binding,
+        "real_spec": spec.model_dump(mode="json"),
+        "source_sha256": source_sha256,
+        "source_size": os.fstat(source.descriptor).st_size,
+        "windows": windows,
+    }
+    save_private(output / "reference.json", receipt)
+    return receipt
+
+
+def _reference_clip(source: MediaFile, clip: Path, start: float, length: float) -> str:
+    source.assert_current()
+    with open_media_output(clip, must_create=True) as output:
         result = subprocess.run(  # noqa: S603 -- fixed tool; hash-checked private input
             [
                 FFMPEG,
                 "-v",
                 "error",
                 "-nostdin",
+                "-y",
                 "-threads",
                 "2",
                 "-ss",
                 str(start),
                 "-i",
-                str(source),
+                f"/proc/self/fd/{source.descriptor}",
                 "-t",
                 str(length),
                 "-map",
@@ -220,30 +260,53 @@ def create_reference(source: Path, source_sha256: str, trace: dict, binding: dic
                 "18",
                 "-c:a",
                 "pcm_s16le",
-                str(clip),
+                "-f",
+                "matroska",
+                f"/proc/self/fd/{output.descriptor}",
             ],
             capture_output=True,
             timeout=180,
+            pass_fds=(source.descriptor, output.descriptor),
         )  # noqa: S603 -- fixed tool; hash-checked private input
-        if result.returncode:
+        source.assert_current()
+        if result.returncode or result.stderr:
             raise ValueError("reference extraction failed")
-        windows.append(
-            {"checkpoint": window, "reference_start_seconds": start, "file": clip.name, "sha256": file_digest(clip)}
-        )
-    receipt = {
-        "method": "real-av-reference-v2",
-        "binding": binding,
-        "real_spec": spec.model_dump(mode="json"),
-        "source_sha256": source_sha256,
-        "source_size": source.stat().st_size,
-        "windows": windows,
-    }
-    save_private(output / "reference.json", receipt)
-    return receipt
+        digest, size = output.facts()
+        if size == 0:
+            raise ValueError("reference extraction produced no media")
+        return digest
 
 
 def analyze_capture(recording: Path, trace_path: Path, reference_path: Path) -> dict:
-    trace, reference = json.loads(trace_path.read_text()), json.loads(reference_path.read_text())
+    """Bind every sample to the same locked recording and evidence session."""
+    with ExitStack() as files:
+        locked = [files.enter_context(open_media_file(path)) for path in (recording, trace_path, reference_path)]
+        video, trace_file, reference_file = locked
+        versions = [file_version(os.fstat(item.descriptor)) for item in locked]
+        with trace_file.reader() as handle:
+            trace_raw = handle.read()
+        with reference_file.reader() as handle:
+            reference_raw = handle.read()
+        recording_sha = video.facts()[0]
+        trace, reference = json.loads(trace_raw), json.loads(reference_raw)
+        results = _analyze_capture(video, trace, reference, reference_path.parent)
+        digests = (recording_sha, hashlib.sha256(trace_raw).hexdigest(), hashlib.sha256(reference_raw).hexdigest())
+        for item, version, digest in zip(locked, versions, digests, strict=True):
+            item.assert_current()
+            if file_version(os.fstat(item.descriptor)) != version or item.facts()[0] != digest:
+                raise ValueError("analysis input changed during the session")
+        return {
+            "method": "real-av-analysis-v2",
+            "status": "REVIEW_REQUIRED",
+            "binding": trace["binding"],
+            "recording_sha256": recording_sha,
+            "trace_sha256": digests[1],
+            "reference_sha256": digests[2],
+            "checkpoints": results,
+        }
+
+
+def _analyze_capture(recording: MediaFile, trace: dict, reference: dict, root: Path) -> list[dict]:
     spec = validate_capture_windows(trace)
     if trace.get("binding") != reference.get("binding") or spec != RealAVSpec.model_validate(reference["real_spec"]):
         raise ValueError("recording/reference identity mismatch")
@@ -251,38 +314,38 @@ def analyze_capture(recording: Path, trace_path: Path, reference_path: Path) -> 
         raise ValueError("reference sampling set changed")
     results = []
     for window in reference["windows"]:
-        checkpoint = window["checkpoint"]
-        clip = reference_path.parent / window["file"]
-        if clip.parent.resolve() != reference_path.parent.resolve() or file_digest(clip) != window["sha256"]:
+        clip = root / window["file"]
+        if clip.parent.resolve() != root.resolve():
             raise ValueError("reference clip changed")
-        length = checkpoint["duration_seconds"]
-        got = _decode(recording, checkpoint["recording_seconds"], length, audio=False, crop=checkpoint["crop"])
-        ref = _decode(clip, 0, length + 10, audio=False)
-        match = candidate_match(ref, got, window["reference_start_seconds"])
-        content_offset = match["candidate_content_seconds"] - window["reference_start_seconds"]
-        reference_audio = _decode(clip, content_offset, length, audio=True)
-        recorded_audio = _decode(recording, checkpoint["recording_seconds"], length, audio=True)
-        ref_energy, got_energy = _energy(reference_audio), _energy(recorded_audio)
-        # Preserve audio evidence even when naturally silent. Energy is only a
-        # diagnostic; listening and content matching are mandatory human work.
-        results.append(
-            {
-                **checkpoint,
-                **match,
-                "reference_pcm_sha256": hashlib.sha256(reference_audio).hexdigest(),
-                "recording_pcm_sha256": hashlib.sha256(recorded_audio).hexdigest(),
-                "reference_rms_peak": max(ref_energy, default=0),
-                "recording_rms_peak": max(got_energy, default=0),
-                "source_silent_candidate": max(ref_energy, default=0) < 5,
-                **audio_candidate(reference_audio, recorded_audio),
-            }
-        )
+        with open_media_file(clip) as source:
+            if source.facts()[0] != window["sha256"]:
+                raise ValueError("reference clip changed")
+            result = _analyze_window(recording, source, window)
+            if source.facts()[0] != window["sha256"]:
+                raise ValueError("reference clip changed during analysis")
+            results.append(result)
+    return results
+
+
+def _analyze_window(recording: MediaFile, clip: MediaFile, window: dict) -> dict:
+    checkpoint = window["checkpoint"]
+    length = checkpoint["duration_seconds"]
+    got = _decode(recording, checkpoint["recording_seconds"], length, audio=False, crop=checkpoint["crop"])
+    ref = _decode(clip, 0, length + 10, audio=False)
+    match = candidate_match(ref, got, window["reference_start_seconds"])
+    content_offset = match["candidate_content_seconds"] - window["reference_start_seconds"]
+    reference_audio = _decode(clip, content_offset, length, audio=True)
+    recorded_audio = _decode(recording, checkpoint["recording_seconds"], length, audio=True)
+    ref_energy, got_energy = _energy(reference_audio), _energy(recorded_audio)
+    # Preserve diagnostics for naturally silent samples; human listening and
+    # content matching remain mandatory even for an identifiable candidate.
     return {
-        "method": "real-av-analysis-v2",
-        "status": "REVIEW_REQUIRED",
-        "binding": trace["binding"],
-        "recording_sha256": file_digest(recording),
-        "trace_sha256": file_digest(trace_path),
-        "reference_sha256": file_digest(reference_path),
-        "checkpoints": results,
+        **checkpoint,
+        **match,
+        "reference_pcm_sha256": hashlib.sha256(reference_audio).hexdigest(),
+        "recording_pcm_sha256": hashlib.sha256(recorded_audio).hexdigest(),
+        "reference_rms_peak": max(ref_energy, default=0),
+        "recording_rms_peak": max(got_energy, default=0),
+        "source_silent_candidate": max(ref_energy, default=0) < 5,
+        **audio_candidate(reference_audio, recorded_audio),
     }

@@ -17,7 +17,6 @@ else found at an item's name is refused, not deleted.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import re
 import secrets
@@ -28,6 +27,7 @@ from pathlib import Path
 
 from pixav.library_projection.artwork import ArtworkStore
 from pixav.library_projection.render import ProjectionFile, ProjectionSpec, item_name, projection_digest
+from pixav.shared.media_file import open_media_file
 
 LIBRARY = "library"
 VERSIONS = "versions"
@@ -60,18 +60,11 @@ def _write_file(path: Path, content: bytes) -> None:
 
 def _file_digest(path: Path) -> tuple[int, str] | None:
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
+        with open_media_file(path) as source:
+            digest, size = source.facts()
+            return size, digest
+    except (OSError, ValueError):
         return None
-    with os.fdopen(descriptor, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            return None
-        digest = hashlib.sha256()
-        size = 0
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-            size += len(chunk)
-    return size, digest.hexdigest()
 
 
 class ProjectionWriter:

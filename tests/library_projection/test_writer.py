@@ -12,6 +12,7 @@ from pixav.library_projection.metadata import EffectiveMetadata
 from pixav.library_projection.render import render_projection
 from pixav.library_projection.repository import ArtworkRecord
 from pixav.library_projection.writer import ForeignContentError, ProjectionWriter, publication_is_complete
+from pixav.shared.media_file import open_media_file
 
 VIDEO = uuid.UUID("99999999-9999-4999-8999-999999999999")
 PNG = b"\x89PNG\r\n\x1a\n" + b"synthetic poster"
@@ -181,3 +182,29 @@ def test_cleanup_rejects_posterless_projection_even_with_matching_digest(writer)
     projection = spec()
     version = writer.publish(projection, 1)
     assert not publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)
+
+
+def test_cleanup_publication_verification_does_not_change_file_metadata(tmp_path, store, writer):
+    projection = spec(artwork=[retained_poster(tmp_path, store)])
+    version = writer.publish(projection, 1)
+    paths = list((writer.versions / str(VIDEO) / version).iterdir())
+    for path in paths:
+        os.utime(path, ns=(1_000_000_000, path.stat().st_mtime_ns))
+
+    def metadata():
+        return [
+            (p.stat().st_ino, p.stat().st_size, p.stat().st_atime_ns, p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+            for p in paths
+        ]
+
+    before = metadata()
+    assert publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)
+    assert metadata() == before
+
+
+def test_cleanup_publication_verification_refuses_an_active_writer(tmp_path, store, writer):
+    projection = spec(artwork=[retained_poster(tmp_path, store)])
+    version = writer.publish(projection, 1)
+    poster = writer.versions / str(VIDEO) / version / "poster.png"
+    with open_media_file(poster, exclusive=True):
+        assert not publication_is_complete(writer.library.parent, VIDEO, version, projection.digest)

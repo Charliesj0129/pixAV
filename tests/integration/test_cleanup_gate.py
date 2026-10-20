@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -19,7 +20,7 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import pytest
 
@@ -740,7 +741,7 @@ async def reasons_for(db):
     return await db.fetchval("SELECT reasons FROM cleanup_audit ORDER BY created_at DESC LIMIT 1")
 
 
-async def private_approval_request(db, tmp_path, video, media):
+async def private_approval_request(db, tmp_path, video, media, *, runtime=RUNTIME):
     """Synthetic operator attestation only; no actual backup/restore operation."""
     tmp_path.chmod(0o700)
     with open_media_file(media) as source:
@@ -764,7 +765,7 @@ async def private_approval_request(db, tmp_path, video, media):
             "authorized_by": "fixture-operator",
             "reason": "Synthetic exception",
             "instruction": instruction,
-            "runtime": RUNTIME.model_dump(),
+            "runtime": runtime.model_dump(),
             "database_identifier": binding.database_identifier,
             "database_name": binding.database_name,
             "target_binding_sha256": target_binding_digest(binding),
@@ -778,7 +779,7 @@ async def private_approval_request(db, tmp_path, video, media):
         scope="isolated-acceptance",
         expected_count=1,
         target=binding,
-        runtime=RUNTIME,
+        runtime=runtime,
         recovery_receipt=receipt,
         approved_by="fixture-operator",
         reason="Synthetic exact-target approval",
@@ -830,6 +831,246 @@ async def test_receipt_authorizer_requires_exception_opt_in_and_all_other_live_g
         await service.authorize(approval, apply=True)
     assert await db.fetchval("SELECT count(*) FROM cleanup_authorizations") == 0
     assert media.exists()
+
+
+async def _operator_child(module, arguments, environment, private_values=()):
+    """Run the real entry point; never expose a child's unbounded output."""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        module,
+        *arguments,
+        cwd=Path.cwd(),
+        env=environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        output, errors = await asyncio.wait_for(process.communicate(), 90)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    if errors or len(output) > 4096 or any(value.encode() in output for value in private_values):
+        pytest.fail("operator child emitted unexpected or private output")
+    try:
+        value = json.loads(output)
+    except (ValueError, TypeError):
+        pytest.fail("operator child did not return bounded JSON")
+    if not isinstance(value, dict):
+        pytest.fail("operator child JSON must be an object")
+    return process.returncode, value
+
+
+async def _operator_domain_snapshot(db):
+    rows = []
+    for table in (
+        "videos",
+        "accounts",
+        "remote_assets",
+        "playable_assets",
+        "library_publications",
+        "cleanup_authorizations",
+        "cleanup_journal",
+        "cleanup_audit",
+    ):
+        rows.append(
+            await db.fetchval(
+                f"SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb) FROM {table} t"  # noqa: S608 -- fixed table names
+            )
+        )
+    return rows
+
+
+def _operator_file_metadata(root):
+    result = {}
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            info = path.stat()
+            result[str(path.relative_to(root))] = (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_atime_ns,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+    return result
+
+
+async def test_real_cleanup_cli_uses_live_instances_and_only_its_owned_pause(db, integration_redis, tmp_path):
+    """A subprocess, actual Docker CLI/SDK, PG, Redis and private files.
+
+    Domain media/restore attestations are synthetic; no provider or original
+    deployment is connected. Authorization registers consent and never unlinks.
+    """
+    import docker
+    from scripts.instance_guard import database_identity
+    from scripts.integration_guard import require_test_redis
+
+    assert await database_identity(db) == os.environ["PIXAV_TEST_DB_IDENTITY"]
+    assert (await db.fetchval("SELECT current_database()")).startswith("pixav_test_")
+    redis, pause_key = integration_redis
+    await require_test_redis(redis)
+    tmp_path.chmod(0o700)
+    client = docker.from_env(timeout=15)
+    try:
+        daemon = client.info()["ID"]
+    finally:
+        client.close()
+    context = (
+        subprocess.run(  # noqa: S603 -- fixed read-only local Docker query
+            [shutil.which("docker"), "context", "show"],
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    runtime = CleanupRuntimeBinding(
+        docker_context=context,
+        docker_daemon_id=daemon,
+        redis_run_id=str((await redis.info("server"))["run_id"]),
+    )
+    video, media = await artifact(db, tmp_path)
+    await publish(db, video)
+    await playback_verified(db, video)
+    for path in tmp_path.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            os.utime(path, ns=(1_000_000_000, path.stat().st_mtime_ns))
+    approval = await private_approval_request(db, tmp_path, video, media, runtime=runtime)
+
+    def private_file(name, content):
+        path = tmp_path / name
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(content)
+        return str(path)
+
+    request_path = private_file("request.json", approval.model_dump_json())
+    wrong_daemon = approval.model_copy(
+        update={"runtime": runtime.model_copy(update={"docker_daemon_id": "unrelated-synthetic-daemon"})}
+    )
+    wrong_daemon_path = private_file("wrong-daemon.json", wrong_daemon.model_dump_json())
+    other_run_id = "0" * 40 if runtime.redis_run_id != "0" * 40 else "1" * 40
+    wrong_redis = approval.model_copy(update={"runtime": runtime.model_copy(update={"redis_run_id": other_run_id})})
+    wrong_redis_path = private_file("wrong-redis.json", wrong_redis.model_dump_json())
+    wrong_database = approval.model_copy(
+        update={
+            "target": approval.target.model_copy(
+                update={"database_identifier": str(int(approval.target.database_identifier) ^ 1)}
+            )
+        }
+    )
+    wrong_database_path = private_file("wrong-database.json", wrong_database.model_dump_json())
+    token, wrong_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    token_path = private_file("owner-token", token)
+    wrong_path = private_file("wrong-token", wrong_token)
+    endpoint = urlsplit(os.environ["PIXAV_E2E_ADMIN_DSN"])
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(Path.cwd() / "src") + os.pathsep + str(Path.cwd()),
+        "PIXAV_DB_HOST": endpoint.hostname,
+        "PIXAV_DB_PORT": str(endpoint.port or 5432),
+        "PIXAV_DB_USER": unquote(endpoint.username),
+        "PIXAV_DB_PASSWORD": unquote(endpoint.password),
+        "PIXAV_DB_NAME": approval.target.database_name,
+        "PIXAV_EXPECTED_DB_IDENTITY": approval.target.database_identifier,
+        "PIXAV_EXPECTED_DB_NAME": approval.target.database_name,
+        "PIXAV_REDIS_URL": os.environ["PIXAV_E2E_REDIS_URL"],
+        "PIXAV_EXPECTED_REDIS_RUN_ID": runtime.redis_run_id,
+        "PIXAV_SYSTEM_PAUSE_KEY": pause_key,
+        "PIXAV_DOWNLOAD_DIR": str(tmp_path),
+        "PIXAV_LIBRARY_ROOT": str(tmp_path / "library"),
+    }
+    private_values = (token, wrong_token, unquote(endpoint.password))
+
+    async def cleanup(*arguments):
+        return await _operator_child("scripts.manage_cleanup", list(arguments), environment, private_values)
+
+    pause_arguments = ["--token-file", token_path]
+    paused = False
+    try:
+        code, report = await _operator_child(
+            "scripts.manage_cleanup",
+            ["files", "--request", request_path, "--allow-operator-exception"],
+            {**environment, "PIXAV_DB_PORT": "invalid-settings-must-not-be-loaded"},
+            private_values,
+        )
+        assert code == 0 and report == {
+            "result": "FILES_VERIFIED_ONLY",
+            "expected_count": 1,
+            "authorized_count": 0,
+            "recovery_mode": "operator-exception",
+            "runtime_checked": False,
+            "database_clock_checked": False,
+        }
+        code, report = await cleanup(
+            "authorize",
+            "--request",
+            request_path,
+            "--maintenance-token-file",
+            token_path,
+            "--allow-operator-exception",
+            "--apply",
+        )
+        assert code == 2 and report == {"result": "REFUSED", "code": "CLEANUP_OWNED_SYSTEM_PAUSE_REQUIRED"}
+        code, report = await _operator_child(
+            "scripts.manage_system_pause", ["pause", *pause_arguments], environment, private_values
+        )
+        assert code == 0 and report["paused"] and report["owned"]
+        paused = True
+        pause_before = await redis.get(pause_key)
+        database_before, files_before = await _operator_domain_snapshot(db), _operator_file_metadata(tmp_path)
+        base = ["authorize", "--request", request_path, "--maintenance-token-file", token_path]
+        code, report = await cleanup(*base)
+        assert code == 2 and report == {"result": "REFUSED", "code": "CLEANUP_OPERATOR_EXCEPTION_NOT_ALLOWED"}
+        code, report = await cleanup(
+            "authorize",
+            "--request",
+            request_path,
+            "--maintenance-token-file",
+            wrong_path,
+            "--allow-operator-exception",
+            "--apply",
+        )
+        assert code == 2 and report == {"result": "REFUSED", "code": "CLEANUP_OWNED_SYSTEM_PAUSE_REQUIRED"}
+        for transplanted, expected_code in (
+            (wrong_daemon_path, "CLEANUP_RUNTIME_BINDING_MISMATCH"),
+            (wrong_redis_path, "CLEANUP_AUTHORIZATION_UNCONFIRMED"),
+            (wrong_database_path, "CLEANUP_AUTHORIZATION_UNCONFIRMED"),
+        ):
+            code, report = await cleanup(
+                "authorize",
+                "--request",
+                transplanted,
+                "--maintenance-token-file",
+                token_path,
+                "--allow-operator-exception",
+                "--apply",
+            )
+            assert code == 2 and report == {"result": "REFUSED", "code": expected_code}
+        code, report = await cleanup(*base, "--allow-operator-exception")
+        assert code == 0 and report["result"] == "ELIGIBLE_FOR_AUTHORIZATION" and report["authorized_count"] == 0
+        assert await _operator_domain_snapshot(db) == database_before
+        assert _operator_file_metadata(tmp_path) == files_before
+        assert await redis.get(pause_key) == pause_before
+        code, report = await cleanup(*base, "--allow-operator-exception", "--apply")
+        assert code == 0 and report["result"] == "AUTHORIZED" and report["authorized_count"] == 1
+        code, report = await cleanup(*base, "--allow-operator-exception", "--apply")
+        assert code == 0 and report["result"] == "ALREADY_AUTHORIZED" and report["authorized_count"] == 0
+        assert await db.fetchval("SELECT count(*) FROM cleanup_authorizations") == 1
+        assert await db.fetchval("SELECT count(*) FROM cleanup_journal") == 0
+        assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 0
+        assert await redis.get(pause_key) == pause_before and media.exists()
+    finally:
+        if paused:
+            code, report = await _operator_child(
+                "scripts.manage_system_pause", ["resume", *pause_arguments], environment, private_values
+            )
+            assert code == 0 and report["owned_pause_released"]
 
 
 async def test_the_missing_producer_is_named_rather_than_assumed_bdd_005_131(db, tmp_path):
