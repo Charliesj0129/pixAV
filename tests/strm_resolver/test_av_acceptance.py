@@ -2,11 +2,13 @@
 
 import array
 import math
+import os
 import uuid
 from types import SimpleNamespace
 
 import pytest
 
+from pixav.shared.media_file import MediaFile, open_media_file
 from pixav.strm_resolver.av_acceptance import (
     FRAME_BYTES,
     RATE,
@@ -120,11 +122,16 @@ def test_recording_analysis_rejects_audiovisual_faults(tmp_path, monkeypatch, fa
     raw = b"".join(frames)
     pcm = pcm_tone(490 if fault == "wrong-tone" else 400, 0 if fault == "mute" else 0.25)
     recording = tmp_path / "client.mkv"
+    recording.write_bytes(b"synthetic recording input")
 
     def decode(command, **kwargs):
-        assert str(recording) in command
+        argument = command[command.index("-i") + 1]
+        assert argument.startswith("/proc/self/fd/")
+        descriptor = int(argument.rsplit("/", 1)[1])
+        assert descriptor in kwargs["pass_fds"]
+        assert os.fstat(descriptor).st_ino == recording.stat().st_ino
         assert kwargs["check"] is True
-        return SimpleNamespace(stdout=raw if "rawvideo" in command else pcm)
+        return SimpleNamespace(stdout=raw if "rawvideo" in command else pcm, stderr=b"")
 
     monkeypatch.setattr("pixav.strm_resolver.av_acceptance.subprocess.run", decode)
     window = {
@@ -172,7 +179,7 @@ def capture_bundle(tmp_path, monkeypatch):
     calls = []
 
     def recompute(recording, recipe, window):
-        assert recording == tmp_path / "client.mkv" and recipe == spec
+        assert isinstance(recording, MediaFile) and recording.path == tmp_path / "client.mkv" and recipe == spec
         calls.append(window["kind"])
         return {**window, "status": "PASS"}
 
@@ -247,6 +254,8 @@ def test_capture_pass_receipt_cannot_override_failed_recording_analysis(capture_
 @pytest.mark.parametrize("boundary", [4.0, 1.0, 8.0])
 def test_crossing_requires_continuous_recorded_picture_and_audio(tmp_path, monkeypatch, boundary):
     spec = SyntheticAVSpec(identity=uuid.uuid4(), duration_seconds=60)
+    recording = tmp_path / "client.mkv"
+    recording.write_bytes(b"synthetic recording input")
     frames = []
     for index in range(40):
         frame = bytearray(frame_at(2 + index / 10))
@@ -256,9 +265,9 @@ def test_crossing_requires_continuous_recorded_picture_and_audio(tmp_path, monke
 
     def decode(command, **kwargs):
         if "rawvideo" in command:
-            return SimpleNamespace(stdout=raw)
+            return SimpleNamespace(stdout=raw, stderr=b"")
         offset = float(command[command.index("-ss") + 1])
-        return SimpleNamespace(stdout=pcm_tone(spec.tone(2 + offset + 0.1)))
+        return SimpleNamespace(stdout=pcm_tone(spec.tone(2 + offset + 0.1)), stderr=b"")
 
     monkeypatch.setattr("pixav.strm_resolver.av_acceptance.subprocess.run", decode)
     window = {
@@ -281,3 +290,83 @@ def test_segment_manifest_requires_every_crossing(capture_bundle):
     directory, spec, binding, _, _, _, _, _, verify = capture_bundle
     with pytest.raises(ValueError, match="manifest segment crossings"):
         verify(directory, spec, binding, expected_junction_seconds=(30.0,))
+
+
+@pytest.mark.parametrize("fault", [None, "video-diagnostic", "audio-diagnostic", "video-replaced", "audio-replaced"])
+def test_synthetic_window_retains_locked_recording_descriptor_between_samples(tmp_path, monkeypatch, fault):
+    recording = tmp_path / "client.mkv"
+    recording.write_bytes(b"synthetic recording input")
+    spec = SyntheticAVSpec(identity=uuid.uuid4(), duration_seconds=60)
+    frames = []
+    for index in range(12):
+        frame = bytearray(frame_at(2 + index / 10))
+        frame[120 * WIDTH * 3 :] = bytes([index * 5]) * ((360 - 120) * WIDTH * 3)
+        frames.append(bytes(frame))
+    calls = []
+
+    def decode(command, **kwargs):
+        with pytest.raises(BlockingIOError), open_media_file(recording, exclusive=True):
+            pytest.fail("recording writer entered during a decoder sample")
+        argument = command[command.index("-i") + 1]
+        assert argument.startswith("/proc/self/fd/")
+        descriptor = int(argument.rsplit("/", 1)[1])
+        assert descriptor in kwargs["pass_fds"]
+        assert os.fstat(descriptor).st_ino == recording.stat().st_ino
+        kind = "video" if "rawvideo" in command else "audio"
+        calls.append(kind)
+        if fault == kind + "-replaced":
+            replacement = tmp_path / "replacement.mkv"
+            replacement.write_bytes(b"uncooperative replacement")
+            os.replace(replacement, recording)
+        return SimpleNamespace(
+            stdout=b"".join(frames) if kind == "video" else pcm_tone(400),
+            stderr=b"decode error" if fault == kind + "-diagnostic" else b"",
+        )
+
+    monkeypatch.setattr("pixav.strm_resolver.av_acceptance.subprocess.run", decode)
+    window = {"kind": "beginning", "recording_seconds": 0, "expected_seconds": 2, "crop": [640, 360, 0, 0]}
+    before = recording.stat()
+    if fault:
+        with pytest.raises(ValueError):
+            analyze_window(recording, spec, window)
+        assert calls == (["video"] if fault.startswith("video") else ["video", "audio"])
+    else:
+        assert analyze_window(recording, spec, window)["status"] == "PASS"
+        assert calls == ["video", "audio", "audio", "audio"]
+        assert recording.stat().st_atime_ns == before.st_atime_ns
+    with open_media_file(recording, exclusive=True):
+        pass
+
+
+def test_synthetic_verification_locks_the_entire_capture_session(capture_bundle, monkeypatch):
+    directory, spec, binding, _, _, _, _, _, verify = capture_bundle
+    checked = []
+
+    def analyze(recording, recipe, window):
+        for name in ("client.mkv", "result.json", "trace.json", "analysis.json"):
+            with pytest.raises(BlockingIOError), open_media_file(directory / name, exclusive=True):
+                pytest.fail("capture input released between validation and sampling")
+        assert isinstance(recording, MediaFile)
+        assert recording.path == directory / "client.mkv" and recipe == spec
+        checked.append(window["kind"])
+        return {**window, "status": "PASS"}
+
+    monkeypatch.setattr("pixav.strm_resolver.av_acceptance.analyze_window", analyze)
+    assert verify(directory, spec, binding)["status"] == "PASS"
+    assert checked == ["beginning", "middle", "seek", "resume", "end"]
+    for name in ("client.mkv", "result.json", "trace.json", "analysis.json"):
+        with open_media_file(directory / name, exclusive=True):
+            pass
+
+
+def test_synthetic_verification_refuses_inputs_changed_after_sampling(capture_bundle, monkeypatch):
+    directory, spec, binding, _, _, _, _, _, verify = capture_bundle
+
+    def changed(recording, recipe, window):
+        if window["kind"] == "end":
+            (directory / "trace.json").write_bytes(b"uncooperative writer ignored the lock")
+        return {**window, "status": "PASS"}
+
+    monkeypatch.setattr("pixav.strm_resolver.av_acceptance.analyze_window", changed)
+    with pytest.raises(ValueError, match="capture input changed"):
+        verify(directory, spec, binding)

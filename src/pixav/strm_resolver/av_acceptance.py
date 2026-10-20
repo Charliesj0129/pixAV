@@ -11,15 +11,17 @@ import array
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from pixav.shared.media_file import open_media_file
+from pixav.shared.media_file import MediaFile, file_version, open_media_file
 
 WIDTH, HEIGHT, RATE = 640, 360, 48000
 FRAME_BYTES = WIDTH * HEIGHT * 3
@@ -210,14 +212,26 @@ def validate_progress(times: list[float], expected_seconds: float, window_second
     return {"first_seconds": times[0], "last_seconds": times[-1], "frame_count": len(times)}
 
 
-def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict:
+def analyze_window(recording: Path | MediaFile, spec: SyntheticAVSpec, window: dict) -> dict:
     """Analyze only the actual captured picture/audio; DOM clocks cannot pass it."""
+    with ExitStack() as files:
+        source = recording if isinstance(recording, MediaFile) else files.enter_context(open_media_file(recording))
+        version = file_version(os.fstat(source.descriptor))
+        result = _analyze_window(source, spec, window)
+        source.assert_current()
+        if file_version(os.fstat(source.descriptor)) != version:
+            raise ValueError("recording changed during analysis")
+        return result
+
+
+def _analyze_window(recording: MediaFile, spec: SyntheticAVSpec, window: dict) -> dict:
     start, duration = float(window["recording_seconds"]), 4.0 if window["kind"] == "junction_crossing" else 1.2
     crop = window["crop"]
     if len(crop) != 4 or any(type(value) is not int or value < 0 for value in crop) or min(crop[:2]) < 1:
         raise ValueError("invalid recorded video geometry")
     width, height, x, y = crop
-    raw = subprocess.run(  # noqa: S603 -- validated geometry; no shell
+    recording.assert_current()
+    video = subprocess.run(  # noqa: S603 -- validated geometry; inherited locked input, no shell
         [
             FFMPEG,
             "-v",
@@ -226,7 +240,7 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
             "-ss",
             str(start),
             "-i",
-            str(recording),
+            f"/proc/self/fd/{recording.descriptor}",
             "-t",
             str(duration),
             "-vf",
@@ -240,7 +254,12 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
         capture_output=True,
         check=True,
         timeout=30,
-    ).stdout
+        pass_fds=(recording.descriptor,),
+    )
+    recording.assert_current()
+    if video.stderr:
+        raise ValueError("recording video decode failed")
+    raw = video.stdout
     times = [
         decode_marker(raw[index : index + FRAME_BYTES], marker_row=spec.marker_row)
         for index in range(0, len(raw), FRAME_BYTES)
@@ -261,7 +280,8 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
         # Avoid a tone-change edge; analyze a shorter interval on its earlier side.
         if int(times[index] // 5) != int((times[index] + 0.2) // 5):
             continue
-        pcm = subprocess.run(  # noqa: S603 -- recording path and numeric seek; no shell
+        recording.assert_current()
+        audio = subprocess.run(  # noqa: S603 -- inherited locked input and numeric seek; no shell
             [
                 FFMPEG,
                 "-v",
@@ -270,7 +290,7 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
                 "-ss",
                 str(start + offset),
                 "-i",
-                str(recording),
+                f"/proc/self/fd/{recording.descriptor}",
                 "-t",
                 "0.2",
                 "-vn",
@@ -285,8 +305,12 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
             capture_output=True,
             check=True,
             timeout=30,
-        ).stdout
-        audio_checks.append(tone_measurement(pcm, spec.tone(source_time), tones))
+            pass_fds=(recording.descriptor,),
+        )
+        recording.assert_current()
+        if audio.stderr:
+            raise ValueError("recording audio decode failed")
+        audio_checks.append(tone_measurement(audio.stdout, spec.tone(source_time), tones))
     if len(audio_checks) < 2:
         raise ValueError("insufficient audio intervals away from tone changes")
     return {**window, **result, "audio_checks": audio_checks, "status": "PASS"}
@@ -295,6 +319,26 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
 def _artifact_sha256(path: Path) -> str:
     with open_media_file(path) as source:
         return source.facts()[0]
+
+
+def _read_capture_evidence(locked: dict[str, MediaFile]) -> tuple[dict[str, dict], dict[str, str]]:
+    payloads = {}
+    digests = {"client.mkv": locked["client.mkv"].facts()[0]}
+    for name in ("result.json", "trace.json", "analysis.json"):
+        with locked[name].reader() as handle:
+            raw = handle.read()
+        payloads[name] = json.loads(raw)
+        digests[name] = hashlib.sha256(raw).hexdigest()
+    return payloads, digests
+
+
+def _assert_capture_unchanged(
+    locked: dict[str, MediaFile], versions: dict[str, tuple[int, int, int, int, int]], digests: dict[str, str]
+) -> None:
+    for name, source in locked.items():
+        source.assert_current()
+        if file_version(os.fstat(source.descriptor)) != versions[name] or source.facts()[0] != digests[name]:
+            raise ValueError("capture input changed during verification")
 
 
 def verify_capture(
@@ -309,42 +353,45 @@ def verify_capture(
     paths = {name: directory / name for name in ("result.json", "trace.json", "analysis.json", "client.mkv")}
     if directory.is_symlink() or any(path.is_symlink() or not path.is_file() for path in paths.values()):
         raise ValueError("capture artifacts must be regular files")
-    receipt = json.loads(paths["result.json"].read_text())
-    trace = json.loads(paths["trace.json"].read_text())
-    analysis = json.loads(paths["analysis.json"].read_text())
-    if (
-        receipt.get("method") != "automated-jellyfin-av-v1"
-        or receipt.get("status") != "PASS"
-        or receipt.get("binding") != expected_binding
-        or not expected_binding
-        or receipt.get("synthetic_spec_sha256") != spec.sha256
-        or analysis.get("spec_sha256") != spec.sha256
-        or trace.get("fault_injection") is not None
-    ):
-        raise ValueError("capture identity or recipe does not match")
-    for filename, key in (
-        ("client.mkv", "recording_sha256"),
-        ("trace.json", "trace_sha256"),
-        ("analysis.json", "analysis_sha256"),
-    ):
-        if _artifact_sha256(paths[filename]) != receipt.get(key):
-            raise ValueError("capture artifact digest mismatch")
-    for key in ("item_id", "session_id", "device_id", "client_version", "server_version", "application_version"):
-        if not trace.get(key) or trace[key] != receipt.get(key):
-            raise ValueError("capture client identity mismatch")
-    windows = _validate_capture_windows(trace, spec)
-    crossings = [window for window in windows if window["kind"] == "junction_crossing"]
-    if tuple(window.get("boundary_seconds") for window in crossings) != expected_junction_seconds:
-        raise ValueError("required manifest segment crossings missing or mismatched")
-    if any(
-        window["expected_seconds"] != boundary - 3
-        for window, boundary in zip(crossings, expected_junction_seconds, strict=True)
-    ):
-        raise ValueError("segment crossing checkpoint starts at the wrong position")
-    recomputed = [analyze_window(paths["client.mkv"], spec, window) for window in windows]
-    if recomputed != analysis.get("checkpoints") or recomputed != receipt.get("checkpoints"):
-        raise ValueError("capture analysis does not reproduce")
-    return {"method": receipt["method"], "status": "PASS", "binding": expected_binding, "checkpoints": recomputed}
+    with ExitStack() as files:
+        locked = {name: files.enter_context(open_media_file(path)) for name, path in paths.items()}
+        versions = {name: file_version(os.fstat(source.descriptor)) for name, source in locked.items()}
+        payloads, digests = _read_capture_evidence(locked)
+        receipt, trace, analysis = (payloads[name] for name in ("result.json", "trace.json", "analysis.json"))
+        if (
+            receipt.get("method") != "automated-jellyfin-av-v1"
+            or receipt.get("status") != "PASS"
+            or receipt.get("binding") != expected_binding
+            or not expected_binding
+            or receipt.get("synthetic_spec_sha256") != spec.sha256
+            or analysis.get("spec_sha256") != spec.sha256
+            or trace.get("fault_injection") is not None
+        ):
+            raise ValueError("capture identity or recipe does not match")
+        for filename, key in (
+            ("client.mkv", "recording_sha256"),
+            ("trace.json", "trace_sha256"),
+            ("analysis.json", "analysis_sha256"),
+        ):
+            if digests[filename] != receipt.get(key):
+                raise ValueError("capture artifact digest mismatch")
+        for key in ("item_id", "session_id", "device_id", "client_version", "server_version", "application_version"):
+            if not trace.get(key) or trace[key] != receipt.get(key):
+                raise ValueError("capture client identity mismatch")
+        windows = _validate_capture_windows(trace, spec)
+        crossings = [window for window in windows if window["kind"] == "junction_crossing"]
+        if tuple(window.get("boundary_seconds") for window in crossings) != expected_junction_seconds:
+            raise ValueError("required manifest segment crossings missing or mismatched")
+        if any(
+            window["expected_seconds"] != boundary - 3
+            for window, boundary in zip(crossings, expected_junction_seconds, strict=True)
+        ):
+            raise ValueError("segment crossing checkpoint starts at the wrong position")
+        recomputed = [analyze_window(locked["client.mkv"], spec, window) for window in windows]
+        if recomputed != analysis.get("checkpoints") or recomputed != receipt.get("checkpoints"):
+            raise ValueError("capture analysis does not reproduce")
+        _assert_capture_unchanged(locked, versions, digests)
+        return {"method": receipt["method"], "status": "PASS", "binding": expected_binding, "checkpoints": recomputed}
 
 
 def _validate_capture_windows(trace: dict, spec: SyntheticAVSpec) -> list[dict]:
