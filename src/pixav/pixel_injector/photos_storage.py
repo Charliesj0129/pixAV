@@ -31,6 +31,7 @@ from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT, validate_account_cold_receipt
 from pixav.shared.exceptions import ReadbackUnavailableError, UploadError, VerificationError
 from pixav.shared.host_paths import host_path
+from pixav.shared.media_file import open_media_directory
 from pixav.shared.models import Account
 from pixav.shared.photos_ui_ownership import photos_ui_ownership
 from pixav.shared.photos_ui_session import current_photos_ui_lease
@@ -59,6 +60,54 @@ class ColdProcessError(VerificationError):
     def __init__(self, error_type: str) -> None:
         super().__init__(f"cold read-back failed: {error_type}")
         self.error_type = error_type
+
+
+class ColdChildRetirementError(ReadbackUnavailableError):
+    """The exact child may still be running; retain work and reconcile it."""
+
+    def __init__(self, child_container_id: str, *, reconciliation_recorded: bool = False) -> None:
+        super().__init__("UNKNOWN_DEPENDENCY")
+        self.child_container_id = child_container_id
+        self.reconciliation_recorded = reconciliation_recorded
+
+
+def _child_reconciliation_path(destination: Path) -> Path:
+    return destination.with_name(destination.name + ".cold-child-reconciliation.json")
+
+
+def _record_unconfirmed_child(destination: Path, child_container_id: str) -> bool:
+    """A private sibling survives task cancellation without entering cold inputs."""
+    try:
+        target = _child_reconciliation_path(destination)
+        with open_media_directory(target, exclusive=True) as parent:
+            descriptor = os.open(
+                target.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=parent.descriptor,
+            )
+            with os.fdopen(descriptor, "w") as handle:
+                json.dump(
+                    {
+                        "schema": "cold-child-reconciliation-v1",
+                        "child_container_id": child_container_id,
+                        "work_path_sha256": hashlib.sha256(str(destination).encode()).hexdigest(),
+                        "removal_confirmed": False,
+                        "daemon_identity_revalidation_required": True,
+                    },
+                    handle,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fsync(parent.descriptor)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _check_cold_cancelled(stopped: threading.Event | None) -> None:
+    if stopped is not None and stopped.is_set():
+        raise VerificationError("cold activity cancelled")
 
 
 class MaestroSegmentUploader:
@@ -264,6 +313,27 @@ class PhotosColdReadback:
                 await self._wait_cancelled_child(task)
                 raise
 
+    async def run_anonymous(self, manifest: dict, destination: Path, timeout_seconds: int | None = None) -> dict:
+        """Anonymous recovery also retires its exact child before cancellation returns."""
+        if self.requires_fresh_work or "authentication" in manifest:
+            raise VerificationError("authenticated cold recovery requires ownership")
+        stopped = threading.Event()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._run,
+                destination,
+                json.dumps(manifest).encode(),
+                timeout_seconds=timeout_seconds,
+                stopped=stopped,
+            )
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            stopped.set()
+            await self._wait_cancelled_child(task)
+            raise
+
     @staticmethod
     async def _wait_cancelled_child(task: asyncio.Task) -> None:
         while not task.done():
@@ -272,6 +342,14 @@ class PhotosColdReadback:
             except (asyncio.CancelledError, Exception):
                 if task.done():
                     break
+        try:
+            task.result()
+        except ColdChildRetirementError as error:
+            # Python task boundaries need not retain a CancelledError subclass
+            # or its attributes. The sibling record carries the child identity.
+            raise asyncio.CancelledError("COLD_CHILD_REQUIRES_RECONCILIATION") from error
+        except (asyncio.CancelledError, Exception):
+            return
 
     def _client(self) -> Any:
         if self._windows_runtime is not None:
@@ -310,7 +388,7 @@ class PhotosColdReadback:
                 manifest["segment"]["account_id"] = str(segment.account_id) if segment.account_id else None
                 receipt = await self.run_authenticated(manifest, destination, self._timeout_seconds)
             else:
-                receipt = await asyncio.to_thread(self._run, destination, json.dumps(manifest).encode())
+                receipt = await self.run_anonymous(manifest, destination)
         except ColdProcessError as exc:
             if exc.error_type in {"AccountSessionRequiredError", "AccountSessionMismatchError"}:
                 raise AccountSessionRequiredError("Photos session requires operator login") from None
@@ -367,23 +445,28 @@ class PhotosColdReadback:
         timeout_seconds: int | None = None,
         stopped: threading.Event | None = None,
     ) -> dict:
+        _check_cold_cancelled(stopped)
+        if os.path.lexists(_child_reconciliation_path(destination)):
+            raise ReadbackUnavailableError("UNKNOWN_DEPENDENCY")
         client = self._client()
         lease = current_photos_ui_lease()
+        _check_cold_cancelled(stopped)
         container = self._create_cold_child(client, destination, stopped, lease)
         try:
+            _check_cold_cancelled(stopped)
             self._assert_isolated(container)
             stream = container.attach_socket(params={"stdin": 1, "stream": 1})
             try:
                 stream._sock.sendall(payload)
                 stream._sock.shutdown(socket.SHUT_WR)
+                _check_cold_cancelled(stopped)
                 container.start()
                 if stopped is None:
                     status = container.wait(timeout=timeout_seconds or self._timeout_seconds)
                 else:
                     deadline = time.monotonic() + (timeout_seconds or self._timeout_seconds)
                     while True:
-                        if stopped.is_set():
-                            raise VerificationError("cold UI ownership lost")
+                        _check_cold_cancelled(stopped)
                         if time.monotonic() >= deadline:
                             raise TimeoutError("cold activity deadline expired")
                         container.reload()
@@ -395,7 +478,11 @@ class PhotosColdReadback:
                 stream.close()
             return self._receipt(container, status)
         finally:
-            container.remove(force=True)
+            try:
+                container.remove(force=True)
+            except Exception:
+                recorded = _record_unconfirmed_child(destination, container.id)
+                raise ColdChildRetirementError(container.id, reconciliation_recorded=recorded) from None
             if lease is not None:
                 lease.child_phase = "REMOVED"
 

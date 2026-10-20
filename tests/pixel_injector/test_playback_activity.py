@@ -7,12 +7,15 @@ is offered as input, what is recomputed, what is published -- runs for real.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import fcntl
 import hashlib
 import json
 import os
+import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -28,6 +31,91 @@ STREAMS = [
     {"kind": "video", "codec": "h264", "width": 1920, "height": 1080},
     {"kind": "audio", "codec": "aac", "width": 0, "height": 0},
 ]
+
+
+@pytest.mark.parametrize("phase", ["offer", "verify", "publish"])
+async def test_cancellation_drains_file_work_before_return_and_retains_evidence(tmp_path, monkeypatch, phase):
+    from pixav.pixel_injector import playback_activity
+    from pixav.shared.media_file import open_media_file
+
+    materializer = FakeMaterializer()
+    worker, playable, row = build(tmp_path, materializer)
+    verified_readback(tmp_path, row)
+    request = request_for(playable, "prepare")
+    work = worker.cache_root / ".work" / str(playable["id"]) / str(request.attempt_id)
+    started, released, finished = threading.Event(), threading.Event(), threading.Event()
+    function = {
+        "offer": playback_activity._link_verified_readback,
+        "verify": worker._verify_output,
+        "publish": worker._publish,
+    }[phase]
+
+    def held(*args, **kwargs):
+        marker = work / "active-file-worker"
+        marker.write_bytes(b"owned evidence while file work runs")
+        try:
+            with open_media_file(marker):
+                started.set()
+                assert released.wait(5)
+                return function(*args, **kwargs)
+        finally:
+            finished.set()
+
+    if phase == "offer":
+        monkeypatch.setattr(playback_activity, "_link_verified_readback", held)
+    else:
+        monkeypatch.setattr(worker, "_verify_output" if phase == "verify" else "_publish", held)
+    running = asyncio.create_task(worker.execute(request))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        running.cancel()
+        await asyncio.sleep(0.03)
+        assert not running.done(), "cancellation returned while the file worker still held its inode"
+        assert (work / "active-file-worker").exists()
+        running.cancel()
+        await asyncio.sleep(0.03)
+        assert not running.done(), "a second cancellation bypassed the drain"
+    finally:
+        released.set()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(running, 5)
+        assert await asyncio.to_thread(finished.wait, 2)
+    assert running.cancelled()
+    assert (work / "active-file-worker").read_bytes() == b"owned evidence while file work runs"
+    assert not cache_object_path(worker.cache_root, playable["id"]).exists()
+    if phase == "offer":
+        assert materializer.seen_cloud == []
+
+
+async def test_cancellation_after_atomic_publication_retains_reconciliation_inputs(tmp_path, monkeypatch):
+    worker, playable, _ = build(tmp_path, FakeMaterializer())
+    request = request_for(playable, "prepare")
+    work = worker.cache_root / ".work" / str(playable["id"]) / str(request.attempt_id)
+    target = cache_object_path(worker.cache_root, playable["id"])
+    published, released = threading.Event(), threading.Event()
+    replace = os.replace
+
+    def held_commit(source, destination, **kwargs):
+        result = replace(source, destination, **kwargs)
+        if destination == target.name and "dst_dir_fd" in kwargs:
+            published.set()
+            assert released.wait(5)
+        return result
+
+    monkeypatch.setattr(os, "replace", held_commit)
+    running = asyncio.create_task(worker.execute(request))
+    try:
+        assert await asyncio.to_thread(published.wait, 2)
+        running.cancel()
+        await asyncio.sleep(0.03)
+        assert not running.done() and work.exists()
+    finally:
+        released.set()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(running, 5)
+    assert running.cancelled()
+    assert target.read_bytes() == CONTENT and (work / target.name).read_bytes() == CONTENT
+    assert worker.pool.playable["state"] == "PREPARING", "cache visibility cannot promote domain readiness"
 
 
 def test_publication_waits_for_a_reader_of_the_existing_object(tmp_path):
@@ -193,11 +281,11 @@ async def test_work_conflict_is_infrastructure_and_retains_the_work_directory(tm
     original = playback_activity._link_verified_readback
     retained = []
 
-    def conflict(segment, root, cloud):
+    def conflict(segment, root, cloud, **kwargs):
         foreign = cloud / segment.filename
         foreign.write_bytes(b"work requiring reconciliation")
         retained.append(foreign)
-        return original(segment, root, cloud)
+        return original(segment, root, cloud, **kwargs)
 
     monkeypatch.setattr(playback_activity, "_link_verified_readback", conflict)
     result = await worker.execute(request_for(playable, "prepare"))
@@ -206,6 +294,52 @@ async def test_work_conflict_is_infrastructure_and_retains_the_work_directory(tm
     assert result.error_code == "PLAYBACK_WORK_REQUIRES_RECONCILIATION"
     assert len(retained) == 1 and retained[0].read_bytes() == b"work requiring reconciliation"
     assert materializer.seen_cloud == []
+
+
+async def test_unconfirmed_child_retirement_retains_work_without_invalidating_media(tmp_path, monkeypatch):
+    from pixav.pixel_injector.photos_storage import ColdChildRetirementError
+
+    materializer = FakeMaterializer()
+    worker, playable, _ = build(tmp_path, materializer)
+    retained = []
+
+    async def unknown_child(manifest, work, *, timeout_seconds):
+        marker = work / "child-reconciliation-evidence"
+        marker.write_bytes(b"retain until exact child retirement is proven")
+        retained.append(marker)
+        raise ColdChildRetirementError("synthetic-child")
+
+    monkeypatch.setattr(materializer, "materialize", unknown_child)
+    result = await worker.execute(request_for(playable, "rebuild"))
+    assert result.outcome == "infrastructure"
+    assert result.error_code == "PLAYBACK_CHILD_REQUIRES_RECONCILIATION"
+    assert len(retained) == 1 and retained[0].exists()
+
+
+async def test_unconfirmed_retirement_does_not_swallow_worker_cancellation(tmp_path, monkeypatch):
+    materializer = FakeMaterializer()
+    worker, playable, _ = build(tmp_path, materializer)
+    started = asyncio.Event()
+    retained = []
+
+    async def unconfirmed(manifest, work, *, timeout_seconds):
+        marker = work / "unconfirmed-child"
+        marker.write_bytes(b"retain stopped-attempt evidence")
+        retained.append(marker)
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise asyncio.CancelledError("COLD_CHILD_REQUIRES_RECONCILIATION") from None
+
+    monkeypatch.setattr(materializer, "materialize", unconfirmed)
+    running = asyncio.create_task(worker.execute(request_for(playable, "prepare")))
+    await asyncio.wait_for(started.wait(), 2)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert running.cancelled()
+    assert len(retained) == 1 and retained[0].exists()
 
 
 def test_a_file_created_after_the_work_check_is_preserved(tmp_path, monkeypatch):

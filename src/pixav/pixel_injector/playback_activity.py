@@ -16,17 +16,24 @@ import json
 import logging
 import os
 import shutil
+import threading
 import uuid
+from collections.abc import Callable
 from contextlib import ExitStack, suppress
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import asyncpg
 from pydantic import ValidationError
 
 from pixav.media_loader.video_parts import contained_file, sha256
 from pixav.pixel_injector.photos_auth import AccountSessionRequiredError
-from pixav.pixel_injector.photos_storage import COLD_MOUNTS, ColdProcessError, PhotosColdReadback
+from pixav.pixel_injector.photos_storage import (
+    COLD_MOUNTS,
+    ColdChildRetirementError,
+    ColdProcessError,
+    PhotosColdReadback,
+)
 from pixav.shared.activity_context import activity_context
 from pixav.shared.media_file import file_version, open_media_directory, open_media_file, open_media_output
 from pixav.shared.playable_assets import playable_from_row
@@ -67,8 +74,7 @@ class PhotosPlaybackMaterializer(PhotosColdReadback):
         if self.requires_fresh_work:
             receipt = await self.run_authenticated(manifest, work, timeout_seconds)
         else:
-            payload = json.dumps(manifest).encode()
-            receipt = await asyncio.to_thread(self._run, work, payload, timeout_seconds=timeout_seconds)
+            receipt = await self.run_anonymous(manifest, work, timeout_seconds)
         return {**receipt, "cold_mounts": list(COLD_MOUNTS)}
 
 
@@ -84,6 +90,40 @@ class PlaybackWorkConflictError(Exception):
     """Retain changed, foreign or busy work; it is not a remote media verdict."""
 
 
+class _FileWorkCancelledError(Exception):
+    """Stop between file steps; the cancelled caller retains its workspace."""
+
+
+def _check_file_work(stopped: threading.Event | None) -> None:
+    if stopped is not None and stopped.is_set():
+        raise _FileWorkCancelledError("PLAYBACK_FILE_WORK_CANCELLED")
+
+
+async def _file_work(function: Callable[..., Any], *args: Any) -> Any:
+    """Keep cancellation from abandoning a thread that owns media descriptors."""
+    stopped = threading.Event()
+    task = asyncio.create_task(asyncio.to_thread(function, *args, stopped=stopped))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stopped.set()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                if task.done():
+                    break
+        # Retrieve a completed failure even if it raced the cancellation.
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+        raise
+
+
+def _clear_work(work: Path, *, stopped: threading.Event | None = None) -> None:
+    _check_file_work(stopped)
+    shutil.rmtree(work, True)
+
+
 def _redacted(segment: RemoteAssetSegment, *, account_bound: bool = False) -> dict:
     """What the isolated process may know: the provider location and the facts."""
     clean = segment.model_copy(
@@ -97,7 +137,9 @@ def _redacted(segment: RemoteAssetSegment, *, account_bound: bool = False) -> di
     return json.loads(clean.model_dump_json())
 
 
-def _link_verified_readback(segment: RemoteAssetSegment, readback_root: Path, cloud: Path) -> bool:
+def _link_verified_readback(
+    segment: RemoteAssetSegment, readback_root: Path, cloud: Path, *, stopped: threading.Event | None = None
+) -> bool:
     """Offer the storage read-back's copy of a segment, only if it still proves itself.
 
     The file must sit beside its original cold receipt, be a regular file inside
@@ -107,6 +149,7 @@ def _link_verified_readback(segment: RemoteAssetSegment, readback_root: Path, cl
     supported. Separate Docker mounts may prohibit hard links; then a private
     copy is hashed again before it is offered. Rebuild never calls this helper.
     """
+    _check_file_work(stopped)
     folder = readback_root / str(segment.asset_id) / str(segment.segment_index)
     # Inspect only this segment's immediate, bounded session directories. Do
     # not follow a symlink or search staging for a similarly named original.
@@ -122,12 +165,15 @@ def _link_verified_readback(segment: RemoteAssetSegment, readback_root: Path, cl
     except OSError:
         return False
     for candidate in sorted(folders, key=lambda p: p.name, reverse=True):
-        if _offer_readback(segment, readback_root, candidate, cloud):
+        if _offer_readback(segment, readback_root, candidate, cloud, stopped=stopped):
             return True
     return False
 
 
-def _offer_file(original: Path, destination: Path, created: dict[Path, tuple[int, ...]]) -> None:
+def _offer_file(
+    original: Path, destination: Path, created: dict[Path, tuple[int, ...]], *, stopped: threading.Event | None = None
+) -> None:
+    _check_file_work(stopped)
     with open_media_file(original) as source:
         try:
             os.link(original, destination)
@@ -139,11 +185,13 @@ def _offer_file(original: Path, destination: Path, created: dict[Path, tuple[int
                 try:
                     with source.reader() as reader, os.fdopen(os.dup(output.descriptor), "wb") as writer:
                         shutil.copyfileobj(reader, writer)
+                        _check_file_work(stopped)
                         writer.flush()
                         os.fsync(output.descriptor)
                 finally:
                     created[destination] = file_version(os.fstat(output.descriptor))
         source.assert_current()
+        _check_file_work(stopped)
 
 
 def _discard_offered(created: dict[Path, tuple[int, ...]]) -> None:
@@ -158,7 +206,10 @@ def _discard_offered(created: dict[Path, tuple[int, ...]]) -> None:
         raise PlaybackWorkConflictError("PLAYBACK_WORK_REQUIRES_RECONCILIATION") from exc
 
 
-def _offer_readback(segment: RemoteAssetSegment, root: Path, folder: Path, cloud: Path) -> bool:
+def _offer_readback(
+    segment: RemoteAssetSegment, root: Path, folder: Path, cloud: Path, *, stopped: threading.Event | None = None
+) -> bool:
+    _check_file_work(stopped)
     source, receipt = folder / segment.filename, folder / (segment.filename + ".json")
     if any(os.path.lexists(cloud / path.name) for path in (source, receipt)):
         raise PlaybackWorkConflictError("PLAYBACK_WORK_REQUIRES_RECONCILIATION")
@@ -176,13 +227,14 @@ def _offer_readback(segment: RemoteAssetSegment, root: Path, folder: Path, cloud
         ):
             return False
         for original in (source, receipt):
-            _offer_file(original, cloud / original.name, created)
+            _offer_file(original, cloud / original.name, created, stopped=stopped)
         if (cloud / segment.filename).stat().st_size != segment.size_bytes or sha256(
             cloud / segment.filename
         ) != segment.sha256:
             raise ValueError("read-back changed while it was offered")
         if json.loads((cloud / receipt.name).read_text()) != report:
             raise ValueError("read-back receipt changed while it was offered")
+        _check_file_work(stopped)
     except FileExistsError as exc:
         raise PlaybackWorkConflictError("PLAYBACK_WORK_REQUIRES_RECONCILIATION") from exc
     except (OSError, ValueError, UnicodeError):
@@ -219,6 +271,10 @@ class PlaybackActivityWorker:
             return ActivityResult(**fields, outcome="success", evidence=evidence)
         except PlaybackRefusedError as refused:
             return ActivityResult(**fields, outcome="verification_failed", error_code=refused.code)
+        except ColdChildRetirementError:
+            return ActivityResult(
+                **fields, outcome="infrastructure", error_code="PLAYBACK_CHILD_REQUIRES_RECONCILIATION"
+            )
         except PlaybackWorkConflictError:
             return ActivityResult(
                 **fields, outcome="infrastructure", error_code="PLAYBACK_WORK_REQUIRES_RECONCILIATION"
@@ -254,17 +310,18 @@ class PlaybackActivityWorker:
         work.mkdir(parents=True, exist_ok=False, mode=0o700)
         try:
             receipt, inputs = await self._run(request, playable, expected, segments, work)
-            output = await asyncio.to_thread(self._verify_output, work, playable, receipt)
-            await asyncio.to_thread(
+            output = await _file_work(self._verify_output, work, playable, receipt)
+            await _file_work(
                 self._publish, output, playable.id, request.attempt_id, (receipt["sha256"], int(receipt["size"]))
             )
-        except (PlaybackRefusedError, PlaybackWorkConflictError):
-            # Integrity failures and work ownership conflicts retain their evidence.
+        except (asyncio.CancelledError, ColdChildRetirementError, PlaybackRefusedError, PlaybackWorkConflictError):
+            # Cancelled file work has drained; retain its evidence, including a
+            # publication that might have crossed the atomic commit boundary.
             raise
         except BaseException:
-            await asyncio.to_thread(shutil.rmtree, work, True)
+            await _file_work(_clear_work, work)
             raise
-        await asyncio.to_thread(shutil.rmtree, work, True)
+        await _file_work(_clear_work, work)
         return {**receipt, "inputs": inputs}
 
     async def _run(self, request, playable, expected, segments, work) -> tuple[dict, PlaybackInputs]:
@@ -273,7 +330,7 @@ class PlaybackActivityWorker:
         offered = 0
         if request.purpose == "prepare" and not getattr(self.materializer, "requires_fresh_work", False):
             for segment in segments:
-                offered += await asyncio.to_thread(_link_verified_readback, segment, self.readback_root, cloud)
+                offered += await _file_work(_link_verified_readback, segment, self.readback_root, cloud)
         inputs: PlaybackInputs = (
             "verified-readback" if offered == len(segments) else "photos" if offered == 0 else "mixed"
         )
@@ -310,17 +367,28 @@ class PlaybackActivityWorker:
         return receipt, inputs
 
     @staticmethod
-    def _verify_output(work: Path, playable: PlayableAsset, receipt: dict) -> Path:
+    def _verify_output(
+        work: Path, playable: PlayableAsset, receipt: dict, *, stopped: threading.Event | None = None
+    ) -> Path:
         """Recompute the object's identity here rather than trusting the child."""
+        _check_file_work(stopped)
         output = contained_file(work, work / cache_object_name(playable.id))
         if output.stat().st_size != receipt["size"] or sha256(output) != receipt["sha256"]:
             raise PlaybackRefusedError("PLAYBACK_INTEGRITY_MISMATCH")
+        _check_file_work(stopped)
         return output
 
     def _publish(
-        self, output: Path, playable_id: uuid.UUID, attempt_id: uuid.UUID, expected: tuple[str, int] | None = None
+        self,
+        output: Path,
+        playable_id: uuid.UUID,
+        attempt_id: uuid.UUID,
+        expected: tuple[str, int] | None = None,
+        *,
+        stopped: threading.Event | None = None,
     ) -> None:
         """Publish verified bytes while coordinating existing readers and eviction."""
+        _check_file_work(stopped)
         objects = self.cache_root / CACHE_OBJECTS
         objects.mkdir(parents=True, exist_ok=True, mode=0o700)
         if objects.is_symlink():
@@ -330,6 +398,7 @@ class PlaybackActivityWorker:
         with open_media_file(output) as source:
             if expected is not None and source.facts() != expected:
                 raise PlaybackRefusedError("PLAYBACK_INTEGRITY_MISMATCH")
+            _check_file_work(stopped)
             with open_media_directory(target, exclusive=True) as directory, ExitStack() as guards:
                 source_info = os.fstat(source.descriptor)
                 try:
@@ -356,6 +425,7 @@ class PlaybackActivityWorker:
                         raise PlaybackRefusedError("PLAYBACK_INTEGRITY_MISMATCH")
                     os.utime(staged.name, dir_fd=directory.descriptor, follow_symlinks=False)
                     directory.assert_current()
+                    _check_file_work(stopped)
                     os.replace(
                         staged.name, target.name, src_dir_fd=directory.descriptor, dst_dir_fd=directory.descriptor
                     )

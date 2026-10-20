@@ -7,8 +7,11 @@ produced it could not have opened the staging file.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -17,7 +20,7 @@ from pixav.pixel_injector.photos_storage import (
     COLD_WORK_MOUNT,
     PhotosColdReadback,
 )
-from pixav.shared.exceptions import VerificationError
+from pixav.shared.exceptions import ReadbackUnavailableError, VerificationError
 from pixav.shared.storage_models import RemoteAssetSegment
 
 ASSET = uuid.UUID("55555555-5555-4555-8555-555555555555")
@@ -25,6 +28,47 @@ DIGEST = "b" * 64
 SHARE_URL = "https://photos.app.goo.gl/managedcanary"
 IMAGE = "pixav-storage-tools:1"
 RECEIPT = {"method": "photos-original-browser", "size": 128_743_122, "sha256": DIGEST}
+
+
+@pytest.mark.parametrize("entry", ["readback", "playback"])
+async def test_anonymous_cancellation_waits_for_child_retirement(tmp_path, monkeypatch, entry):
+    from pixav.pixel_injector.playback_activity import PhotosPlaybackMaterializer
+
+    started, released, retired, stop_seen = (threading.Event() for _ in range(4))
+    if entry == "readback":
+        subject = PhotosColdReadback(tmp_path, image="synthetic")
+        operation = subject.read_back(segment())
+    else:
+        subject = PhotosPlaybackMaterializer(tmp_path, image="synthetic")
+        operation = subject.materialize({"segments": []}, tmp_path, timeout_seconds=10)
+
+    def run(destination, payload, *, timeout_seconds=None, stopped=None):
+        started.set()
+        try:
+            if stopped is not None:
+                assert stopped.wait(5)
+                stop_seen.set()
+            assert released.wait(5)
+            raise RuntimeError("synthetic child retired")
+        finally:
+            retired.set()
+
+    monkeypatch.setattr(subject, "_run", run)
+    running = asyncio.create_task(operation)
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        running.cancel()
+        await asyncio.sleep(0.03)
+        assert not running.done(), "an isolated child was abandoned on cancellation"
+        running.cancel()
+        await asyncio.sleep(0.03)
+        assert not running.done(), "repeated cancellation bypassed child retirement"
+    finally:
+        released.set()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(running, 5)
+        assert await asyncio.to_thread(retired.wait, 2)
+    assert running.cancelled() and stop_seen.is_set()
 
 
 def segment(**overrides) -> RemoteAssetSegment:
@@ -68,16 +112,18 @@ class FakeStream:
 class FakeContainer:
     def __init__(self, spec: dict, *, output: bytes, exit_code: int = 0) -> None:
         self.spec = spec
+        self.id = "synthetic-cold-child"
         self.stream = FakeStream()
         self.started = False
         self.removed = False
         self._output = output
         self._exit_code = exit_code
         self.attrs = {
+            "State": {"Status": "created", "ExitCode": 0},
             "Mounts": [
                 {"Destination": destination["bind"], "RW": destination["mode"] == "rw", "Type": "bind"}
                 for destination in spec["volumes"].values()
-            ]
+            ],
         }
 
     def reload(self) -> None:
@@ -90,6 +136,7 @@ class FakeContainer:
     def start(self) -> None:
         assert self.stream._sock.shutdown_called, "stdin must be closed before the process runs"
         self.started = True
+        self.attrs["State"] = {"Status": "exited", "ExitCode": self._exit_code}
 
     def wait(self, timeout=None):
         return {"StatusCode": self._exit_code}
@@ -114,6 +161,108 @@ class FakeClient:
         return container
 
 
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_failed_child_removal_is_not_successful_retirement(tmp_path, monkeypatch, cancelled):
+    client = FakeClient()
+    started = threading.Event()
+    create = client.create
+
+    def create_with_failed_removal(*args, **kwargs):
+        container = create(*args, **kwargs)
+
+        def remove(*args, **kwargs):
+            raise OSError("synthetic removal unavailable")
+
+        if cancelled:
+
+            def start():
+                container.started = True
+                container.attrs["State"] = {"Status": "running", "ExitCode": 0}
+                started.set()
+
+            container.start = start
+        container.remove = remove
+        return container
+
+    monkeypatch.setattr(client, "create", create_with_failed_removal)
+    subject = readback(tmp_path, client)
+    running = asyncio.create_task(subject.run_anonymous({}, tmp_path, 5))
+    if cancelled:
+        assert await asyncio.to_thread(started.wait, 2)
+        running.cancel()
+    expected = asyncio.CancelledError if cancelled else ReadbackUnavailableError
+    with pytest.raises(expected):
+        await asyncio.wait_for(running, 5)
+    assert running.cancelled() == cancelled
+    journal = tmp_path.with_name(tmp_path.name + ".cold-child-reconciliation.json")
+    record = json.loads(journal.read_text())
+    assert record["child_container_id"] == "synthetic-cold-child" and record["removal_confirmed"] is False
+    assert record["daemon_identity_revalidation_required"] is True
+    assert journal.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(ReadbackUnavailableError):
+        await subject.run_anonymous({}, tmp_path, 5)
+    assert len(client.created) == 1 and not client.created[0].removed
+
+
+def test_child_reconciliation_record_is_private_and_never_overwritten(tmp_path):
+    from pixav.pixel_injector.photos_storage import _record_unconfirmed_child
+
+    work = tmp_path / "session"
+    work.mkdir()
+    assert _record_unconfirmed_child(work, "first-synthetic-child")
+    journal = tmp_path / "session.cold-child-reconciliation.json"
+    before = journal.read_bytes()
+    assert not _record_unconfirmed_child(work, "replacement-child")
+    assert journal.read_bytes() == before and journal.stat().st_mode & 0o777 == 0o600
+    assert list(work.iterdir()) == [], "the record must not enter the cold-input mount"
+
+
+def test_failed_reconciliation_record_does_not_mask_unconfirmed_retirement(tmp_path, monkeypatch):
+    from pixav.pixel_injector import photos_storage
+
+    def changed_parent(*args, **kwargs):
+        raise ValueError("synthetic directory identity change")
+
+    monkeypatch.setattr(photos_storage, "open_media_directory", changed_parent)
+    assert not photos_storage._record_unconfirmed_child(tmp_path / "session", "synthetic-child")
+
+
+@pytest.mark.parametrize("during_create", [False, True])
+def test_stopped_cold_run_never_starts_a_new_child(tmp_path, monkeypatch, during_create):
+    client = FakeClient()
+    subject = readback(tmp_path, client)
+    stopped = threading.Event()
+    if during_create:
+        create = client.create
+
+        def stop_after_create(*args, **kwargs):
+            container = create(*args, **kwargs)
+            stopped.set()
+            return container
+
+        monkeypatch.setattr(client, "create", stop_after_create)
+    else:
+        stopped.set()
+
+    with pytest.raises(VerificationError):
+        subject._run(tmp_path, b"{}", stopped=stopped)
+
+    assert all(not child.started and child.removed for child in client.created)
+    assert len(client.created) == int(during_create)
+
+
+@pytest.mark.parametrize("secret,manifest", [("configured-private-reference", {}), ("", {"authentication": {}})])
+async def test_anonymous_entry_cannot_bypass_authenticated_ownership(tmp_path, monkeypatch, secret, manifest):
+    subject = PhotosColdReadback(tmp_path, image="synthetic", authentication_secret=secret)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("authenticated payload reached the anonymous child")
+
+    monkeypatch.setattr(subject, "_run", forbidden)
+    with pytest.raises(VerificationError, match="ownership"):
+        await subject.run_anonymous(manifest, tmp_path)
+
+
 def readback(tmp_path, client, **changes) -> PhotosColdReadback:
     return PhotosColdReadback(
         tmp_path / "readback",
@@ -130,6 +279,7 @@ async def test_the_container_uses_image_code_and_mounts_only_the_work_dir_bdd_05
 
     spec = client.created[0].spec
     assert spec["image"] == IMAGE
+    assert spec["mem_limit"] == "4g" and spec["nano_cpus"] == 2_000_000_000
     assert spec["command"] == ["python", "-m", "pixav.pixel_injector.segment_readback"]
     work = next(source for source, mount in spec["volumes"].items() if mount["bind"] == COLD_WORK_MOUNT)
     assert Path(work).parent == tmp_path / "readback" / str(ASSET) / "3"
