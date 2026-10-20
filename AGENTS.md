@@ -42,6 +42,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - 026 expand migration 的收據核准由私有 `manage_cleanup files / authorize` 入口登錄，預設 dry-run，兩者不刪媒體；只有具權限操作者提供的 restore attestation 或明確 opt-in 的隔離例外可成為核准，不把檔案 hash 當實際還原證明。intent／audit 保留核准與收據摘要，缺歷史同意的 intent 不自動 recovery；新版整合驗證及完整 apply 入口通過前維持 cleanup 關閉，不新增備份工作。
 - playback work 失敗清理只處理該次建立、身分未變且無 reader 的精確檔案；既存或被替換的 work 保留待 reconciliation，視為基礎設施／ownership 問題，不污染遠端完整性判定。
 - segment presentation 的 copy／link／release 使用共同 descriptor 鎖，既有 pending 或 foreign target 不覆寫；原件缺失或仍有 reader 時不得移除 staged 副本。檔案 thread 取消須 drain，未發布或已越過發布的檔案留待 reconciliation，不能把本機衝突當遠端完整性失敗。
+- ZIP／original copy 的 partial 清理也須綁定該次持鎖 inode 與 parent；被替換的 partial、既存工作或發布衝突保留，child 的 `OriginalWorkConflictError` 不得觸發整個 playback work 清除或遠端失效。驗收 hash 的單次 shared lock 不代表離線解碼或 ADB 全程已受保護。
 - 取消檔案 thread 或 cold child 時須先收斂已開始的工作，重複取消不得略過等待。child 移除未確認須保留 work 並回報 reconciliation，不視為已停止或完整性失敗；已越過 cache rename 的結果不能推進取消 attempt 的 domain 狀態。
 - 未確認 child 的 sibling 記錄從建立起 0600，不進 cold-input mount、不覆寫既存記錄；pending 記錄阻擋同一 work 再建 child。取消須持續傳遞，不能因保全錯誤轉成一般結果；後續依記錄重新核對 daemon／exact child／實際 bind，不以記錄本身當停止證明。
 - 磁碟餘額須同時核對 WSL／Docker VHD 所在實體分區；虛擬檔案系統餘額不代替實體容量。Docker 資料磁碟搬移須先完整盤點、獨立備份還原與容量守衛，再取得明確搬移授權；停止的其他專案不得隨 daemon 恢復而自動啟動。

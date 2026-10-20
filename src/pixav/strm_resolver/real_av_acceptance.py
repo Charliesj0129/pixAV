@@ -17,6 +17,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pixav.shared.backup_files import create_backup_file
+from pixav.shared.media_file import open_media_file
 
 FFMPEG = "/usr/bin/ffmpeg"
 FRAME_BYTES = 64 * 36
@@ -46,11 +47,8 @@ class RealAVSpec(BaseModel):
 
 
 def file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with open_media_file(path) as source:
+        return source.facts()[0]
 
 
 def validate_capture_windows(trace: dict) -> RealAVSpec:

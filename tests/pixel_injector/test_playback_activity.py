@@ -552,6 +552,21 @@ async def test_infrastructure_failure_releases_the_work_directory(tmp_path):
     assert not (tmp_path / "cache" / ".work" / str(playable["id"]) / str(request.attempt_id)).exists()
 
 
+async def test_cold_original_work_conflict_retains_files_and_does_not_invalidate_remote(tmp_path):
+    class Conflict(FakeMaterializer):
+        async def materialize(self, manifest, work, *, timeout_seconds):
+            (work / "retained-original.part").write_bytes(b"foreign or unfinished work")
+            return await super().materialize(manifest, work, timeout_seconds=timeout_seconds)
+
+    worker, playable, _ = build(tmp_path, Conflict(error="OriginalWorkConflictError"))
+    request = request_for(playable, "prepare")
+    result = await worker.execute(request)
+    assert result.outcome == "infrastructure" and result.error_code == "PLAYBACK_WORK_REQUIRES_RECONCILIATION"
+    work = tmp_path / "cache" / ".work" / str(playable["id"]) / str(request.attempt_id)
+    assert (work / "retained-original.part").read_bytes() == b"foreign or unfinished work"
+    assert not cache_object_path(tmp_path / "cache", playable["id"]).exists()
+
+
 async def test_republishing_does_not_disturb_an_open_reader_bdd_080(tmp_path):
     worker, playable, _ = build(tmp_path, FakeMaterializer(), state="READY", sha=DIGEST)
     published = cache_object_path(tmp_path / "cache", playable["id"])

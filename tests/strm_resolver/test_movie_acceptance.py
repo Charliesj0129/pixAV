@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import subprocess
+import threading
+from contextlib import suppress
 
 import httpx
 import pytest
 import respx
 
+from pixav.shared.media_file import open_media_file
 from pixav.strm_resolver.movie_acceptance import range_acceptance, vlc_acceptance
 
 BASE = "http://resolver:8000"
@@ -50,6 +54,56 @@ def _serve(movie):
 
 
 class TestRangeAcceptance:
+    @respx.mock
+    async def test_local_reference_stays_locked_for_the_whole_http_acceptance(self, movie):
+        serve = _serve(movie)
+        checked = []
+
+        def inspect(request):
+            with pytest.raises(BlockingIOError), open_media_file(movie, exclusive=True):
+                pytest.fail("local comparison source was unlocked during acceptance")
+            checked.append(request.method)
+            return serve(request)
+
+        respx.get(f"{BASE}/resolve/{VIDEO_ID}").mock(side_effect=inspect)
+        for path in ("stream", "local"):
+            respx.route(url=f"{BASE}/{path}/{VIDEO_ID}").mock(side_effect=inspect)
+        await range_acceptance(BASE, VIDEO_ID, movie)
+        assert "HEAD" in checked and checked.count("GET") >= 6
+        with open_media_file(movie, exclusive=True):
+            pass
+
+    @respx.mock
+    async def test_cancel_during_reference_hash_drains_before_releasing_its_lock(self, movie, monkeypatch):
+        from pixav.strm_resolver import movie_acceptance as module
+
+        _serve(movie)
+        digest = module._local_digest
+        entered, released = threading.Event(), threading.Event()
+
+        def held(*args, **kwargs):
+            entered.set()
+            assert released.wait(5)
+            return digest(*args, **kwargs)
+
+        monkeypatch.setattr(module, "_local_digest", held)
+        running = asyncio.create_task(range_acceptance(BASE, VIDEO_ID, movie))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            running.cancel()
+            await asyncio.sleep(0.02)
+            assert not running.done()
+            with pytest.raises(BlockingIOError), open_media_file(movie, exclusive=True):
+                pytest.fail("cancellation released an unfinished hash's source")
+            running.cancel()
+        finally:
+            released.set()
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(running, 5)
+        assert running.cancelled()
+        with open_media_file(movie, exclusive=True):
+            pass
+
     @respx.mock
     async def test_head_middle_and_tail_ranges_must_match_the_published_bytes(self, movie):
         _serve(movie)

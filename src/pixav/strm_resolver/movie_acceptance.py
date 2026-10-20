@@ -4,22 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import subprocess
+import threading
 from pathlib import Path
 
 import httpx
 
+from pixav.shared.media_file import MediaFile, open_media_file, run_media_work
 
-def _local_digest(local: Path) -> str:
-    digest = hashlib.sha256()
-    with local.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+
+def _local_digest(local: Path, *, stopped: threading.Event | None = None) -> str:
+    if stopped is not None and stopped.is_set():
+        raise ValueError("ACCEPTANCE_FILE_WORK_CANCELLED")
+    with open_media_file(local) as source:
+        return source.facts()[0]
 
 
 async def range_acceptance(base: str, video_id: str, local: Path) -> dict:
-    size = local.stat().st_size
+    with open_media_file(local) as source:
+        result = await _range_acceptance(base, video_id, source)
+        source.assert_current()
+        return result
+
+
+async def _range_acceptance(base: str, video_id: str, local: MediaFile) -> dict:
+    size = os.fstat(local.descriptor).st_size
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         resolved = await client.get(f"{base}/resolve/{video_id}")
         resolved.raise_for_status()
@@ -28,7 +38,7 @@ async def range_acceptance(base: str, video_id: str, local: Path) -> dict:
             (f"bytes={size // 2}-{min(size // 2 + 65535, size - 1)}", size // 2, min(size // 2 + 65535, size - 1)),
             ("bytes=-65536", max(0, size - 65536), size - 1),
         ]
-        with local.open("rb") as source:
+        with local.reader() as source:
             for header, start, end in ranges:
                 response = await client.get(f"{base}/stream/{video_id}", headers={"Range": header})
                 source.seek(start)
@@ -46,7 +56,7 @@ async def range_acceptance(base: str, video_id: str, local: Path) -> dict:
             raise ValueError("HTTP HEAD contract failed")
 
         # Stream both inputs: a complete 4K movie must never be buffered in RAM.
-        expected = await asyncio.to_thread(_local_digest, local)
+        expected = await run_media_work(_local_digest, local.path)
         digest = hashlib.sha256()
         received = 0
         async with client.stream(

@@ -15,54 +15,105 @@ import zipfile
 from pathlib import Path
 from typing import IO, Any
 
+from pixav.shared.media_file import (
+    MediaFile,
+    MediaFileChangedError,
+    MediaFileUnsafeError,
+    open_media_directory,
+    open_media_file,
+    open_media_output,
+)
+
 
 class OriginalMismatchError(ValueError):
     """Downloaded bytes or media cannot be the requested original."""
 
 
+class OriginalWorkConflictError(ValueError):
+    """Preserve changed work; this is not a provider integrity verdict."""
+
+
 def copy_original(stream: IO[bytes], destination: Path, size: int, digest: str) -> None:
     """Accept exactly the expected original bytes; never publish a partial result."""
+    destination = Path(os.path.abspath(destination))
     partial = destination.with_suffix(destination.suffix + ".part")
     if destination.exists() or destination.is_symlink():
-        raise ValueError("original destination already exists")
-    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    measured = hashlib.sha256()
-    count = 0
+        raise OriginalWorkConflictError("original destination already exists")
     try:
-        with os.fdopen(fd, "wb") as target:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                count += len(chunk)
-                if count > size:
-                    raise OriginalMismatchError("cloud file exceeds source size")
-                target.write(chunk)
-                measured.update(chunk)
-            target.flush()
-            os.fsync(target.fileno())
-        if count != size or measured.hexdigest() != digest:
-            raise OriginalMismatchError("cloud original size or SHA-256 mismatch")
-        os.link(partial, destination)  # Atomic publication without overwriting an existing file.
-    finally:
-        partial.unlink(missing_ok=True)
+        _copy_original(stream, destination, partial, size, digest)
+    except (OSError, MediaFileChangedError, MediaFileUnsafeError):
+        raise OriginalWorkConflictError("COLD_ORIGINAL_WORK_REQUIRES_RECONCILIATION") from None
+
+
+def _copy_original(stream: IO[bytes], destination: Path, partial: Path, size: int, digest: str) -> None:
+    with open_media_output(partial, must_create=True) as output:
+        try:
+            measured = hashlib.sha256()
+            count = 0
+            with os.fdopen(os.dup(output.descriptor), "wb") as target:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    count += len(chunk)
+                    if count > size:
+                        raise OriginalMismatchError("cloud file exceeds source size")
+                    target.write(chunk)
+                    measured.update(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            if count != size or measured.hexdigest() != digest or output.facts() != (digest, size):
+                raise OriginalMismatchError("cloud original size or SHA-256 mismatch")
+        except Exception:
+            try:
+                output.unlink()
+            except (OSError, ValueError):
+                raise OriginalWorkConflictError("COLD_ORIGINAL_WORK_REQUIRES_RECONCILIATION") from None
+            raise
+        # Interruptions retain owned partial work. Publication conflicts also
+        # retain it; never replace a destination or remove a changed name.
+        try:
+            with open_media_directory(destination, exclusive=True) as directory:
+                output.assert_current()
+                os.link(
+                    partial.name,
+                    destination.name,
+                    src_dir_fd=directory.descriptor,
+                    dst_dir_fd=directory.descriptor,
+                    follow_symlinks=False,
+                )
+                MediaFile(destination, output.descriptor, directory.descriptor, True).assert_current()
+                output.assert_current()
+                os.unlink(partial.name, dir_fd=directory.descriptor)
+                os.fsync(directory.descriptor)
+        except (OSError, ValueError):
+            raise OriginalWorkConflictError("COLD_ORIGINAL_WORK_REQUIRES_RECONCILIATION") from None
 
 
 def extract_original(archive: Path, destination: Path, filename: str, size: int, digest: str) -> None:
     """Download-all must contain exactly one regular item with the expected name."""
     # DEFLATE can expand incompressible data by more than 1 MiB for a 9.5 GB
     # original. ZIP64 is handled by ZipFile; bound expansion without trusting it.
-    if archive.stat().st_size > size + max(1024 * 1024, size // 100 + 65536):
-        raise OriginalMismatchError("download archive exceeds single-item bound")
-    with zipfile.ZipFile(archive) as bundle:
-        items = bundle.infolist()
-        if (
-            len(items) != 1
-            or items[0].filename != filename
-            or items[0].is_dir()
-            or items[0].file_size != size
-            or (items[0].external_attr >> 16) & 0o170000 == 0o120000
-        ):
-            raise OriginalMismatchError("download archive does not contain exactly the expected item")
-        with bundle.open(items[0]) as stream:
-            copy_original(stream, destination, size, digest)
+    try:
+        with open_media_file(archive) as source, source.reader() as reader:
+            if os.fstat(source.descriptor).st_size > size + max(1024 * 1024, size // 100 + 65536):
+                raise OriginalMismatchError("download archive exceeds single-item bound")
+            with zipfile.ZipFile(reader) as bundle:
+                _extract_item(bundle, destination, filename, size, digest)
+            source.assert_current()
+    except (OSError, MediaFileChangedError, MediaFileUnsafeError):
+        raise OriginalWorkConflictError("COLD_ORIGINAL_WORK_REQUIRES_RECONCILIATION") from None
+
+
+def _extract_item(bundle: zipfile.ZipFile, destination: Path, filename: str, size: int, digest: str) -> None:
+    items = bundle.infolist()
+    if (
+        len(items) != 1
+        or items[0].filename != filename
+        or items[0].is_dir()
+        or items[0].file_size != size
+        or (items[0].external_attr >> 16) & 0o170000 == 0o120000
+    ):
+        raise OriginalMismatchError("download archive does not contain exactly the expected item")
+    with bundle.open(items[0]) as stream:
+        copy_original(stream, destination, size, digest)
 
 
 def probe(path: Path) -> dict[str, Any]:

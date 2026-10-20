@@ -19,6 +19,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from pixav.shared.media_file import open_media_file
+
 WIDTH, HEIGHT, RATE = 640, 360, 48000
 FRAME_BYTES = WIDTH * HEIGHT * 3
 FFMPEG = "/usr/bin/ffmpeg"
@@ -291,11 +293,8 @@ def analyze_window(recording: Path, spec: SyntheticAVSpec, window: dict) -> dict
 
 
 def _artifact_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with open_media_file(path) as source:
+        return source.facts()[0]
 
 
 def verify_capture(

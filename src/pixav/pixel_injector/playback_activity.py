@@ -328,6 +328,8 @@ class PlaybackActivityWorker:
                 manifest, work, timeout_seconds=self.segment_timeout_seconds * len(segments)
             )
         except ColdProcessError as failure:
+            if failure.error_type == "OriginalWorkConflictError":
+                raise PlaybackWorkConflictError("cold original work requires reconciliation") from None
             if failure.error_type in {"AccountSessionRequiredError", "AccountSessionMismatchError"}:
                 raise AccountSessionRequiredError("Photos session requires operator login") from None
             if failure.error_type in _SEGMENT_MISMATCH:

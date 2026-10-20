@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 import os
 import stat
@@ -24,17 +23,15 @@ from pydantic import BaseModel, ConfigDict, Field
 import docker
 from pixav.pixel_injector.errors import CanaryBlockedError
 from pixav.pixel_injector.profiles import get_profile
+from pixav.shared.media_file import open_media_file
 
 TOOLS_IMAGE = "pixav-photos-canary:maestro-2.10.0"
 OWNER_LABEL = "pixav.photos_canary.owner"
 
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with open_media_file(path) as source:
+        return source.facts()[0]
 
 
 def private_directory(path: Path) -> Path:
