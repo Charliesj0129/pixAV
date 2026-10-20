@@ -833,8 +833,19 @@ async def test_receipt_authorizer_requires_exception_opt_in_and_all_other_live_g
     assert media.exists()
 
 
+class _OperatorEnvironment(dict):
+    def __repr__(self):
+        return "<private operator child environment>"
+
+
+class _OperatorPrivateValues(tuple):
+    def __repr__(self):
+        return "<private operator output redaction values>"
+
+
 async def _operator_child(module, arguments, environment, private_values=()):
     """Run the real entry point; never expose a child's unbounded output."""
+    __tracebackhide__ = True
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -968,24 +979,26 @@ async def test_real_cleanup_cli_uses_live_instances_and_only_its_owned_pause(db,
     token_path = private_file("owner-token", token)
     wrong_path = private_file("wrong-token", wrong_token)
     endpoint = urlsplit(os.environ["PIXAV_E2E_ADMIN_DSN"])
-    environment = {
-        **os.environ,
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": str(Path.cwd() / "src") + os.pathsep + str(Path.cwd()),
-        "PIXAV_DB_HOST": endpoint.hostname,
-        "PIXAV_DB_PORT": str(endpoint.port or 5432),
-        "PIXAV_DB_USER": unquote(endpoint.username),
-        "PIXAV_DB_PASSWORD": unquote(endpoint.password),
-        "PIXAV_DB_NAME": approval.target.database_name,
-        "PIXAV_EXPECTED_DB_IDENTITY": approval.target.database_identifier,
-        "PIXAV_EXPECTED_DB_NAME": approval.target.database_name,
-        "PIXAV_REDIS_URL": os.environ["PIXAV_E2E_REDIS_URL"],
-        "PIXAV_EXPECTED_REDIS_RUN_ID": runtime.redis_run_id,
-        "PIXAV_SYSTEM_PAUSE_KEY": pause_key,
-        "PIXAV_DOWNLOAD_DIR": str(tmp_path),
-        "PIXAV_LIBRARY_ROOT": str(tmp_path / "library"),
-    }
-    private_values = (token, wrong_token, unquote(endpoint.password))
+    environment = _OperatorEnvironment(
+        {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(Path.cwd() / "src") + os.pathsep + str(Path.cwd()),
+            "PIXAV_DB_HOST": endpoint.hostname,
+            "PIXAV_DB_PORT": str(endpoint.port or 5432),
+            "PIXAV_DB_USER": unquote(endpoint.username),
+            "PIXAV_DB_PASSWORD": unquote(endpoint.password),
+            "PIXAV_DB_NAME": approval.target.database_name,
+            "PIXAV_EXPECTED_DB_IDENTITY": approval.target.database_identifier,
+            "PIXAV_EXPECTED_DB_NAME": approval.target.database_name,
+            "PIXAV_REDIS_URL": os.environ["PIXAV_E2E_REDIS_URL"],
+            "PIXAV_EXPECTED_REDIS_RUN_ID": runtime.redis_run_id,
+            "PIXAV_SYSTEM_PAUSE_KEY": pause_key,
+            "PIXAV_DOWNLOAD_DIR": str(tmp_path),
+            "PIXAV_LIBRARY_ROOT": str(tmp_path / "library"),
+        }
+    )
+    private_values = _OperatorPrivateValues((token, wrong_token, unquote(endpoint.password)))
 
     async def cleanup(*arguments):
         return await _operator_child("scripts.manage_cleanup", list(arguments), environment, private_values)
@@ -996,7 +1009,7 @@ async def test_real_cleanup_cli_uses_live_instances_and_only_its_owned_pause(db,
         code, report = await _operator_child(
             "scripts.manage_cleanup",
             ["files", "--request", request_path, "--allow-operator-exception"],
-            {**environment, "PIXAV_DB_PORT": "invalid-settings-must-not-be-loaded"},
+            _OperatorEnvironment({**environment, "PIXAV_DB_PORT": "invalid-settings-must-not-be-loaded"}),
             private_values,
         )
         assert code == 0 and report == {
