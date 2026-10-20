@@ -30,13 +30,16 @@ from pixav.library_projection.render import render_projection
 from pixav.library_projection.repository import ArtworkRecord
 from pixav.library_projection.writer import ProjectionWriter
 from pixav.maxwell_core.cleanup_authorization import CleanupAuthorizer
+from pixav.maxwell_core.cleanup_operation import CleanupOperator
 from pixav.maxwell_core.gc import LocalFileJanitor
 from pixav.shared.cleanup_binding import capture_cleanup_binding
+from pixav.shared.cleanup_operation import CleanupSelection, cleanup_selection_stamp
 from pixav.shared.cleanup_recovery import (
     CleanupApprovalError,
     CleanupApprovalRequest,
     CleanupRecoveryAuthorization,
     CleanupRuntimeBinding,
+    EvidenceFile,
     target_binding_digest,
 )
 from pixav.shared.media_file import open_media_file
@@ -56,9 +59,9 @@ async def db(integration_db):
     return integration_db
 
 
-async def artifact(db, tmp_path, *, durable=True, due=True):
+async def artifact(db, tmp_path, *, durable=True, due=True, filename="prepared.mp4"):
     """A video whose staging file is a candidate for removal."""
-    media = tmp_path / "prepared.mp4"
+    media = tmp_path / filename
     media.write_bytes(b"the only local copy")
     video = await db.fetchval(
         """INSERT INTO videos(title,local_path,local_cleanup_after)
@@ -787,6 +790,246 @@ async def private_approval_request(db, tmp_path, video, media, *, runtime=RUNTIM
     )
 
 
+async def selected_cleanup_fixture(db, root, *, count=2):
+    """Real domain gates with synthetic recovery and runtime attestations."""
+    root.chmod(0o700)
+    guard = type("Guard", (), {"check": AsyncMock(return_value=RUNTIME)})()
+    authorizer = CleanupAuthorizer(
+        db, guard, staging_root=root, library_root=root / "library", allow_operator_exception=True
+    )
+    approvals, media_files = [], []
+    for index in range(count + 1):
+        video, media = await artifact(db, root, filename=f"prepared-{index}.mp4")
+        await publish(db, video)
+        await playback_verified(db, video)
+        os.utime(media, ns=(1_000_000_000, media.stat().st_mtime_ns))
+        evidence = root / f"approval-{index}"
+        evidence.mkdir(mode=0o700)
+        approval = await private_approval_request(db, evidence, video, media)
+        assert (await authorizer.authorize(approval, apply=True))["authorized_count"] == 1
+        approvals.append(approval)
+        media_files.append(media)
+    selected = CleanupSelection(
+        version="cleanup-selection-v1",
+        id=uuid.uuid4(),
+        expected_count=count,
+        runtime=RUNTIME,
+        downloader_mount=EvidenceFile(path=str(root / "unused-runtime-fixture"), sha256="a" * 64, size_bytes=1),
+        requests=tuple(approvals[:count]),
+    )
+    operator = CleanupOperator(
+        db, guard, staging_root=root, library_root=root / "library", apply_allowed=True, allow_operator_exception=True
+    )
+    return selected, operator, guard, media_files
+
+
+async def test_exact_selection_preview_delete_and_replay_leave_eligible_neighbour_untouched(db, tmp_path):
+    selection, operator, _, files = await selected_cleanup_fixture(db, tmp_path)
+    database_before, files_before = await _operator_domain_snapshot(db), _operator_file_metadata(tmp_path)
+    preview = await operator.execute(selection)
+    assert preview["result"] == "ELIGIBLE_FOR_CLEANUP" and preview["eligible"] == 2
+    assert preview["deleted"] == 0
+    assert await _operator_domain_snapshot(db) == database_before
+    assert _operator_file_metadata(tmp_path) == files_before
+    outcome = await operator.execute(selection, apply=True)
+    assert outcome["result"] == "APPLIED" and outcome["deleted"] == 2
+    assert not files[0].exists() and not files[1].exists() and files[2].exists()
+    assert await db.fetchval("SELECT count(*) FROM videos WHERE local_path IS NULL") == 2
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal WHERE state='COMPLETED'") == 2
+    stamp = cleanup_selection_stamp(selection)
+    for row in await db.fetch("SELECT gates FROM cleanup_journal"):
+        assert json.loads(row["gates"])["selection"] == stamp
+    for row in await db.fetch("SELECT reasons FROM cleanup_audit WHERE decision='deleted'"):
+        assert json.loads(row["reasons"])["selection"] == stamp
+    files[0].write_bytes(b"replacement outside the completed operation")
+    replay = await operator.execute(selection, apply=True)
+    assert replay["result"] == "ALREADY_APPLIED" and replay["deleted"] == 0 and replay["already_completed"] == 2
+    assert files[0].read_bytes() == b"replacement outside the completed operation" and files[2].exists()
+
+
+@pytest.mark.parametrize("fault", ["not-due", "expired-row", "unapproved-id", "active-reader"])
+async def test_any_ineligible_selection_member_preserves_the_whole_set_before_apply(db, tmp_path, fault):
+    from contextlib import ExitStack
+
+    selection, operator, _, files = await selected_cleanup_fixture(db, tmp_path)
+    item = selection.requests[1]
+    with ExitStack() as handles:
+        if fault == "not-due":
+            await db.execute(
+                "UPDATE videos SET local_cleanup_after=now()+interval '1 day' WHERE id=$1", item.target.video_id
+            )
+        elif fault == "expired-row":
+            await db.execute(
+                """UPDATE cleanup_authorizations SET created_at=now()-interval '1 day',
+                expires_at=now()-interval '1 second' WHERE id=$1""",
+                item.id,
+            )
+        elif fault == "unapproved-id":
+            selection = selection.model_copy(
+                update={"requests": (selection.requests[0], item.model_copy(update={"id": uuid.uuid4()}))}
+            )
+        else:
+            handles.enter_context(open_media_file(files[1]))
+        before = await _operator_domain_snapshot(db)
+        result = await operator.execute(selection, apply=True)
+        assert result["result"] == "REFUSED" and result["deleted"] == 0
+        assert all(path.exists() for path in files)
+        assert await _operator_domain_snapshot(db) == before
+
+
+async def test_guard_failure_after_selection_intent_preserves_files_and_retains_pending_recovery(
+    db, tmp_path, monkeypatch
+):
+    from pixav.maxwell_core import cleanup_operation as module
+
+    selection, operator, guard, files = await selected_cleanup_fixture(db, tmp_path)
+
+    class ChangedAfterIntent(LocalFileJanitor):
+        async def _persist_intent(self, *arguments):
+            result = await super()._persist_intent(*arguments)
+            guard.check.side_effect = CleanupApprovalError("CLEANUP_DOWNLOADER_NOT_QUIESCENT")
+            return result
+
+    monkeypatch.setattr(module, "LocalFileJanitor", ChangedAfterIntent)
+    outcome = await operator.execute(selection, apply=True)
+    assert outcome["result"] == "REFUSED" and outcome["failed"] == 1 and outcome["deleted"] == 0
+    assert all(path.exists() for path in files)
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal WHERE state='INTENT'") == 1
+    guard.check.side_effect = None
+    pending = await operator.recover(selection, apply=True)
+    assert pending["pending"] == 1 and pending["recovered"] == 0 and all(path.exists() for path in files)
+
+
+async def test_selection_locks_execution_admission_and_remote_invalidation_until_unlink_commits(
+    db, tmp_path, monkeypatch
+):
+    import asyncpg
+
+    from pixav.maxwell_core import cleanup_operation as module
+
+    selection, operator, _, files = await selected_cleanup_fixture(db, tmp_path)
+    attempts = []
+
+    class CheckMetadataLocks(LocalFileJanitor):
+        async def _persist_intent(self, conn, video, *arguments):
+            result = await super()._persist_intent(conn, video, *arguments)
+            task = await conn.fetchval("SELECT id FROM tasks WHERE video_id=$1", video)
+            async with db.acquire() as writer:
+                await writer.execute("SET lock_timeout='100ms'")
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await writer.execute(
+                        "UPDATE remote_assets SET state='INVALID',durable_at=NULL WHERE video_id=$1", video
+                    )
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await writer.execute(
+                        "INSERT INTO executions(id,task_id,max_retries,state) VALUES($1,$2,1,'READY')",
+                        uuid.uuid4(),
+                        task,
+                    )
+            attempts.append(video)
+            return result
+
+    monkeypatch.setattr(module, "LocalFileJanitor", CheckMetadataLocks)
+    janitor = await operator._janitor(selection)
+    result = await janitor.cleanup(apply=True)
+    assert result["deleted"] == 2 and len(attempts) == 2 and files[2].exists()
+    assert await db.fetchval("SELECT count(*) FROM remote_assets WHERE state='DURABLE'") == 3
+
+
+async def test_selection_stops_after_a_later_target_loses_eligibility(db, tmp_path, monkeypatch):
+    from pixav.maxwell_core import cleanup_operation as module
+
+    selection, operator, _, files = await selected_cleanup_fixture(db, tmp_path, count=3)
+    ordered = sorted(selection.requests, key=lambda item: item.target.video_id)
+
+    class RevokeNext(LocalFileJanitor):
+        async def _audit(self, conn, video, path, decision, applied, reasons):
+            await super()._audit(conn, video, path, decision, applied, reasons)
+            if decision == "deleted" and video == ordered[0].target.video_id:
+                await conn.execute(
+                    "UPDATE remote_assets SET state='INVALID',durable_at=NULL WHERE video_id=$1",
+                    ordered[1].target.video_id,
+                )
+
+    monkeypatch.setattr(module, "LocalFileJanitor", RevokeNext)
+    result = await operator.execute(selection, apply=True)
+    assert result["result"] == "PARTIAL_OR_REFUSED" and result["deleted"] == 1 and result["rejected"] == 1
+    assert not Path(ordered[0].target.path).exists()
+    assert Path(ordered[1].target.path).exists() and Path(ordered[2].target.path).exists() and files[3].exists()
+
+
+async def test_selection_sigkill_recovers_only_its_missing_file_then_resumes_the_remaining_target(db, tmp_path):
+    selection, operator, _, files = await selected_cleanup_fixture(db, tmp_path)
+    selection_path = tmp_path / "selection.json"
+    descriptor = os.open(selection_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(selection.model_dump_json())
+    endpoint = urlsplit(os.environ["PIXAV_E2E_ADMIN_DSN"])
+    database = await db.fetchval("SELECT current_database()")
+    dsn = urlunsplit(endpoint._replace(path=f"/{database}"))
+    ready = tmp_path / "selected-kill-ready"
+    child = r"""
+import asyncio,os,sys
+from pathlib import Path
+from types import SimpleNamespace
+import asyncpg
+from pixav.maxwell_core.gc import LocalFileJanitor
+from pixav.shared.cleanup_operation import read_cleanup_selection
+from pixav.shared.instance import database_identity
+os.umask(0o077)
+root,selection_path,ready=map(Path,sys.argv[1:])
+selection=read_cleanup_selection(selection_path)
+async def guard():return selection.runtime
+class CrashJanitor(LocalFileJanitor):
+    async def _audit(self,conn,video,path,decision,applied,reasons):
+        if decision=='deleted':
+            ready.write_text('unlinked')
+            await asyncio.sleep(60)
+        await super()._audit(conn,video,path,decision,applied,reasons)
+async def main():
+    pool=await asyncpg.create_pool(sys.stdin.readline().strip(),min_size=1,max_size=3)
+    try:
+        assert await database_identity(pool)==os.environ['PIXAV_TEST_DB_IDENTITY']
+        assert (await pool.fetchval('SELECT current_database()')).startswith('pixav_test_')
+        await CrashJanitor(pool,download_dir=str(root),library_root=str(root/'library'),
+            recovery_runtime=selection.runtime,allow_operator_exception=True,selection=selection,
+            operation_guard=SimpleNamespace(check=guard)).cleanup(apply=True)
+    finally:await pool.close()
+asyncio.run(main())
+"""
+    process = subprocess.Popen(  # noqa: S603 -- exact synthetic test DB; credential arrives on stdin
+        [sys.executable, "-c", child, str(tmp_path), str(selection_path), str(ready)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        process.stdin.write((dsn + "\n").encode())
+        process.stdin.close()
+        for _ in range(200):
+            if ready.exists():
+                break
+            assert process.poll() is None, "selection child terminated before its crash checkpoint"
+            await asyncio.sleep(0.05)
+        assert ready.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+    assert sum(not path.exists() for path in files[:2]) == 1 and files[2].exists()
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal WHERE state='INTENT'") == 1
+    assert await db.fetchval("SELECT count(*) FROM cleanup_audit") == 0
+    assert (await janitor(db, tmp_path).recover(apply=True))["rejected"] == 1
+    before = await _operator_domain_snapshot(db)
+    preview = await operator.recover(selection)
+    assert preview["eligible_recovery"] == 1 and preview["recovered"] == 0
+    assert await _operator_domain_snapshot(db) == before
+    assert (await operator.recover(selection, apply=True))["recovered"] == 1
+    assert (await operator.execute(selection, apply=True))["deleted"] == 1
+    assert files[2].exists() and not files[0].exists() and not files[1].exists()
+    assert await db.fetchval("SELECT count(*) FROM cleanup_journal WHERE state='COMPLETED'") == 2
+
+
 async def test_receipt_authorizer_dry_run_apply_idempotence_and_audit(db, tmp_path):
     video, media = await artifact(db, tmp_path)
     await publish(db, video)
@@ -1084,6 +1327,186 @@ async def test_real_cleanup_cli_uses_live_instances_and_only_its_owned_pause(db,
                 "scripts.manage_system_pause", ["resume", *pause_arguments], environment, private_values
             )
             assert code == 0 and report["owned_pause_released"]
+
+
+async def test_real_selection_cli_observes_stops_and_fences_a_noncooperating_reader(db, integration_redis, tmp_path):
+    """Actual Docker lifecycle and CLI/PG/Redis; the actor is a synthetic sleeper.
+
+    Its raw open fd deliberately ignores pixAV's advisory locks. This verifies
+    the Docker process/mount contract without claiming a live qBittorrent API,
+    a provider upload, a real restore or complete production actor coverage.
+    """
+    import yaml
+
+    import docker
+
+    redis, pause_key = integration_redis
+    tmp_path.chmod(0o700)
+    staging, evidence = tmp_path / "staging", tmp_path / "evidence"
+    staging.mkdir(mode=0o700)
+    evidence.mkdir(mode=0o700)
+    video, media = await artifact(db, staging)
+    await publish(db, video)
+    await playback_verified(db, video)
+    client = docker.from_env(timeout=15)
+    actor = None
+    paused = False
+    owner = uuid.uuid4().hex
+    context = (
+        subprocess.check_output(  # noqa: S603 -- fixed read-only local Docker query
+            [shutil.which("docker"), "context", "show"], timeout=15
+        )
+        .decode()
+        .strip()
+    )
+    runtime = CleanupRuntimeBinding(
+        docker_context=context,
+        docker_daemon_id=client.info()["ID"],
+        redis_run_id=str((await redis.info("server"))["run_id"]),
+    )
+    approval = await private_approval_request(db, evidence, video, media, runtime=runtime)
+
+    def private_file(name, text):
+        path = evidence / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        return path
+
+    token = secrets.token_urlsafe(32)
+    token_path = private_file("token", token)
+    approval_path = private_file("approval.json", approval.model_dump_json())
+    runtime_path = private_file("runtime.json", runtime.model_dump_json())
+    endpoint = urlsplit(os.environ["PIXAV_E2E_ADMIN_DSN"])
+    environment = _OperatorEnvironment(
+        {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(Path.cwd() / "src") + os.pathsep + str(Path.cwd()),
+            "PIXAV_DB_HOST": endpoint.hostname,
+            "PIXAV_DB_PORT": str(endpoint.port or 5432),
+            "PIXAV_DB_USER": unquote(endpoint.username),
+            "PIXAV_DB_PASSWORD": unquote(endpoint.password),
+            "PIXAV_DB_NAME": approval.target.database_name,
+            "PIXAV_EXPECTED_DB_IDENTITY": approval.target.database_identifier,
+            "PIXAV_EXPECTED_DB_NAME": approval.target.database_name,
+            "PIXAV_REDIS_URL": os.environ["PIXAV_E2E_REDIS_URL"],
+            "PIXAV_EXPECTED_REDIS_RUN_ID": runtime.redis_run_id,
+            "PIXAV_SYSTEM_PAUSE_KEY": pause_key,
+            "PIXAV_DOWNLOAD_DIR": str(staging),
+            "PIXAV_LIBRARY_ROOT": str(staging / "library"),
+            "PIXAV_LOCAL_CLEANUP_APPLY": "0",
+        }
+    )
+    private_values = _OperatorPrivateValues((token, unquote(endpoint.password)))
+
+    async def run(command, *arguments):
+        return await _operator_child(command, list(arguments), environment, private_values)
+
+    async def action(command, request, *, apply=False):
+        arguments = [
+            command,
+            "--request",
+            str(request),
+            "--maintenance-token-file",
+            str(token_path),
+            "--allow-operator-exception",
+        ]
+        return await run("scripts.manage_cleanup", *arguments, *(["--apply"] if apply else []))
+
+    try:
+        code, result = await run("scripts.manage_system_pause", "pause", "--token-file", str(token_path))
+        assert code == 0 and result["owned"]
+        paused = True
+        image_name = yaml.safe_load(Path("docker-compose.integration.yml").read_text())["services"]["redis"]["image"]
+        image = client.images.get(image_name)
+        assert set(image.attrs["Config"].get("Volumes") or {}) == {"/data"}
+        actor = client.containers.create(
+            image.id,
+            entrypoint=["/bin/sh", "-c"],
+            command=["exec 3</downloads/prepared.mp4; exec sleep 600"],
+            user=f"{os.getuid()}:{os.getgid()}",
+            network_mode="none",
+            read_only=True,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            mem_limit="64m",
+            pids_limit=32,
+            nano_cpus=1_000_000_000,
+            restart_policy={"Name": "no"},
+            labels={
+                "com.docker.compose.project": "pixav-cleanup-test-" + owner,
+                "com.docker.compose.service": "qbittorrent",
+                "pixav.cleanup-test.owner": owner,
+            },
+            mounts=[docker.types.Mount("/downloads", str(staging), "bind", read_only=False)],
+            tmpfs={"/data": "rw,nosuid,nodev,size=1048576,mode=0700"},
+        )
+        await asyncio.to_thread(actor.start)
+        assert (await asyncio.to_thread(actor.exec_run, ["/bin/sh", "-c", "test -r /proc/1/fd/3"])).exit_code == 0
+        code, result = await action("authorize", approval_path, apply=True)
+        assert code == 0 and result["authorized_count"] == 1
+        proof_path = evidence / "mount.json"
+        code, observed = await run(
+            "scripts.manage_cleanup",
+            "capture-downloader",
+            "--runtime-file",
+            str(runtime_path),
+            "--maintenance-token-file",
+            str(token_path),
+            "--container-id",
+            actor.id,
+            "--mount-destination",
+            "/downloads",
+            "--output",
+            str(proof_path),
+        )
+        assert code == 0 and observed["result"] == "DOWNLOADER_MOUNT_OBSERVED" and not observed["quiescence_verified"]
+        assert proof_path.stat().st_mode & 0o777 == 0o600
+        selected = CleanupSelection(
+            version="cleanup-selection-v1",
+            id=uuid.uuid4(),
+            expected_count=1,
+            runtime=runtime,
+            downloader_mount=EvidenceFile(
+                path=str(proof_path), sha256=observed["receipt_sha256"], size_bytes=observed["receipt_size_bytes"]
+            ),
+            requests=(approval,),
+        )
+        selection_path = private_file("selection.json", selected.model_dump_json())
+        code, result = await action("execute", selection_path, apply=True)
+        assert code == 2 and result["code"] == "CLEANUP_APPLY_DISABLED" and media.exists()
+        environment["PIXAV_LOCAL_CLEANUP_APPLY"] = "1"
+        code, result = await action("execute", selection_path, apply=True)
+        assert code == 2 and result["code"] == "CLEANUP_DOWNLOADER_NOT_QUIESCENT" and media.exists()
+        await asyncio.to_thread(actor.stop, timeout=10)
+        before, files_before, pause_before = (
+            await _operator_domain_snapshot(db),
+            _operator_file_metadata(tmp_path),
+            await redis.get(pause_key),
+        )
+        code, result = await action("execute", selection_path)
+        assert code == 0 and result["result"] == "ELIGIBLE_FOR_CLEANUP" and result["eligible"] == 1
+        assert await _operator_domain_snapshot(db) == before
+        assert _operator_file_metadata(tmp_path) == files_before and await redis.get(pause_key) == pause_before
+        code, result = await action("execute", selection_path, apply=True)
+        assert code == 0 and result["result"] == "APPLIED" and result["deleted"] == 1 and not media.exists()
+        assert await db.fetchval("SELECT local_path FROM videos WHERE id=$1", video) is None
+        assert await db.fetchval("SELECT count(*) FROM cleanup_journal WHERE state='COMPLETED'") == 1
+        code, result = await action("execute", selection_path, apply=True)
+        assert code == 0 and result["result"] == "ALREADY_APPLIED" and result["deleted"] == 0
+        code, result = await action("recover", selection_path, apply=True)
+        assert code == 0 and result["result"] == "ALREADY_RECONCILED" and result["recovered"] == 0
+        assert await redis.get(pause_key) == pause_before
+    finally:
+        if actor is not None:
+            actor.reload()
+            assert actor.labels.get("pixav.cleanup-test.owner") == owner
+            actor.remove(force=True, v=False)
+        client.close()
+        if paused:
+            code, result = await run("scripts.manage_system_pause", "resume", "--token-file", str(token_path))
+            assert code == 0 and result["owned_pause_released"]
 
 
 async def test_the_missing_producer_is_named_rather_than_assumed_bdd_005_131(db, tmp_path):

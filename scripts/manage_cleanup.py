@@ -1,9 +1,9 @@
-"""Check recovery files or register one exact cleanup authorization.
+"""Inspect cleanup evidence, authorize, or execute an exact private selection.
 
-Neither command deletes media. The files command cannot prove runtime or DB
-clock identity. The authorize command is dry-run unless --apply and requires
-live instance identities, an owned system pause and all other domain gates.
-Run it in the same media-path namespace as the stored domain paths.
+files/authorize never unlink media. execute defaults to dry-run; --apply also
+requires the deployment deletion switch, owned pause and stopped-downloader
+proof. recover reconciles only selected committed intents and never unlinks.
+Use the host media-path namespace verified by capture-downloader.
 """
 
 from __future__ import annotations
@@ -23,6 +23,15 @@ from typing import Any
 import docker
 from pixav.config import get_settings
 from pixav.maxwell_core.cleanup_authorization import CleanupAuthorizer
+from pixav.maxwell_core.cleanup_operation import CleanupOperator
+from pixav.maxwell_core.cleanup_quiescence import StoppedDownloaderGuard, capture_downloader_mount
+from pixav.shared.cleanup_operation import (
+    CleanupOperationUnconfirmedError,
+    CleanupSelection,
+    read_cleanup_runtime,
+    read_cleanup_selection,
+    write_downloader_mount,
+)
 from pixav.shared.cleanup_recovery import (
     CleanupApprovalError,
     CleanupRuntimeBinding,
@@ -92,8 +101,16 @@ class LiveCleanupGuard:
 
 
 async def run(args: argparse.Namespace) -> dict:
-    request = read_cleanup_request(args.request)
+    if args.command == "capture-downloader":
+        return await observe_downloader(args)
+    request = (
+        read_cleanup_selection(args.request)
+        if args.command in {"execute", "recover"}
+        else read_cleanup_request(args.request)
+    )
     if args.command == "files":
+        if isinstance(request, CleanupSelection):
+            raise CleanupApprovalError("CLEANUP_APPROVAL_REQUEST_REQUIRED")
         stamp = await asyncio.to_thread(
             validate_cleanup_recovery,
             request,
@@ -109,12 +126,13 @@ async def run(args: argparse.Namespace) -> dict:
             "database_clock_checked": False,
         }
     settings = get_settings()
-    if settings.db_name != request.target.database_name:
+    target = request.requests[0].target if isinstance(request, CleanupSelection) else request.target
+    if settings.db_name != target.database_name:
         raise CleanupApprovalError("CLEANUP_DATABASE_NAME_MISMATCH")
     settings = settings.model_copy(
         update={
-            "expected_db_identity": request.target.database_identifier,
-            "expected_db_name": request.target.database_name,
+            "expected_db_identity": target.database_identifier,
+            "expected_db_name": target.database_name,
             "expected_redis_run_id": request.runtime.redis_run_id,
         }
     )
@@ -130,6 +148,18 @@ async def run(args: argparse.Namespace) -> dict:
         )
         await guard.check()
         pool = await create_pool(settings)
+        if isinstance(request, CleanupSelection):
+            operation = CleanupOperator(
+                pool,
+                StoppedDownloaderGuard(client, guard, request.downloader_mount, Path(settings.download_dir)),
+                staging_root=Path(settings.download_dir),
+                library_root=Path(settings.library_root),
+                apply_allowed=settings.local_cleanup_apply,
+                allow_operator_exception=args.allow_operator_exception,
+            )
+            if args.command == "recover":
+                return await operation.recover(request, apply=args.apply)
+            return await operation.execute(request, apply=args.apply)
         service = CleanupAuthorizer(
             pool,
             guard,
@@ -151,16 +181,59 @@ async def run(args: argparse.Namespace) -> dict:
                     client.close()
 
 
+async def observe_downloader(args: argparse.Namespace) -> dict:
+    runtime = read_cleanup_runtime(args.runtime_file)
+    settings = get_settings().model_copy(update={"expected_redis_run_id": runtime.redis_run_id})
+    token = read_maintenance_token(args.maintenance_token_file)
+    client = None
+    redis = None
+    try:
+        client = docker.from_env(timeout=15)
+        redis = await create_redis(settings)
+        guard = LiveCleanupGuard(client, redis, pause_key=settings.system_pause_key, token=token, expected=runtime)
+        await guard.check()
+        proof = await asyncio.to_thread(
+            capture_downloader_mount,
+            client,
+            args.container_id,
+            args.mount_destination,
+            Path(settings.download_dir),
+            runtime,
+        )
+        if await guard.check() != runtime:
+            raise CleanupApprovalError("CLEANUP_RUNTIME_CHANGED")
+        reference = write_downloader_mount(args.output, proof)
+        return {
+            "result": "DOWNLOADER_MOUNT_OBSERVED",
+            "receipt_sha256": reference.sha256,
+            "receipt_size_bytes": reference.size_bytes,
+            "quiescence_verified": False,
+        }
+    finally:
+        try:
+            if redis is not None:
+                await redis.aclose()
+        finally:
+            if client is not None:
+                client.close()
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     actions = result.add_subparsers(dest="command", required=True)
-    for command in ("files", "authorize"):
+    for command in ("files", "authorize", "execute", "recover"):
         child = actions.add_parser(command)
         child.add_argument("--request", type=Path, required=True)
         child.add_argument("--allow-operator-exception", action="store_true")
-        if command == "authorize":
+        if command != "files":
             child.add_argument("--maintenance-token-file", type=Path, required=True)
             child.add_argument("--apply", action="store_true")
+    capture = actions.add_parser("capture-downloader")
+    capture.add_argument("--runtime-file", type=Path, required=True)
+    capture.add_argument("--maintenance-token-file", type=Path, required=True)
+    capture.add_argument("--container-id", required=True)
+    capture.add_argument("--mount-destination", required=True)
+    capture.add_argument("--output", type=Path, required=True)
     return result
 
 
@@ -170,9 +243,14 @@ def main() -> None:
         result = asyncio.run(run(args))
     except Exception as error:
         code = str(error) if isinstance(error, CleanupApprovalError) else "CLEANUP_AUTHORIZATION_UNCONFIRMED"
-        print(json.dumps({"result": "REFUSED", "code": code}))
+        if isinstance(error, CleanupOperationUnconfirmedError):
+            print(json.dumps({"result": "PARTIAL_OR_UNCONFIRMED", "code": code, "reconciliation_required": True}))
+        else:
+            print(json.dumps({"result": "REFUSED", "code": code}))
         raise SystemExit(2) from None
     print(json.dumps(result))
+    if result.get("result") in {"REFUSED", "PARTIAL_OR_REFUSED"}:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

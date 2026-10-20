@@ -17,6 +17,7 @@ import pytest
 from pixav.maxwell_core.cleanup_authorization import CleanupAuthorizer
 from pixav.maxwell_core.gc import _GATE_CONDITIONS, LocalFileJanitor
 from pixav.shared.cleanup_binding import CleanupTargetBinding
+from pixav.shared.cleanup_operation import CleanupSelection, cleanup_selection_stamp, read_cleanup_selection
 from pixav.shared.cleanup_recovery import (
     CleanupApprovalError,
     CleanupApprovalRequest,
@@ -33,6 +34,65 @@ from pixav.shared.media_file import MediaFile, open_media_file
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 RUNTIME = CleanupRuntimeBinding(docker_context="synthetic", docker_daemon_id="synthetic-daemon", redis_run_id="a" * 40)
+
+
+def selection_fixture(root):
+    root.chmod(0o700)
+    requests = []
+    for index in range(2):
+        folder = root / str(index)
+        folder.mkdir(mode=0o700)
+        requests.append(request(folder))
+    return CleanupSelection(
+        version="cleanup-selection-v1",
+        id=uuid.uuid4(),
+        expected_count=2,
+        runtime=RUNTIME,
+        downloader_mount=EvidenceFile(path=str(root / "mount.json"), sha256="a" * 64, size_bytes=1),
+        requests=tuple(requests),
+    )
+
+
+def test_selection_names_exact_independent_files_and_preserves_identity_across_maintenance_sessions(tmp_path):
+    selected = selection_fixture(tmp_path)
+    stamp = cleanup_selection_stamp(selected)
+    reordered = selected.model_copy(update={"requests": tuple(reversed(selected.requests))})
+    assert cleanup_selection_stamp(reordered) == stamp
+    maintenance = selected.model_copy(update={"runtime": RUNTIME.model_copy(update={"redis_run_id": "b" * 40})})
+    assert cleanup_selection_stamp(maintenance) == stamp
+    changed = selected.requests[0].model_copy(update={"reason": "another consent"})
+    assert cleanup_selection_stamp(selected.model_copy(update={"requests": (changed, selected.requests[1])})) != stamp
+
+
+@pytest.mark.parametrize("fault", ["count", "id", "video", "path", "inode", "database", "scope"])
+def test_selection_refuses_partial_duplicate_shared_or_mixed_targets(tmp_path, fault):
+    selected = selection_fixture(tmp_path)
+    payload = selected.model_dump(mode="json")
+    first, other = payload["requests"]
+    if fault == "count":
+        payload["expected_count"] = 3
+    elif fault == "id":
+        other["id"] = first["id"]
+    elif fault in {"video", "path", "inode", "database"}:
+        key = {"video": "video_id", "path": "path", "inode": "file", "database": "database_name"}[fault]
+        other["target"][key] = "other-database" if fault == "database" else first["target"][key]
+    else:
+        other["scope"] = "production"
+    with pytest.raises(ValueError):
+        CleanupSelection.model_validate(payload)
+
+
+def test_selection_private_read_is_read_only_and_rejects_duplicate_fields(tmp_path):
+    selected = selection_fixture(tmp_path)
+    ref = artifact(tmp_path, "selection.json", selected.model_dump(mode="json"))
+    path = Path(ref.path)
+    os.utime(path, ns=(1_000_000_000, path.stat().st_mtime_ns))
+    before = path.stat()
+    assert read_cleanup_selection(path) == selected
+    assert path.stat() == before
+    path.write_text('{"version":"cleanup-selection-v1","version":"overridden"}')
+    with pytest.raises(CleanupApprovalError, match="DUPLICATE_JSON"):
+        read_cleanup_selection(path)
 
 
 def artifact(root, name, value):

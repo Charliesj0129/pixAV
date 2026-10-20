@@ -17,8 +17,11 @@ from pydantic import ValidationError
 
 from pixav.library_projection.repository import RECONCILE_LOCK
 from pixav.library_projection.writer import publication_is_complete
+from pixav.maxwell_core.cleanup_quiescence import MaintenanceGuard
 from pixav.shared.cleanup_binding import CleanupTargetBinding, capture_cleanup_binding
+from pixav.shared.cleanup_operation import CleanupSelection, cleanup_selection_stamp, selection_matches_authorization
 from pixav.shared.cleanup_recovery import (
+    CleanupApprovalError,
     CleanupAuthorizationEvidence,
     CleanupRecoveryAuthorization,
     CleanupRuntimeBinding,
@@ -238,6 +241,8 @@ class LocalFileJanitor:
         apply_deletions: bool = False,
         recovery_runtime: CleanupRuntimeBinding | None = None,
         allow_operator_exception: bool = False,
+        selection: CleanupSelection | None = None,
+        operation_guard: MaintenanceGuard | None = None,
     ) -> None:
         self._pool = pool
         self._download_dir = download_dir
@@ -247,6 +252,52 @@ class LocalFileJanitor:
         self._apply_deletions = apply_deletions
         self._recovery_runtime = recovery_runtime
         self._allow_operator_exception = allow_operator_exception
+        self._selection = selection
+        self._operation_guard = operation_guard
+
+    async def _check_operation(self) -> None:
+        if self._selection is not None:
+            if self._operation_guard is None or await self._operation_guard.check() != self._selection.runtime:
+                raise CleanupApprovalError("CLEANUP_OPERATION_RUNTIME_MISMATCH")
+
+    def _selection_stamp(self) -> dict | None:
+        return cleanup_selection_stamp(self._selection) if self._selection is not None else None
+
+    async def _lock_selection_contract(self, conn: asyncpg.Connection, video_id: uuid.UUID) -> None:
+        """Keep execution admission and mutable asset facts fenced until commit.
+
+        NOWAIT prevents an in-flight owner holding a task/execution and waiting
+        on our video lock from deadlocking cleanup. New task/execution/segment
+        inserts also need the parent row locks held here.
+        """
+        if self._selection is None:
+            return
+        queries = (
+            """SELECT t.id FROM tasks t WHERE t.video_id=$1 OR t.id IN
+            (SELECT task_id FROM workflow_tasks WHERE video_id=$1) ORDER BY t.id FOR UPDATE OF t NOWAIT""",
+            # Execution's FK references workflow_tasks, not tasks. Lock both
+            # rows, including either side of an inconsistent legacy mapping.
+            """SELECT task_id FROM workflow_tasks WHERE video_id=$1 OR task_id IN
+            (SELECT id FROM tasks WHERE video_id=$1) ORDER BY task_id FOR UPDATE NOWAIT""",
+            """SELECT e.id FROM executions e JOIN workflow_tasks t ON t.task_id=e.task_id
+            WHERE t.video_id=$1 OR e.task_id IN (SELECT id FROM tasks WHERE video_id=$1)
+            ORDER BY e.id FOR UPDATE OF e NOWAIT""",
+            "SELECT id FROM remote_assets WHERE video_id=$1 ORDER BY id FOR UPDATE NOWAIT",
+            "SELECT id FROM playable_assets WHERE video_id=$1 ORDER BY id FOR UPDATE NOWAIT",
+            "SELECT video_id FROM library_publications WHERE video_id=$1 FOR UPDATE NOWAIT",
+            """SELECT s.asset_id,s.segment_index FROM remote_asset_segments s
+            JOIN remote_assets r ON r.id=s.asset_id WHERE r.video_id=$1
+            ORDER BY s.asset_id,s.segment_index FOR UPDATE OF s NOWAIT""",
+            """SELECT a.id FROM workflow_artifacts a JOIN executions e ON e.id=a.execution_id
+            JOIN workflow_tasks t ON t.task_id=e.task_id WHERE t.video_id=$1 OR e.task_id IN
+            (SELECT id FROM tasks WHERE video_id=$1) ORDER BY a.id FOR UPDATE OF a NOWAIT""",
+            "SELECT id FROM reader_leases WHERE video_id=$1 ORDER BY id FOR UPDATE NOWAIT",
+        )
+        try:
+            for query in queries:
+                await conn.fetch(query, video_id)
+        except asyncpg.LockNotAvailableError:
+            raise CleanupApprovalError("CLEANUP_DOMAIN_WRITER_BUSY") from None
 
     @staticmethod
     async def _table_available(conn: asyncpg.Connection, name: str) -> bool:
@@ -316,10 +367,12 @@ class LocalFileJanitor:
             JOIN remote_assets r ON r.id = a.remote_asset_id
             JOIN playable_assets p ON p.remote_asset_id=r.id AND p.video_id=a.video_id AND p.state='READY'
             WHERE a.video_id=$1 AND a.path=$2 AND a.expires_at > clock_timestamp()
+              AND ($3::uuid IS NULL OR a.id=$3)
               AND r.video_id = a.video_id AND r.state='DURABLE'
             ORDER BY a.created_at DESC,a.id DESC LIMIT 1""",
             video_id,
             path,
+            self._selection.request_for(video_id).id if self._selection is not None else None,
         )
         if row is None:
             return None
@@ -357,13 +410,16 @@ class LocalFileJanitor:
                     allow_operator_exception=self._allow_operator_exception,
                 ):
                     return None
-                return CleanupAuthorizationEvidence(
+                evidence = CleanupAuthorizationEvidence(
                     version="cleanup-authorization-evidence-v1",
                     authorization_id=row["id"],
                     approval_sha256=row["approval_sha256"],
                     target=current,
                     recovery=recovery,
                 )
+                if self._selection is not None and not selection_matches_authorization(self._selection, evidence):
+                    return None
+                return evidence
         except (OSError, ValueError):
             return None
 
@@ -449,6 +505,8 @@ class LocalFileJanitor:
         return {name: observed[name] for name in _GATE_CONDITIONS}
 
     async def _audit(self, conn, video_id, path: str, decision: str, applied: bool, reasons: dict) -> None:
+        if self._selection is not None:
+            reasons = {**reasons, "selection": self._selection_stamp()}
         await conn.execute(
             """INSERT INTO cleanup_audit(id,video_id,path,decision,applied,reasons)
             VALUES($1,$2,$3,$4,$5,$6::jsonb)""",
@@ -498,6 +556,7 @@ class LocalFileJanitor:
                     or existing["video_id"] != video_id
                     or previous[0] != fingerprint
                     or previous[1].get("authorization") != authorized.model_dump(mode="json")
+                    or previous[1].get("selection") != self._selection_stamp()
                 ):
                     raise ValueError("pending cleanup intent names another object")
                 return existing["id"], fingerprint, authorized
@@ -509,7 +568,14 @@ class LocalFileJanitor:
                 video_id,
                 str(target),
                 json.dumps(fingerprint),
-                json.dumps({**gates, "domain_path": path, "authorization": authorized.model_dump(mode="json")}),
+                json.dumps(
+                    {
+                        **gates,
+                        "domain_path": path,
+                        "authorization": authorized.model_dump(mode="json"),
+                        **({"selection": self._selection_stamp()} if self._selection is not None else {}),
+                    }
+                ),
             )
         return intent_id, fingerprint, authorized
 
@@ -526,6 +592,10 @@ class LocalFileJanitor:
             return None
         try:
             authorization = CleanupAuthorizationEvidence.model_validate(gates.get("authorization"))
+            if gates.get("selection") != self._selection_stamp():
+                return None
+            if self._selection is not None and not selection_matches_authorization(self._selection, authorization):
+                return None
             target = authorization.target
             approved_path, _ = safe_cleanup_candidate(self._download_dir, gates["domain_path"])
             identity = await conn.fetchrow(
@@ -554,15 +624,25 @@ class LocalFileJanitor:
         except (ValueError, TypeError, KeyError):
             return None
 
+    async def _recovery_rows(self):
+        if self._selection is None:
+            return await self._pool.fetch("SELECT * FROM cleanup_journal WHERE state='INTENT' ORDER BY created_at")
+        return await self._pool.fetch(
+            """SELECT * FROM cleanup_journal WHERE state='INTENT' AND video_id=ANY($1::uuid[])
+                AND gates->'selection'->>'sha256'=$2 ORDER BY created_at""",
+            [request.target.video_id for request in self._selection.requests],
+            cleanup_selection_stamp(self._selection)["sha256"],
+        )
+
     async def recover(self, *, apply: bool = False) -> dict[str, int]:
         """Converge missing files with committed intents; never unlink in recovery.
 
         Existing/replaced files remain pending for normal re-evaluation. The
         default reports only and creates no audit or domain/journal updates.
         """
+        await self._check_operation()
         counts = {"recovered": 0, "pending": 0, "rejected": 0}
-        rows = await self._pool.fetch("SELECT * FROM cleanup_journal WHERE state='INTENT' ORDER BY created_at")
-        for row in rows:
+        for row in await self._recovery_rows():
             target, missing = safe_cleanup_candidate(self._download_dir, row["path"])
             data = _intent_data(row)
             if data is None or target is None:
@@ -582,6 +662,7 @@ class LocalFileJanitor:
                     current = await conn.fetchval(
                         "SELECT local_path FROM videos WHERE id=$1 FOR UPDATE", row["video_id"]
                     )
+                    await self._lock_selection_contract(conn, row["video_id"])
                     if current != gates["domain_path"] or not await self._single_path_reference(
                         conn, row["video_id"], current
                     ):
@@ -598,6 +679,7 @@ class LocalFileJanitor:
                         continue
                     # Recheck after waiting for locks; recovery must never clear a
                     # newly restored file's domain path.
+                    await self._check_operation()
                     checked, absent = safe_cleanup_candidate(self._download_dir, row["path"])
                     if checked is None or not absent:
                         counts["rejected"] += 1
@@ -627,22 +709,49 @@ class LocalFileJanitor:
     async def cleanup(  # noqa: C901 -- explicit refusal/audit paths
         self, *, apply: bool | None = None
     ) -> dict[str, int]:
+        await self._check_operation()
         apply = self._apply_deletions if apply is None else apply
+        if self._selection is not None and apply:
+            preview = await self.cleanup(apply=False)
+            if preview["eligible"] + preview["already_completed"] != self._selection.expected_count:
+                return preview
+        stop_on_refusal = apply and self._selection is not None
         counts = {"deleted": 0, "missing": 0, "failed": 0, "unsafe": 0, "rejected": 0, "eligible": 0}
-        rows = await self._pool.fetch(
-            """SELECT id, local_path FROM videos
-            WHERE local_path IS NOT NULL AND local_cleanup_after IS NOT NULL AND local_cleanup_after <= now()
-            ORDER BY local_cleanup_after LIMIT $1""",
-            self._batch_size,
-        )
+        if self._selection is None:
+            rows = await self._pool.fetch(
+                """SELECT id, local_path FROM videos
+                WHERE local_path IS NOT NULL AND local_cleanup_after IS NOT NULL AND local_cleanup_after <= now()
+                ORDER BY local_cleanup_after LIMIT $1""",
+                self._batch_size,
+            )
+        else:
+            counts["already_completed"] = 0
+            rows = await self._pool.fetch(
+                "SELECT id,local_path FROM videos WHERE id=ANY($1::uuid[]) ORDER BY id",
+                [request.target.video_id for request in self._selection.requests],
+            )
+            if len(rows) != self._selection.expected_count:
+                raise CleanupApprovalError("CLEANUP_SELECTION_COUNT_MISMATCH")
         for row in rows:
             video_id, path = row["id"], row["local_path"]
+            if self._selection is not None:
+                await self._check_operation()
+                if await self._selected_completed(video_id):
+                    counts["already_completed"] += 1
+                    continue
+                if path != self._selection.request_for(video_id).target.path:
+                    counts["rejected"] += 1
+                    if apply:
+                        return counts
+                    continue
             target, missing = safe_cleanup_candidate(self._download_dir, path)
             if target is None:
                 counts["unsafe"] += 1
                 if apply:
                     async with self._pool.acquire() as conn:
                         await self._audit(conn, video_id, path, "unsafe", False, {"path_containment": False})
+                if stop_on_refusal:
+                    return counts
                 continue
             with ExitStack() as file_handles:
                 async with self._pool.acquire() as conn, conn.transaction():
@@ -651,10 +760,13 @@ class LocalFileJanitor:
                     # Protect the video's recorded path for the whole decision.
                     # The inode lock below remains held through the database commit.
                     current_path = await conn.fetchval("SELECT local_path FROM videos WHERE id=$1 FOR UPDATE", video_id)
+                    await self._lock_selection_contract(conn, video_id)
                     if current_path != path:
                         counts["rejected"] += 1
                         if apply:
                             await self._audit(conn, video_id, path, "rejected", False, {"local_path_unchanged": False})
+                        if stop_on_refusal:
+                            return counts
                         continue
                     locked = None
                     if not missing:
@@ -665,6 +777,8 @@ class LocalFileJanitor:
                             record_cleanup_rejection("no_active_reader")
                             if apply:
                                 await self._audit(conn, video_id, path, "rejected", False, {"no_active_reader": False})
+                            if stop_on_refusal:
+                                return counts
                             continue
                         except (OSError, ValueError):
                             counts["rejected"] += 1
@@ -672,6 +786,8 @@ class LocalFileJanitor:
                                 await self._audit(
                                     conn, video_id, path, "rejected", False, {"filesystem_identity": False}
                                 )
+                            if stop_on_refusal:
+                                return counts
                             continue
                     gates = await self._evaluate(conn, video_id, path, locked.descriptor if locked else None)
                     if not all(gates.values()):
@@ -681,6 +797,8 @@ class LocalFileJanitor:
                                 record_cleanup_rejection(condition)
                         if apply:
                             await self._audit(conn, video_id, path, "rejected", False, gates)
+                        if stop_on_refusal:
+                            return counts
                         continue
                     counts["eligible"] += 1
                     if not apply:
@@ -689,6 +807,8 @@ class LocalFileJanitor:
                     if missing or not target.exists():
                         counts["missing"] += 1
                         await self._audit(conn, video_id, path, "missing", False, {**gates, "committed_intent": False})
+                        if stop_on_refusal:
+                            return counts
                         continue
                     try:
                         if locked is None:
@@ -707,11 +827,14 @@ class LocalFileJanitor:
                         observed = self._fingerprint(target)
                         if observed != {key: value for key, value in fingerprint.items() if key != "sha256"}:
                             raise ValueError("cleanup target changed after intent commit")
+                        await self._check_operation()
                         locked.unlink()
                     except (OSError, ValueError) as exc:
                         counts["failed"] += 1
                         logger.error("cleanup could not remove an approved artifact: %s", type(exc).__name__)
                         await self._audit(conn, video_id, path, "failed", True, {**gates, "error": type(exc).__name__})
+                        if self._selection is not None:
+                            return counts
                         continue
                     counts["deleted"] += 1
                     await conn.execute(
@@ -731,3 +854,20 @@ class LocalFileJanitor:
                         "UPDATE cleanup_journal SET state='COMPLETED',completed_at=now() WHERE id=$1", intent_id
                     )
         return counts
+
+    async def _selected_completed(self, video_id: uuid.UUID) -> bool:
+        """A replay skips only the exact historical operation, including its bytes."""
+        if self._selection is None:
+            return False
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT * FROM cleanup_journal WHERE video_id=$1 AND state='COMPLETED'
+                AND gates->'selection'->>'sha256'=$2 ORDER BY created_at""",
+                video_id,
+                cleanup_selection_stamp(self._selection)["sha256"],
+            )
+            for row in rows:
+                data = _intent_data(row)
+                if data is not None and await self._intent_authorization(conn, row, data[1], data[0]) is not None:
+                    return True
+        return False
