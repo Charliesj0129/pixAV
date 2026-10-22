@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = Field(default="redis://localhost:6379/0", repr=False)
     expected_redis_run_id: str = ""
+    expected_redis_database: int | None = Field(default=None, ge=0)
     system_pause_key: str = "system:pause"
     download_pause_key: str = "pixav:download:pause"
 

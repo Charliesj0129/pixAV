@@ -65,7 +65,7 @@ async def _open_redis(url: str, settings: Settings) -> aioredis.Redis | None:
         logger.warning("redis unavailable at startup (%s)", type(exc).__name__)
         if client is not None:
             await client.aclose()
-        if settings.expected_redis_run_id:
+        if settings.expected_redis_run_id or settings.expected_redis_database is not None:
             raise RuntimeError("Redis instance binding required for configured playback") from None
         return None
 

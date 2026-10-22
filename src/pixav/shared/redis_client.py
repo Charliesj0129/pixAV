@@ -16,12 +16,16 @@ async def create_redis(settings: Settings) -> aioredis.Redis:
         settings.redis_url,
         decode_responses=True,
     )
-    if settings.expected_redis_run_id:
-        try:
+    try:
+        if settings.expected_redis_database is not None:
+            selected = int(client.connection_pool.connection_kwargs.get("db", 0))
+            if selected != settings.expected_redis_database:
+                raise RuntimeError("REDIS_DATABASE_BINDING_CHANGED")
+        if settings.expected_redis_run_id:
             observed = str((await client.info("server")).get("run_id", ""))
             if observed != settings.expected_redis_run_id:
                 raise RuntimeError("REDIS_INSTANCE_BINDING_CHANGED")
-        except BaseException:
-            await client.aclose()
-            raise
+    except BaseException:
+        await client.aclose()
+        raise
     return client

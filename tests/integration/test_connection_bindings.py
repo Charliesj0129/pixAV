@@ -87,3 +87,39 @@ async def test_wrong_database_migration_refuses_before_creating_a_ledger(integra
     with pytest.raises(ValueError, match="database name mismatch"):
         await run_migrations(dsn, expected_database="synthetic_other_database")
     assert await integration_db.fetchval("SELECT to_regclass('public._migrations')") is None
+
+
+@pytest.mark.parametrize("matches", [True, False])
+@pytest.mark.parametrize("pin_run_id", [True, False])
+@pytest.mark.parametrize("runtime", ["worker", "resolver"])
+async def test_redis_startup_refuses_a_different_database_on_the_same_server(
+    integration_redis, matches, pin_run_id, runtime
+):
+    original, _key = integration_redis
+    selected = int(original.connection_pool.connection_kwargs.get("db", 0))
+    identity = (await original.info("server"))["run_id"]
+    settings = Settings(
+        redis_url=os.environ["PIXAV_E2E_REDIS_URL"],
+        expected_redis_run_id=identity if pin_run_id else "",
+        expected_redis_database=selected if matches else selected + 1,
+    )
+    if runtime == "resolver":
+        from pixav.strm_resolver.app import _open_redis
+
+        operation = _open_redis(settings.redis_url, settings)
+    else:
+        operation = create_redis(settings)
+    if not matches:
+        code = "Redis instance binding required" if runtime == "resolver" else "REDIS_DATABASE_BINDING_CHANGED"
+        with pytest.raises(RuntimeError, match=code):
+            unexpected = await operation
+            if unexpected is not None:
+                await unexpected.aclose()
+        return
+    client = await operation
+    try:
+        assert client is not None and await client.ping()
+        assert int(client.connection_pool.connection_kwargs.get("db", 0)) == selected
+    finally:
+        if client is not None:
+            await client.aclose()

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import redis.asyncio as aioredis
+from pydantic import ValidationError
 
 from pixav.config import Settings
 from pixav.shared.redis_client import create_redis
@@ -46,3 +50,40 @@ class TestCreateRedis:
 
         _, kwargs = mock_from_url.call_args
         assert kwargs.get("decode_responses") is True
+
+
+@pytest.mark.parametrize(
+    "url", ["redis://localhost:9/1", "redis://localhost:9/0?db=1", "unix:///tmp/synthetic.sock?db=1"]
+)
+async def test_database_binding_uses_the_actual_url_parser_without_connecting(url):
+    client = await create_redis(Settings(redis_url=url, expected_redis_database=1))
+    try:
+        assert client.connection_pool.connection_kwargs["db"] == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "url", ["redis://localhost:9/0", "redis://localhost:9/1?db=0", "unix:///tmp/synthetic.sock?db=0"]
+)
+async def test_wrong_database_is_closed_before_instance_lookup_or_work(url):
+    client = aioredis.from_url(url)
+    close = AsyncMock(wraps=client.aclose)
+    info = AsyncMock(return_value={"run_id": "a" * 40})
+    with (
+        patch("pixav.shared.redis_client.aioredis.from_url", return_value=client),
+        patch.object(client, "aclose", close),
+        patch.object(client, "info", info),
+    ):
+        try:
+            with pytest.raises(RuntimeError, match="REDIS_DATABASE_BINDING_CHANGED"):
+                await create_redis(Settings(redis_url=url, expected_redis_run_id="a" * 40, expected_redis_database=1))
+            info.assert_not_awaited()
+            close.assert_awaited_once()
+        finally:
+            await client.aclose()
+
+
+def test_negative_database_binding_is_invalid():
+    with pytest.raises(ValidationError):
+        Settings(expected_redis_database=-1)

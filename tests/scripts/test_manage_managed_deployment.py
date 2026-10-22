@@ -519,6 +519,73 @@ def test_authority_profile_binds_separate_role_secrets_and_exact_instances(autho
     )
 
 
+def test_authority_redis_database_requires_matching_operator_selection(authority_config):
+    config, args = authority_config
+    args.redis_database = 1
+    with pytest.raises(ValueError, match="AUTHORITY_EXECUTION_BINDING_INVALID"):
+        module.validate_application(config, args)
+    config["services"]["maxwell_core"]["environment"]["PIXAV_EXPECTED_REDIS_DATABASE"] = "1"
+    module.validate_application(config, args)
+
+
+def test_negative_operator_redis_database_is_refused(authority_config):
+    config, args = authority_config
+    args.redis_database = -1
+    with pytest.raises(ValueError, match="REDIS_DATABASE_BINDING_INVALID"):
+        module.validate_application(config, args)
+
+
+@pytest.mark.parametrize("database", [None, "1"])
+def test_real_compose_binds_redis_database_for_all_application_profiles(tmp_path, database):
+    import json
+    import os
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    binary = shutil.which("docker")
+    if binary is None:
+        pytest.skip("Docker Compose CLI is needed for the actual interpolation contract")
+    repository = Path(__file__).resolve().parents[2]
+    private = tmp_path / "synthetic.env"
+    values = {
+        "PIXAV_MANAGED_PROJECT": "pixav-managed-synthetic",
+        "PIXAV_MANAGED_STAGING_HOST_ROOT": str(tmp_path / "staging"),
+        "PIXAV_MANAGED_WINDOWS_TOOLS_IMAGE": "sha256:" + "a" * 64,
+        "PIXAV_ANDROID_SERIAL": "emulator-5554",
+        "PIXAV_STORAGE_WORKER_OWNER": "11111111-1111-4111-8111-111111111111",
+        "PIXAV_STORAGE_WINDOWS_RUNTIME_ID": "22222222-2222-4222-8222-222222222222",
+        "PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION": "7",
+    }
+    if database is not None:
+        values["PIXAV_EXPECTED_REDIS_DATABASE"] = database
+    private.write_text("".join(key + "=" + value + "\n" for key, value in values.items()))
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PIXAV_")}
+    result = subprocess.run(  # noqa: S603 - config only, no daemon or operator data
+        [
+            binary,
+            "compose",
+            "--env-file",
+            str(private),
+            "-f",
+            str(repository / "docker-compose.managed.yml"),
+            "--profile",
+            "*",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    services = json.loads(result.stdout)["services"]
+    for name in ("maxwell_core", "storage_worker", "playback_worker", "media_loader", "strm_resolver"):
+        assert services[name]["environment"]["PIXAV_EXPECTED_REDIS_DATABASE"] == (database or "0")
+
+
 @pytest.mark.parametrize("defect", ["admin-secret", "legacy-mode", "wrong-run-id", "raw-password", "database-mount"])
 def test_authority_profile_refuses_privilege_and_identity_drift(authority_config, defect):
     config, args = authority_config

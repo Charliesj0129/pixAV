@@ -498,6 +498,7 @@ def validate_resolver(config: dict, service: dict, args: argparse.Namespace) -> 
         **PRIVATE_PROXY_ENV,
         "PIXAV_DB_USER": "pixav_reader",
         "PIXAV_EXPECTED_REDIS_RUN_ID": args.redis_run_id,
+        "PIXAV_EXPECTED_REDIS_DATABASE": str(getattr(args, "redis_database", 0)),
         "PIXAV_MANAGED_MEDIA_WORKFLOW": "true",
         "PIXAV_PIXEL_INJECTOR_MODE": "windows_android",
         "PIXAV_RESOLVER_REQUIRE_READER_ROLE": "true",
@@ -785,6 +786,9 @@ def validate_media(config: dict, service: dict, args: argparse.Namespace) -> Non
 
 def validate_application(config: dict, args: argparse.Namespace) -> None:  # noqa: C901 -- fixed managed roles
     profile = args.profile
+    redis_database = getattr(args, "redis_database", 0)
+    if type(redis_database) is not int or redis_database < 0:
+        raise ValueError("REDIS_DATABASE_BINDING_INVALID")
     expected = {
         "schema": {"migrate", "provision"},
         "authority": {"maxwell_core"},
@@ -892,6 +896,7 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
             if (
                 not args.redis_run_id
                 or env.get("PIXAV_EXPECTED_REDIS_RUN_ID") != args.redis_run_id
+                or env.get("PIXAV_EXPECTED_REDIS_DATABASE") != str(redis_database)
                 or env.get("PIXAV_DB_USER") != ("pixav_authority" if profile == "authority" else "pixav_worker")
                 or env.get("PIXAV_MANAGED_MEDIA_WORKFLOW") != "true"
                 or env.get("PIXAV_PIXEL_INJECTOR_MODE") != "windows_android"
@@ -1075,6 +1080,9 @@ def main() -> None:
     parser.add_argument("--db-identity")
     parser.add_argument("--database")
     parser.add_argument("--redis-run-id")
+    parser.add_argument(
+        "--redis-database", type=int, default=0, help="expected Redis logical DB selected by the private URL"
+    )
     parser.add_argument("--compose-file", type=Path, default=Path("docker-compose.managed.yml"))
     args = parser.parse_args()
     try:

@@ -124,6 +124,27 @@ async def test_resolver_refuses_mismatched_bound_redis_before_opening_database(m
     assert "redis://synthetic" not in caplog.text
 
 
+async def test_resolver_refuses_database_drift_with_only_database_binding(monkeypatch, caplog):
+    from pixav.config import Settings
+
+    settings = Settings(expected_redis_database=1)
+    monkeypatch.setattr("pixav.strm_resolver.app.get_settings", lambda: settings)
+    app = create_app(redis_url="redis://synthetic/0", db_dsn="postgresql://synthetic")
+    redis = AsyncMock()
+    redis.connection_pool.connection_kwargs = {"db": 0}
+    with (
+        patch("pixav.strm_resolver.app.aioredis.from_url", return_value=redis),
+        patch("pixav.strm_resolver.app._open_database", return_value=AsyncMock()) as database,
+    ):
+        with pytest.raises(RuntimeError, match="Redis instance binding required"):
+            async with lifespan(app):
+                pytest.fail("resolver must not ignore a different Redis database")
+    database.assert_not_awaited()
+    redis.info.assert_not_awaited()
+    redis.aclose.assert_awaited_once()
+    assert "redis://synthetic/0" not in caplog.text
+
+
 @pytest.mark.parametrize(
     "field",
     [
