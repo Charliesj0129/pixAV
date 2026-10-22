@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import stat
 import subprocess
@@ -239,8 +240,53 @@ def validate_tools(config: dict) -> None:
         raise ValueError("WINDOWS_TOOLS_HEALTH_OR_TMPFS_INVALID")
 
 
+def validate_prepared_postgres_root(root: Path, data_root: Path, secrets_root: Path, uid: int) -> None:
+    """Check a separately approved bind without initializing or altering it."""
+    for directory in [root, root / "pgdata", root / "pgdata/global"]:
+        if (
+            not directory.is_absolute()
+            or directory.resolve() != directory
+            or not directory.is_dir()
+            or directory.stat().st_uid != uid
+            or stat.S_IMODE(directory.stat().st_mode) != 0o700
+        ):
+            raise ValueError("CORE_PREPARED_POSTGRES_ROOT_REQUIRED")
+    for other in [data_root / "redis", secrets_root]:
+        if root.is_relative_to(other) or other.is_relative_to(root) or root.samefile(other):
+            raise ValueError("CORE_POSTGRES_ROOT_OVERLAPS_PROTECTED_DATA")
+    for marker in [root / "pgdata/PG_VERSION", root / "pgdata/global/pg_control"]:
+        try:
+            observed = marker.lstat()
+        except OSError:
+            raise ValueError("CORE_PREPARED_POSTGRES_MARKERS_REQUIRED") from None
+        if not stat.S_ISREG(observed.st_mode) or observed.st_uid != uid or observed.st_size <= 0:
+            raise ValueError("CORE_PREPARED_POSTGRES_MARKERS_REQUIRED")
+    version = root / "pgdata/PG_VERSION"
+    descriptor = os.open(version, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOATIME)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != uid
+            or opened.st_size > 16
+            or os.read(descriptor, 17).strip() != b"16"
+        ):
+            raise ValueError("CORE_PREPARED_POSTGRES_VERSION_INVALID")
+        named = version.lstat()
+        if (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns, named.st_ctime_ns) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ):
+            raise ValueError("CORE_PREPARED_POSTGRES_MARKER_CHANGED")
+    finally:
+        os.close(descriptor)
+
+
 def validate_core(  # noqa: C901 -- explicit deployment refusals
-    config: dict, data_root: Path, secrets_root: Path
+    config: dict, data_root: Path, secrets_root: Path, *, postgres_host_root: Path | None = None
 ) -> None:
     if set(config["services"]) != set(CORE_IMAGES) or not config.get("networks", {}).get("core", {}).get("internal"):
         raise ValueError("CORE_PROFILE_ISOLATION_INVALID")
@@ -280,7 +326,7 @@ def validate_core(  # noqa: C901 -- explicit deployment refusals
             raise ValueError("CORE_RESOURCE_OR_HEALTH_INVALID")
         mounts = service.get("volumes", [])
         target = "/var/lib/postgresql/data" if name == "postgres" else "/data"
-        source = data_root / name
+        source = postgres_host_root if name == "postgres" and postgres_host_root is not None else data_root / name
         if (
             len(mounts) != 1
             or mounts[0].get("type") != "bind"
@@ -293,6 +339,8 @@ def validate_core(  # noqa: C901 -- explicit deployment refusals
             or source.stat().st_uid != int(service["user"].split(":")[0])
         ):
             raise ValueError("CORE_DATA_BIND_INVALID")
+        if name == "postgres" and postgres_host_root is not None:
+            validate_prepared_postgres_root(source, data_root, secrets_root, int(service["user"].split(":")[0]))
         expected_secrets = ["postgres_password"] if name == "postgres" else ["redis_config", "redis_password"]
         if {row["source"] for row in service.get("secrets", [])} != set(expected_secrets):
             raise ValueError("CORE_SECRET_BINDING_INVALID")
@@ -913,6 +961,9 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
 def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and identity checks before deployment
     if not PROJECT.fullmatch(args.project):
         raise ValueError("MANAGED_PROJECT_REQUIRED")
+    profile = getattr(args, "profile", "windows-tools")
+    if getattr(args, "postgres_host_root", None) is not None and profile != "core":
+        raise ValueError("POSTGRES_HOST_ROOT_REQUIRES_CORE_PROFILE")
     private = args.env_file
     if (
         private.resolve() != private
@@ -939,11 +990,12 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
     config = json.loads(run([*compose, "config", "--format", "json"]))
     if config.get("name") != args.project:
         raise ValueError("MANAGED_PROJECT_BINDING_CHANGED")
-    profile = getattr(args, "profile", "windows-tools")
     if profile == "core":
         if args.data_root is None or args.secrets_root is None:
             raise ValueError("CORE_EXPLICIT_ROOTS_REQUIRED")
-        validate_core(config, args.data_root, args.secrets_root)
+        validate_core(
+            config, args.data_root, args.secrets_root, postgres_host_root=getattr(args, "postgres_host_root", None)
+        )
     elif profile == "windows-tools":
         validate_tools(config)
     elif profile in {"vpn", "torrent"}:
@@ -977,6 +1029,7 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
         "containers_started": 0,
         "database_touched": False,
         "runtime_instances_verified": False,
+        "postgres_root_explicit": getattr(args, "postgres_host_root", None) is not None,
         "golden_path": "OPEN",
     }
 
@@ -1005,6 +1058,7 @@ def main() -> None:
         default="windows-tools",
     )
     parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--postgres-host-root", type=Path, help="explicit prepared PostgreSQL bind; core profile only")
     parser.add_argument("--secrets-root", type=Path)
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--staging-root", type=Path)

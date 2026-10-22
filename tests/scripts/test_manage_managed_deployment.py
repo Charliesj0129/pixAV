@@ -161,6 +161,9 @@ def core_config(tmp_path):
     manifest["secrets"] = {
         name: manifest["secrets"][name] for name in ["postgres_password", "redis_config", "redis_password"]
     }
+    # Security fixtures represent an already resolved Compose model. The
+    # actual nested default/override contract is exercised with Compose below.
+    manifest["services"]["postgres"]["volumes"][0]["source"] = str(data / "postgres")
     replacements = {
         "PIXAV_MANAGED_DATA_ROOT": str(data),
         "PIXAV_MANAGED_SECRETS_ROOT": str(secrets),
@@ -186,6 +189,217 @@ def test_core_manifest_keeps_credentials_in_files_and_selects_only_infrastructur
     config, _, _ = core_config
     assert set(config["services"]) == {"postgres", "redis"}
     assert config["services"]["postgres"]["environment"]["PGDATA"].endswith("/pgdata")
+
+
+@pytest.fixture
+def restored_postgres(tmp_path):
+    root = tmp_path / "restored-postgres"
+    (root / "pgdata/global").mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    (root / "pgdata").chmod(0o700)
+    (root / "pgdata/PG_VERSION").write_text("16\n")
+    (root / "pgdata/global/pg_control").write_bytes(b"synthetic control marker; not a valid live cluster")
+    return root
+
+
+def test_core_accepts_only_the_explicit_prepared_postgres_bind_without_changing_redis(core_config, restored_postgres):
+    config, data, secrets = core_config
+    pg = config["services"]["postgres"]
+    pg["volumes"][0]["source"] = str(restored_postgres)
+    paths = list(restored_postgres.rglob("*")) + [restored_postgres, data / "redis"]
+
+    def metadata():
+        return {
+            str(path): (tuple(path.stat()), path.stat().st_atime_ns, path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+            for path in paths
+        }
+
+    before = metadata()
+    module.validate_core(config, data, secrets, postgres_host_root=restored_postgres)
+    assert metadata() == before
+    assert config["services"]["redis"]["volumes"][0]["source"] == str(data / "redis")
+    with pytest.raises(ValueError, match="CORE_DATA_BIND_INVALID"):
+        module.validate_core(config, data, secrets)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "empty",
+        "major",
+        "oversized-version",
+        "symlink-root",
+        "symlink-version",
+        "symlink-control",
+        "public-root",
+        "redis-overlap",
+        "secret-overlap",
+        "missing-control",
+        "wrong-user",
+    ],
+)
+def test_separate_postgres_root_refuses_unprepared_or_unsafe_locations(
+    core_config, restored_postgres, tmp_path, defect
+):
+    import os
+    import shutil
+
+    config, data, secrets = core_config
+    root = restored_postgres
+    if defect == "empty":
+        root = tmp_path / "empty"
+        root.mkdir(mode=0o700)
+    elif defect == "major":
+        (root / "pgdata/PG_VERSION").write_text("17\n")
+    elif defect == "oversized-version":
+        (root / "pgdata/PG_VERSION").write_bytes(b"16" + b" " * 64)
+    elif defect == "symlink-root":
+        root = tmp_path / "alias"
+        root.symlink_to(restored_postgres, target_is_directory=True)
+    elif defect in {"symlink-version", "symlink-control"}:
+        path = root / ("pgdata/PG_VERSION" if defect == "symlink-version" else "pgdata/global/pg_control")
+        retained = path.with_name(path.name + ".retained")
+        path.rename(retained)
+        path.symlink_to(retained)
+    elif defect == "public-root":
+        root.chmod(0o755)
+    elif defect in {"redis-overlap", "secret-overlap"}:
+        root = data / "redis" if defect == "redis-overlap" else secrets
+        root.chmod(0o700)
+        shutil.copytree(restored_postgres / "pgdata", root / "pgdata")
+    elif defect == "missing-control":
+        (root / "pgdata/global/pg_control").unlink()
+    elif defect == "wrong-user":
+        config["services"]["postgres"]["user"] = f"{os.getuid()+1}:{os.getgid()}"
+    config["services"]["postgres"]["volumes"][0]["source"] = str(root)
+    with pytest.raises(ValueError):
+        module.validate_core(config, data, secrets, postgres_host_root=root)
+
+
+def test_prepared_postgres_marker_replacement_is_preserved_and_refused(core_config, restored_postgres, monkeypatch):
+    import os
+
+    config, data, secrets = core_config
+    config["services"]["postgres"]["volumes"][0]["source"] = str(restored_postgres)
+    version = restored_postgres / "pgdata/PG_VERSION"
+    retained = version.with_suffix(".retained")
+    read = os.read
+
+    def replace(descriptor, count):
+        version.rename(retained)
+        version.write_text("16\n")
+        return read(descriptor, count)
+
+    monkeypatch.setattr(module.os, "read", replace)
+    with pytest.raises(ValueError, match="MARKER_CHANGED"):
+        module.validate_core(config, data, secrets, postgres_host_root=restored_postgres)
+    assert retained.is_file() and version.is_file()
+
+
+def test_preflight_forwards_the_approved_postgres_root_without_starting_services(
+    core_config, restored_postgres, tmp_path, monkeypatch
+):
+    import json
+
+    config, data, secrets = core_config
+    config["name"] = "pixav-managed-synthetic"
+    config["services"]["postgres"]["volumes"][0]["source"] = str(restored_postgres)
+    private = tmp_path / "managed.env"
+    private.write_text("")
+    private.chmod(0o600)
+    tmp_path.chmod(0o700)
+    args = SimpleNamespace(
+        project=config["name"],
+        context="default",
+        daemon_id="synthetic-daemon",
+        env_file=private,
+        compose_file=tmp_path / "compose.yml",
+        profile="core",
+        data_root=data,
+        secrets_root=secrets,
+        postgres_host_root=restored_postgres,
+    )
+    calls = []
+
+    def command(argv):
+        calls.append(argv)
+        if "info" in argv:
+            return json.dumps(args.daemon_id)
+        if "config" in argv:
+            return json.dumps(config)
+        if "image" in argv:
+            return "sha256:" + "a" * 64
+        if "ps" in argv:
+            return ""
+        pytest.fail("preflight attempted a mutation")
+
+    monkeypatch.setattr(module, "run", command)
+    result = module.preflight(args)
+    assert result["postgres_root_explicit"] and result["containers_started"] == 0 and not result["database_touched"]
+    assert all("up" not in argv and "start" not in argv and "exec" not in argv for argv in calls)
+
+
+def test_postgres_root_option_cannot_be_ignored_by_a_noncore_profile(restored_postgres, monkeypatch):
+    monkeypatch.setattr(module, "run", lambda argv: pytest.fail("invalid profile reached Docker"))
+    args = SimpleNamespace(project="pixav-managed-synthetic", profile="authority", postgres_host_root=restored_postgres)
+    with pytest.raises(ValueError, match="REQUIRES_CORE_PROFILE"):
+        module.preflight(args)
+
+
+@pytest.mark.parametrize("setting", ["unset", "empty", "separate"])
+def test_real_compose_resolves_postgres_root_separately_from_other_data(tmp_path, restored_postgres, setting):
+    import json
+    import os
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    binary = shutil.which("docker")
+    if binary is None:
+        pytest.skip("Docker Compose CLI is needed for the actual interpolation contract")
+    repository = Path(__file__).resolve().parents[2]
+    data = tmp_path / "data"
+    values = {
+        "PIXAV_MANAGED_PROJECT": "pixav-managed-synthetic",
+        "PIXAV_MANAGED_DATA_ROOT": str(data),
+        "PIXAV_MANAGED_SECRETS_ROOT": str(tmp_path / "secrets"),
+        "PIXAV_MANAGED_STAGING_HOST_ROOT": str(tmp_path / "staging"),
+        "PIXAV_MANAGED_WINDOWS_TOOLS_IMAGE": "sha256:" + "a" * 64,
+        "PIXAV_ANDROID_SERIAL": "emulator-5554",
+        "PIXAV_STORAGE_WORKER_OWNER": "11111111-1111-4111-8111-111111111111",
+        "PIXAV_STORAGE_WINDOWS_RUNTIME_ID": "22222222-2222-4222-8222-222222222222",
+        "PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION": "7",
+    }
+    if setting != "unset":
+        values["PIXAV_MANAGED_POSTGRES_HOST_ROOT"] = str(restored_postgres) if setting == "separate" else ""
+    private = tmp_path / "synthetic.env"
+    private.write_text("".join(key + "=" + value + "\n" for key, value in values.items()))
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PIXAV_")}
+    result = subprocess.run(  # noqa: S603 - config-only CLI, fixed recipe and synthetic paths; no daemon/data mutation
+        [
+            binary,
+            "compose",
+            "--env-file",
+            str(private),
+            "-f",
+            str(repository / "docker-compose.managed.yml"),
+            "--profile",
+            "core",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    config = json.loads(result.stdout)
+    assert set(config["services"]) == {"postgres", "redis"}
+    expected = restored_postgres if setting == "separate" else data / "postgres"
+    assert config["services"]["postgres"]["volumes"][0]["source"] == str(expected)
+    assert config["services"]["redis"]["volumes"][0]["source"] == str(data / "redis")
 
 
 @pytest.mark.parametrize(
