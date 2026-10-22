@@ -6,7 +6,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 
 - 開始前讀相關 `.agent/skills/`、`.agent/workflows/` 與 `user_rules.md`；不存在時記錄並繼續，不虛構 workflow。
 - 核對 worktree，先讀實際 repository、callers、測試、migration、Compose 與可核實 runtime evidence；保留既有程式修改。區分目標契約、目前實作、隔離證據與 production 驗收。
-- 舊 application Compose／start_workers 與 first-4k 啟動入口已退休；獨立 Android runner 與 CI integration Compose 保留。新 managed Compose 依已驗收 profile 分段接入，目前有 `windows-tools`、僅含 PostgreSQL／Redis 的 `core`、schema／authority、storage／playback、vpn／torrent／media、`resolver` 與 `library` profiles。部分隔離驗證已完成，完整應用部署／Windows upload adapter 另行驗收，不復活舊 executor 或重播舊 queue。
+- 舊 application Compose／start_workers 與 first-4k 啟動入口已退休；獨立 Android runner 與 CI integration Compose 保留。新 managed Compose 依已驗收 profile 分段接入，目前有 `windows-tools`、僅含 PostgreSQL／Redis 的 `core`、schema／authority、storage／playback、vpn／torrent／media、`resolver` 與 `library` profiles。部分隔離驗證已完成，完整應用部署／Windows upload adapter 另行驗收，不復活舊 executor 或重播舊 queue。舊 [Docker canary](src/pixav/pixel_injector/canary.py) CLI 及 provision／source probe／preflight helper 一律在操作 I/O 前拒絕；保留 collectors 使用的 models、私有 evidence 與 ownership helpers，不能以舊 entry 建 guest、讀寫 checkpoint 或清除 volumes。
 - Windows 開發環境採 Windows Android Emulator + Docker Runner，WSL／Docker Desktop 使用 Microsoft 提供的 WSL kernel。操作者已回報 `bzImage-6.6.87.2-pixav-redroid` 的 `.wslconfig` kernel override 造成相容性問題；不得把修改全域 kernel、載入 binder 或 privileged redroid guest 作為開發前置。設定範圍、ADB／Maestro 與遷移守衛見 README。
 - 維持 README、AGENTS、CLAUDE 三份核心文件，不新增 roadmap、CODEMAPS、ADR、實驗流水帳、archive 或轉址頁。外來規格整合進 README 並保留情境對應；文件刪改直接進行，不建立文件備份，同步修正引用。
 - 文件採中性用語與合成媒體，不放來源名稱、連結、作品識別資料或相關圖片；實際程式路徑、參數、設定鍵保留原名。私有 evidence 不變成公開文件或 fixture。
@@ -59,7 +59,7 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - Android 帳號以 `Accounts:` 與實際 Account rows 核對，不把 authenticator 註冊算成已登入帳號。人工 scrcpy bootstrap 期間維持 system pause 並停止 native managed control；交回前核對及關閉 exact controller／Android child，重驗 quiescence 與當次 enrollment，避免並行 UI writer。
 - Windows environment v1／v2 保留舊 launch 與 canonical identity；4 核心／4096 MiB／host GPU 使用明確 v3 欄位並重建 identity／generation，不以隱含預設接受新配置。當次 SDK／AVD／APK、process／boot、檔案 sharing 與 UI quiescence 證據不得代替 registry enrollment 或原 guest／operation reconciliation。
 - 原帳號 cold 模式只接受私有 cookie-only secret reference，經 stdin 傳入新 context；child 僅掛空白工作目錄。登入收據須核對帳號／owner／item／session／原件 digest 與完整解碼，不以匿名歷史收據補齊新契約；UI 鎖失聯先停止 exact child，不能留下仍操作帳號的背景下載。
-- 人工瀏覽器登入使用全新私有 profile 與 exact process 的 loopback 控制入口，先核對 Windows ACL；不讀既有 profile、不自動提交帳密、不記錄登入畫面。操作者完成後重驗原 DB／Android／瀏覽器帳號 binding，僅匯出必要 cookies，不把 producer profile 傳給 cold child。
+- 人工瀏覽器登入先核對全新私有 profile 的 Windows ACL，登入期間不開遠端控制介面；不讀個人既有 profile、不自動提交帳密、不記錄登入畫面。操作者確認完成後才交回該專用 browser，於 exact process 的 loopback 入口重驗原 DB／Android／瀏覽器帳號 binding，僅匯出必要 cookies，再核對 producer／SDK child／listener 已停止。producer profile 不傳給 cold child；獨立 cookie-only context 登入成功不代表原件回載或 operation reconciliation 通過。
 - 新 adapter/服務在 README 記錄 timeout、health/metrics、secret 管理、版本/license、volume、資源限制、備份與 rollback；外部契約須實測。migration 先驗 expand/contract 與 restore，不讓不相容的舊 process 繼續執行。
 
 ## 驗證
