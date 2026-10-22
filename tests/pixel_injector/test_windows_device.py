@@ -216,6 +216,138 @@ async def test_lost_ui_heartbeat_stops_exact_tools_then_original_native_writers(
     uploader.save.assert_awaited_once()
 
 
+@pytest.mark.parametrize("phase", ["tools", "native", "effect"])
+async def test_repeated_cancellation_finishes_the_original_halt_and_io_before_returning(
+    windows_upload, tmp_path, phase
+):
+    import asyncio
+
+    from pixav.shared.media_file import open_media_file
+
+    uploader, device = windows_upload
+    loop = asyncio.get_running_loop()
+    source = tmp_path / "synthetic.mp4"
+    source.write_bytes(b"synthetic")
+    effect_started = asyncio.Event()
+    effect_release = threading.Event()
+    effect_finished = threading.Event()
+    tools_started = asyncio.Event()
+    tools_release = threading.Event()
+    native_started = asyncio.Event()
+    native_release = asyncio.Event()
+    native_finished = asyncio.Event()
+    native_cancelled = asyncio.Event()
+    if phase != "tools":
+        tools_release.set()
+    if phase != "native":
+        native_release.set()
+
+    def effect():
+        with open_media_file(source):
+            loop.call_soon_threadsafe(effect_started.set)
+            assert effect_release.wait(10)
+        effect_finished.set()
+
+    def stop_tools(**kwargs):
+        loop.call_soon_threadsafe(tools_started.set)
+        assert tools_release.wait(10)
+        device.runner.status = "exited"
+
+    async def stop_native(session):
+        assert session == device.session
+        native_started.set()
+        try:
+            await native_release.wait()
+        except asyncio.CancelledError:
+            native_cancelled.set()
+            raise
+        native_finished.set()
+
+    device.runner.stop = stop_tools
+    device._stop_native = stop_native
+    task = asyncio.create_task(uploader._io(effect))
+    try:
+        await asyncio.wait_for(effect_started.wait(), 5)
+        task.cancel()
+        barrier = {"tools": tools_started, "native": native_started, "effect": native_finished}[phase]
+        await asyncio.wait_for(barrier.wait(), 5)
+        task.cancel()
+        # Deliver cancellation at the deliberately blocked await, without
+        # releasing any of the operations it must still drain.
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert not task.done(), "caller returned while an original writer was still active"
+        assert not native_cancelled.is_set(), "repeat cancellation reached the halt operation"
+        if phase == "tools":
+            assert not native_started.is_set(), "native halt overtook the unfinished tools stop"
+        with pytest.raises(BlockingIOError), open_media_file(source, exclusive=True):
+            pytest.fail("the in-flight reader lost its lock")
+        tools_release.set()
+        native_release.set()
+        await asyncio.wait_for(native_finished.wait(), 5)
+        task.cancel()
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert not task.done() and not effect_finished.is_set()
+        effect_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert effect_finished.is_set()
+        with open_media_file(source, exclusive=True):
+            pass
+    finally:
+        tools_release.set()
+        native_release.set()
+        effect_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancelled_io_keeps_cancellation_and_drains_after_an_unconfirmed_native_halt(windows_upload):
+    import asyncio
+
+    uploader, device = windows_upload
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    halting = asyncio.Event()
+    halt_release = asyncio.Event()
+    halt_failed = asyncio.Event()
+
+    def effect():
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(10)
+        finished.set()
+
+    async def halt(session):
+        halting.set()
+        await halt_release.wait()
+        halt_failed.set()
+        raise CanaryBlockedError("synthetic native halt remains unconfirmed")
+
+    device._stop_native = halt
+    task = asyncio.create_task(uploader._io(effect))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.wait_for(halting.wait(), 5)
+        task.cancel()
+        halt_release.set()
+        await asyncio.wait_for(halt_failed.wait(), 5)
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert not task.done() and not finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert finished.is_set()
+        assert set(uploader.recovery) == {"runtime_binding"}
+    finally:
+        halt_release.set()
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_native_stop_is_attempted_even_when_tools_stop_fails(windows_upload):
     _, device = windows_upload
     device.runner.stop.side_effect = RuntimeError("synthetic tools stop failure")

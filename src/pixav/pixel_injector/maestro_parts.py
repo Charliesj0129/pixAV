@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -168,20 +169,40 @@ class MaestroPartUploader:
                 self.check()
                 if done:
                     return task.result()
-        except BaseException:
+        except BaseException as failure:
             # Stopping only the CLI/ADB connection does not stop an in-guest cp.
-            # Preserve both owned containers and /data, while halting their writes.
-            try:
-                if self.windows_device is not None:
-                    await self.windows_device.halt()
-                else:
-                    self.guard(RedroidSession(self.owner, self.guest.id, "127.0.0.1", 5555))
-                    for item in (self.runner, self.guest):
-                        await asyncio.to_thread(item.stop, timeout=10)
-            finally:
-                if task is not None:
-                    await asyncio.gather(task, return_exceptions=True)
+            # An independent cleanup task also survives repeat cancellation of
+            # this caller. Do not leave the UI scope until its original I/O ends.
+            await self._finish_interrupted_io(task, cancelled=isinstance(failure, asyncio.CancelledError))
             raise
+
+    async def _finish_interrupted_io(self, task: asyncio.Task | None, *, cancelled: bool) -> None:
+        cleanup = asyncio.create_task(self._halt_and_drain(task))
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        if cancelled:
+            with suppress(asyncio.CancelledError, Exception):
+                cleanup.result()
+            raise asyncio.CancelledError from None
+        cleanup.result()
+
+    async def _halt_and_drain(self, task: asyncio.Task | None) -> None:
+        """Preserve the owned resources, stop both writers, then reap original I/O."""
+        try:
+            if self.windows_device is not None:
+                await self.windows_device.halt()
+            else:
+                self.guard(RedroidSession(self.owner, self.guest.id, "127.0.0.1", 5555))
+                for item in (self.runner, self.guest):
+                    await asyncio.to_thread(item.stop, timeout=10)
+        finally:
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
 
     async def receipt(self, kind: str, *, complete: bool = False) -> None:
         """Persist only operation names, timestamps and verified identity facts."""
