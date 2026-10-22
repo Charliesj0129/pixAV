@@ -168,12 +168,12 @@ def cached_part():
     )
 
 
-@pytest.mark.parametrize("artifact", ["receipt", "file", "partial"])
+@pytest.mark.parametrize("artifact", ["receipt", "file", "partial", "receipt-pending"])
 def test_incomplete_cloud_cache_is_preserved_before_browser_retry(tmp_path, artifact, browser_stub):
     from pixav.pixel_injector.parts_download import download_original
 
     part = cached_part()
-    suffix = {"receipt": ".json", "file": "", "partial": ".part"}[artifact]
+    suffix = {"receipt": ".json", "file": "", "partial": ".part", "receipt-pending": ".json.pending"}[artifact]
     original = tmp_path / (part.filename + suffix)
     original.write_bytes(b"incomplete evidence")
     with patch.object(browser_stub, "sync_playwright", side_effect=RuntimeError("browser retry reached")):
@@ -325,3 +325,158 @@ def test_ambiguous_album_cannot_select_an_arbitrary_video(tmp_path, original_bro
     download.save_as.assert_not_called()
     assert not (tmp_path / part.filename).exists()
     browser.close.assert_called_once()
+
+
+@pytest.mark.parametrize("fault", [None, "replacement", "in-place", "receipt-change"])
+def test_cached_original_holds_media_and_receipt_until_final_observation(tmp_path, monkeypatch, browser_stub, fault):
+    import json
+    import os
+
+    from pixav.pixel_injector.canary_download import OriginalWorkConflictError
+    from pixav.shared.media_file import open_media_file
+
+    part = cached_part()
+    original = tmp_path / part.filename
+    original.write_bytes(b"original")
+    receipt = tmp_path / (part.filename + ".json")
+    stored = {"sha256": part.sha256, "size": part.size_bytes, "method": "photos-original-browser"}
+    receipt.write_text(json.dumps(stored))
+
+    def observe(path):
+        assert path == original
+        if fault is None:
+            for retained in (original, receipt):
+                with pytest.raises(BlockingIOError), open_media_file(retained, exclusive=True):
+                    pytest.fail("cached read-back released a session input early")
+        elif fault == "replacement":
+            original.rename(tmp_path / "retained-original.mp4")
+            original.write_bytes(b"original")
+        elif fault == "in-place":
+            before = original.stat()
+            original.write_bytes(b"original")
+            os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+        else:
+            receipt.write_text(json.dumps({**stored, "browser": "changed evidence"}))
+        return OBSERVED
+
+    monkeypatch.setattr(parts_download, "observed_media", observe)
+    if fault:
+        with pytest.raises(OriginalWorkConflictError):
+            parts_download.download_original(part, tmp_path)
+    else:
+        assert parts_download.download_original(part, tmp_path) == {**stored, "observed": OBSERVED}
+    browser_stub.sync_playwright.assert_not_called()
+    assert original.read_bytes() == b"original"
+    assert receipt.exists()
+
+
+@pytest.mark.parametrize("fault", [None, "replacement"])
+def test_fresh_original_stays_locked_until_receipt_publication(tmp_path, monkeypatch, original_browser, fault):
+    import json
+
+    from pixav.pixel_injector.canary_download import OriginalWorkConflictError
+    from pixav.shared.media_file import open_media_file
+
+    part, _, _, _ = original_browser
+    original = tmp_path / part.filename
+    receipt = tmp_path / (part.filename + ".json")
+
+    def locked():
+        with pytest.raises(BlockingIOError), open_media_file(original, exclusive=True):
+            pytest.fail("new read-back released the original before its receipt")
+
+    def observe(path):
+        assert path == original
+        if fault:
+            original.rename(tmp_path / "retained-original.mp4")
+            original.write_bytes(b"original")
+        else:
+            locked()
+        return OBSERVED
+
+    dump = json.dump
+
+    def commit(*args, **kwargs):
+        locked()
+        return dump(*args, **kwargs)
+
+    monkeypatch.setattr(parts_download, "observed_media", observe)
+    monkeypatch.setattr(parts_download.json, "dump", commit)
+    with patch("signal.alarm"):
+        if fault:
+            with pytest.raises(OriginalWorkConflictError):
+                parts_download.download_original(part, tmp_path)
+            assert not receipt.exists()
+            assert list(tmp_path.glob("browser-*/original.mp4"))[0].read_bytes() == b"original"
+        else:
+            report = parts_download.download_original(part, tmp_path)
+            assert json.loads(receipt.read_text()) == report
+            assert receipt.stat().st_mode & 0o777 == 0o600
+
+
+def test_interrupted_original_receipt_retains_pending_and_browser_work(
+    tmp_path, monkeypatch, original_browser, observed_stub
+):
+    part, _, _, _ = original_browser
+
+    def interrupted(report, handle):
+        handle.write('{"partial":')
+        raise RuntimeError("synthetic interrupted receipt")
+
+    monkeypatch.setattr(parts_download.json, "dump", interrupted)
+    with patch("signal.alarm"), pytest.raises(RuntimeError, match="interrupted receipt"):
+        parts_download.download_original(part, tmp_path)
+    assert not (tmp_path / (part.filename + ".json")).exists()
+    pending = tmp_path / (part.filename + ".json.pending")
+    assert pending.read_text() == '{"partial":'
+    assert pending.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / part.filename).read_bytes() == b"original"
+    assert list(tmp_path.glob("browser-*/original.mp4"))[0].read_bytes() == b"original"
+
+
+def test_original_change_during_receipt_write_cannot_publish_success(
+    tmp_path, monkeypatch, original_browser, observed_stub
+):
+    import json
+
+    from pixav.pixel_injector.canary_download import OriginalWorkConflictError
+
+    part, _, _, _ = original_browser
+    original = tmp_path / part.filename
+    dump = json.dump
+
+    def replace(report, handle):
+        dump(report, handle)
+        original.rename(tmp_path / "retained-original.mp4")
+        original.write_bytes(b"original")
+
+    monkeypatch.setattr(parts_download.json, "dump", replace)
+    with patch("signal.alarm"), pytest.raises(OriginalWorkConflictError):
+        parts_download.download_original(part, tmp_path)
+    assert not (tmp_path / (part.filename + ".json")).exists()
+    assert (tmp_path / (part.filename + ".json.pending")).exists()
+    assert original.read_bytes() == b"original"
+    assert list(tmp_path.glob("browser-*/original.mp4"))
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_original_media_observation_must_match_the_locked_manifest(
+    tmp_path, monkeypatch, original_browser, browser_stub, cached
+):
+    import json
+
+    from pixav.pixel_injector.canary_download import OriginalWorkConflictError
+
+    part, _, _, _ = original_browser
+    if cached:
+        (tmp_path / part.filename).write_bytes(b"original")
+        (tmp_path / (part.filename + ".json")).write_text(
+            json.dumps({"sha256": part.sha256, "size": part.size_bytes, "method": "photos-original-browser"})
+        )
+    monkeypatch.setattr(parts_download, "observed_media", lambda path: {**OBSERVED, "sha256": "0" * 64})
+    with patch("signal.alarm"), pytest.raises(OriginalWorkConflictError):
+        parts_download.download_original(part, tmp_path)
+    if cached:
+        browser_stub.sync_playwright.assert_not_called()
+    else:
+        assert not (tmp_path / (part.filename + ".json")).exists()

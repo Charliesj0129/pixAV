@@ -312,14 +312,15 @@ def test_full_decoder_refuses_exit_failure_or_error_output(tmp_path, monkeypatch
         decode_original(tmp_path / "synthetic.mp4")
 
 
-@pytest.mark.parametrize("fault", [None, "wrong_item", "expired_session"])
+@pytest.mark.parametrize("fault", [None, "wrong_item", "expired_session", "source-change-during-decode"])
 def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit(tmp_path, monkeypatch, fault):
     """Regression: asyncio media probing must run after sync Playwright exits."""
     import sys
     from types import ModuleType
 
     from pixav.pixel_injector import parts_download
-    from pixav.pixel_injector.canary_download import OriginalMismatchError
+    from pixav.pixel_injector.canary_download import OriginalMismatchError, OriginalWorkConflictError
+    from pixav.shared.media_file import MediaFile, open_media_file
 
     data = b"synthetic provider original"
     part = segment().model_copy(update={"size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
@@ -346,17 +347,37 @@ def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit
     def observe(path):
         assert exited and browser.close.called
         assert path.read_bytes() == data
+        with pytest.raises(BlockingIOError), open_media_file(path, exclusive=True):
+            pytest.fail("authenticated original released its session lock")
         return {"sha256": part.sha256, "size_bytes": len(data)}
 
     monkeypatch.setattr(parts_download, "observed_media", observe)
     decoded = []
-    monkeypatch.setattr(parts_download, "decode_original", lambda path: decoded.append(path.read_bytes()))
+
+    def decode(source):
+        assert isinstance(source, MediaFile) and not source.exclusive
+        with pytest.raises(BlockingIOError), open_media_file(source.path, exclusive=True):
+            pytest.fail("authenticated decoder did not borrow the session reader")
+        with source.reader() as reader:
+            decoded.append(reader.read())
+        if fault == "source-change-during-decode":
+            source.path.rename(tmp_path / "retained-original.mp4")
+            source.path.write_bytes(data)
+
+    monkeypatch.setattr(parts_download, "decode_original", decode)
     error = AccountSessionRequiredError if fault == "expired_session" else OriginalMismatchError
-    if fault:
+    if fault in ("wrong_item", "expired_session"):
         with pytest.raises(error):
             parts_download.download_original(part, tmp_path, authentication=SECRET)
         assert not decoded
         assert not (tmp_path / part.filename).exists()
+        return
+    if fault == "source-change-during-decode":
+        with pytest.raises(OriginalWorkConflictError):
+            parts_download.download_original(part, tmp_path, authentication=SECRET)
+        assert decoded == [data]
+        assert not (tmp_path / (part.filename + ".json")).exists()
+        assert list(tmp_path.glob("browser-*/original.mp4"))
         return
     result = parts_download.download_original(part, tmp_path, authentication=SECRET)
     validate_account_cold_receipt(part, result)

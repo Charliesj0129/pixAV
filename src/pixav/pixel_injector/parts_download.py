@@ -19,7 +19,12 @@ from pathlib import Path
 
 from pixav.media_loader.preparation import inspect_media
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary, sha256
-from pixav.pixel_injector.canary_download import OriginalMismatchError, copy_original, decode_original
+from pixav.pixel_injector.canary_download import (
+    OriginalMismatchError,
+    OriginalWorkConflictError,
+    copy_original,
+    decode_original,
+)
 from pixav.pixel_injector.photos_auth import (
     AccountCookieSecret,
     AccountSessionMismatchError,
@@ -27,7 +32,15 @@ from pixav.pixel_injector.photos_auth import (
     verify_browser_account,
 )
 from pixav.shared.cold_receipts import AUTHENTICATED_RECEIPT
-from pixav.shared.media_file import open_media_file
+from pixav.shared.media_file import (
+    MediaFile,
+    MediaFileChangedError,
+    MediaFileUnsafeError,
+    file_version,
+    open_media_directory,
+    open_media_file,
+    open_media_output,
+)
 from pixav.shared.models import VideoPart
 from pixav.shared.storage_models import TransferableFile
 
@@ -133,7 +146,114 @@ def _browser_original(
     return version, account_binding
 
 
+def _check_original(source: MediaFile, part: TransferableFile, version: tuple[int, int, int, int, int]) -> None:
+    facts = source.facts()
+    if file_version(os.fstat(source.descriptor)) != version or facts != (part.sha256, part.size_bytes):
+        raise OriginalWorkConflictError("COLD_ORIGINAL_CHANGED_DURING_VERIFICATION")
+
+
+def _reuse_original(part: TransferableFile, destination: Path, receipt: Path) -> dict:
+    with open_media_file(destination) as source, open_media_file(receipt) as evidence:
+        version = file_version(os.fstat(source.descriptor))
+        receipt_version = file_version(os.fstat(evidence.descriptor))
+        receipt_facts = evidence.facts()
+        with evidence.reader() as reader:
+            report = json.load(reader)
+        if (
+            source.facts() != (part.sha256, part.size_bytes)
+            or report.get("sha256") != part.sha256
+            or report.get("size") != part.size_bytes
+            or report.get("method") != "photos-original-browser"
+        ):
+            raise OriginalWorkConflictError("cached Photos original is corrupt; retained for inspection")
+        # The probe owns its child descriptor while this outer reader keeps the
+        # original inode locked through observation and final receipt checks.
+        observed = observed_media(destination)
+        _check_original(source, part, version)
+        evidence.assert_current()
+        if file_version(os.fstat(evidence.descriptor)) != receipt_version or evidence.facts() != receipt_facts:
+            raise OriginalWorkConflictError("COLD_ORIGINAL_RECEIPT_CHANGED_DURING_VERIFICATION")
+        if observed.get("sha256") != part.sha256 or observed.get("size_bytes") != part.size_bytes:
+            raise OriginalWorkConflictError("COLD_ORIGINAL_OBSERVATION_CHANGED")
+        return {**report, "observed": observed}
+
+
+def _publish_original_receipt(
+    part: TransferableFile,
+    source: MediaFile,
+    version: tuple[int, int, int, int, int],
+    receipt: Path,
+    report: dict,
+) -> None:
+    pending = receipt.with_suffix(receipt.suffix + ".pending")
+    encoded = json.dumps(report).encode()
+    with open_media_output(pending, must_create=True) as output:
+        with os.fdopen(os.dup(output.descriptor), "w") as handle:
+            json.dump(report, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _check_original(source, part, version)
+        if output.facts() != (hashlib.sha256(encoded).hexdigest(), len(encoded)):
+            raise OriginalWorkConflictError("COLD_ORIGINAL_PENDING_RECEIPT_CHANGED")
+        with open_media_directory(receipt, exclusive=True) as directory:
+            source.assert_current()
+            if file_version(os.fstat(source.descriptor)) != version:
+                raise OriginalWorkConflictError("COLD_ORIGINAL_CHANGED_BEFORE_RECEIPT_PUBLICATION")
+            output.assert_current()
+            os.link(
+                pending.name,
+                receipt.name,
+                src_dir_fd=directory.descriptor,
+                dst_dir_fd=directory.descriptor,
+                follow_symlinks=False,
+            )
+            MediaFile(receipt, output.descriptor, directory.descriptor, True).assert_current()
+            output.assert_current()
+            os.unlink(pending.name, dir_fd=directory.descriptor)
+            os.fsync(directory.descriptor)
+
+
+def _record_original(
+    part: TransferableFile, destination: Path, receipt: Path, browser_version: str, account_binding: dict | None
+) -> dict:
+    with open_media_file(destination) as source:
+        version = file_version(os.fstat(source.descriptor))
+        _check_original(source, part, version)
+        observed = observed_media(destination)
+        if observed.get("sha256") != part.sha256 or observed.get("size_bytes") != part.size_bytes:
+            raise OriginalWorkConflictError("COLD_ORIGINAL_OBSERVATION_CHANGED")
+        _check_original(source, part, version)
+        report = {
+            "method": "photos-original-browser",
+            "size": part.size_bytes,
+            "sha256": part.sha256,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "browser": browser_version,
+            "download_action": "single-video-original",
+            "observed": observed,
+        }
+        if account_binding is not None:
+            decode_original(source)
+            report.update(
+                receipt_version=AUTHENTICATED_RECEIPT,
+                authentication=account_binding,
+                cold_inputs="provider-only",
+                cold_mounts=["/work:rw"],
+                decode="PASS",
+            )
+        _publish_original_receipt(part, source, version, receipt, report)
+        return report
+
+
 def download_original(part: TransferableFile, root: Path, *, authentication: dict | None = None) -> dict:
+    """Retain conflicted local work without reporting provider corruption."""
+    try:
+        return _download_original(part, root, authentication=authentication)
+    except (OSError, MediaFileChangedError, MediaFileUnsafeError):
+        raise OriginalWorkConflictError("COLD_ORIGINAL_WORK_REQUIRES_RECONCILIATION") from None
+
+
+def _download_original(part: TransferableFile, root: Path, *, authentication: dict | None = None) -> dict:
     if not part.share_url or not part.share_url.startswith(
         ("https://photos.app.goo.gl/", "https://photos.google.com/")
     ):
@@ -141,10 +261,11 @@ def download_original(part: TransferableFile, root: Path, *, authentication: dic
     destination = root / part.filename
     receipt = root / (part.filename + ".json")
     stray = root / (part.filename + ".part")
+    pending_receipt = receipt.with_suffix(receipt.suffix + ".pending")
     auth = AccountCookieSecret.model_validate(authentication) if authentication is not None else None
     if auth is not None and getattr(part, "account_id", None) != auth.account_id:
         raise AccountSessionMismatchError()
-    if auth is not None and any(p.exists() or p.is_symlink() for p in (destination, receipt, stray)):
+    if auth is not None and any(p.exists() or p.is_symlink() for p in (destination, receipt, stray, pending_receipt)):
         raise ValueError("authenticated cold retrieval requires fresh inputs")
     account_binding = None
     if destination.exists():
@@ -154,24 +275,15 @@ def download_original(part: TransferableFile, root: Path, *, authentication: dic
             # recording how it arrived. The file cannot be trusted and cannot be
             # explained, so it is moved aside and fetched from Photos again.
             # Writing a receipt for it would be a fabrication.
-            quarantine(root, destination, receipt, stray)
+            quarantine(root, destination, receipt, stray, pending_receipt)
         else:
-            report = json.loads(receipt.read_text())
-            if (
-                sha256(destination) != part.sha256
-                or destination.stat().st_size != part.size_bytes
-                or report.get("sha256") != part.sha256
-                or report.get("size") != part.size_bytes
-                or report.get("method") != "photos-original-browser"
-            ):
-                raise ValueError("cached Photos original is corrupt; retained for inspection")
             # A receipt written before the observation was part of the contract
             # describes bytes that are still here and still hash correctly, so
             # the observation is recomputed rather than the download repeated.
-            return {**report, "observed": observed_media(destination)}
-    elif any(p.exists() or p.is_symlink() for p in (stray, receipt)):
+            return _reuse_original(part, destination, receipt)
+    elif any(p.exists() or p.is_symlink() for p in (stray, receipt, pending_receipt)):
         # A half-written extraction would make the retry fail its exclusive open.
-        quarantine(root, stray, receipt)
+        quarantine(root, stray, receipt, pending_receipt)
     # Browser download, save_as and verified publication can coexist. Retained
     # quarantine bytes are already charged to actual filesystem free space.
     require_space([(root, part.size_bytes * 3 + 16 * 1024**2)])
@@ -179,33 +291,16 @@ def download_original(part: TransferableFile, root: Path, *, authentication: dic
         # Linux container deadline includes provider preparation and save_as, which
         # Playwright's click/download-event timeout does not bound.
         signal.alarm(21600)
-        original = Path(temporary) / "original.mp4"
-        version, account_binding = _browser_original(part, Path(temporary), original, auth)
-        with open_media_file(contained_file(Path(temporary), original)) as source, source.reader() as stream:
-            copy_original(stream, destination, part.size_bytes, part.sha256)
-        signal.alarm(0)
-    report = {
-        "method": "photos-original-browser",
-        "size": part.size_bytes,
-        "sha256": part.sha256,
-        "at": datetime.now(timezone.utc).isoformat(),
-        "browser": version,
-        "download_action": "single-video-original",
-        "observed": observed_media(destination),
-    }
-    if account_binding is not None:
-        decode_original(destination)
-        report.update(
-            receipt_version=AUTHENTICATED_RECEIPT,
-            authentication=account_binding,
-            cold_inputs="provider-only",
-            cold_mounts=["/work:rw"],
-            decode="PASS",
-        )
-    # Crash after byte publication leaves an untrusted cached file, never inferred success.
-    with receipt.open("x") as handle:
-        json.dump(report, handle)
-    return report
+        try:
+            original = Path(temporary) / "original.mp4"
+            version, account_binding = _browser_original(part, Path(temporary), original, auth)
+            with open_media_file(contained_file(Path(temporary), original)) as source, source.reader() as stream:
+                copy_original(stream, destination, part.size_bytes, part.sha256)
+            # Keep failed browser work, the original and any pending receipt for
+            # reconciliation until the complete verification has committed.
+            return _record_original(part, destination, receipt, version, account_binding)
+        finally:
+            signal.alarm(0)
 
 
 def prepare(manifest: dict, root: Path) -> dict:

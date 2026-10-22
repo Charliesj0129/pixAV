@@ -199,7 +199,7 @@ def decode_original(path: Path | MediaFile, *, timeout: int = 21600) -> None:
         )
         source.assert_current()
         if file_version(os.fstat(source.descriptor)) != before:
-            raise ValueError("Photos original changed during complete decoding")
+            raise OriginalWorkConflictError("Photos original changed during complete decoding")
         if result.returncode or errors.tell():
             raise OriginalMismatchError("Photos original failed complete decoding")
 
