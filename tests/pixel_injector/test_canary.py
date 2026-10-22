@@ -1,6 +1,8 @@
 """Canary rejection and crash-safety contracts; these are not live Photos evidence."""
 
+import json
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -20,6 +22,43 @@ from pixav.pixel_injector.canary import (
 )
 
 OWNER = "7880fc5a-e3bf-4c0b-beb6-72f03b8b6c2e"
+
+
+@pytest.mark.parametrize("command", ["preflight", "run", "resume", "verify", "cleanup"])
+def test_retired_docker_canary_cli_never_opens_resources(command, tmp_path, monkeypatch, capsys):
+    from pixav.pixel_injector import canary
+
+    single = Mock(side_effect=AssertionError("retired entry acquired a process lock"))
+    directory = Mock(side_effect=AssertionError("retired entry opened evidence"))
+    connect = Mock(side_effect=AssertionError("retired entry connected to Docker"))
+    monkeypatch.setattr(canary, "single_flight", single)
+    monkeypatch.setattr(canary, "private_directory", directory)
+    monkeypatch.setattr("docker.from_env", connect)
+    evidence = tmp_path / "must-not-be-created"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "canary",
+            command,
+            "--source",
+            str(tmp_path / "source.mp4"),
+            "--profile",
+            str(tmp_path / "profile.yml"),
+            "--secret",
+            str(tmp_path / "private.json"),
+            "--evidence",
+            str(evidence),
+        ],
+    )
+    assert canary.main() == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "RETIRED"
+    assert result["reason_code"] == "LEGACY_DOCKER_CANARY_RETIRED"
+    single.assert_not_called()
+    directory.assert_not_called()
+    connect.assert_not_called()
+    assert not evidence.exists()
 
 
 @pytest.fixture
@@ -142,32 +181,28 @@ def test_ownership_rejects_production_label():
     client.containers.list.assert_called_once_with(all=True, filters={"label": f"{OWNER_LABEL}={OWNER}"})
 
 
-def test_resume_never_recreates_uncertain_guest():
-    client = Mock()
-    client.containers.list.return_value = [SimpleNamespace(labels={OWNER_LABEL: OWNER})]
-    state = {"owner": OWNER, "status": "CREATING_RUNTIME"}
-    save = Mock()
-    prepare_runtime(client, state, "config/android_profiles.yml", save)
-    assert state["status"] == "REVIEW_REQUIRED"
-    client.containers.run.assert_not_called()
-    save.assert_called_once()
+@pytest.mark.parametrize("status", ["PREFLIGHT_READY", "CREATING_RUNTIME", "REVIEW_REQUIRED", "USER_ACTION_REQUIRED"])
+def test_retired_runtime_preserves_original_checkpoint_and_never_touches_docker(status):
+    client, save = Mock(), Mock()
+    state = {"owner": OWNER, "status": status, "login_stage": "GOOGLE_DEVICE_CHALLENGE"}
+    before = state.copy()
+    with pytest.raises(ValueError, match="LEGACY_DOCKER_CANARY_RETIRED"):
+        prepare_runtime(client, state, "config/android_profiles.yml", save)
+    assert state == before
+    assert client.mock_calls == []
+    save.assert_not_called()
 
 
-def test_intent_persisted_before_create_failure():
-    client = Mock()
-    client.containers.list.return_value = []
-    client.containers.run.side_effect = RuntimeError("interrupted")
-    state = {"owner": OWNER, "status": "PREFLIGHT_READY"}
-    snapshots = []
-    with pytest.raises(RuntimeError):
-        prepare_runtime(client, state, "config/android_profiles.yml", lambda: snapshots.append(state.copy()))
-    assert snapshots[0]["status"] == "CREATING_RUNTIME"
-    kwargs = client.containers.run.call_args.kwargs
-    assert "pixav.task_id" not in kwargs["labels"]
-    assert kwargs["ports"] == {"5555/tcp": ("127.0.0.1", None)}
-    with pytest.raises(ValueError):
-        prepare_runtime(client, state, "config/android_profiles.yml", Mock())
-    assert client.containers.run.call_count == 1
+def test_retired_source_probe_and_preflight_never_read_paths_or_create_containers(tmp_path):
+    from pixav.pixel_injector.canary import preflight, probe_source
+
+    client, source, args, checkpoint = Mock(), Mock(), Mock(), tmp_path / "checkpoint.json"
+    with pytest.raises(ValueError, match="LEGACY_DOCKER_CANARY_RETIRED"):
+        probe_source(client, source, "sha256:unused")
+    with pytest.raises(ValueError, match="LEGACY_DOCKER_CANARY_RETIRED"):
+        preflight(client, args, checkpoint)
+    assert client.mock_calls == source.mock_calls == args.mock_calls == []
+    assert not checkpoint.exists()
 
 
 def test_private_fifo_does_not_block(tmp_path):
@@ -177,24 +212,45 @@ def test_private_fifo_does_not_block(tmp_path):
         read_private(fifo)
 
 
-def test_owned_runtime_pair_uses_pinned_tools_and_guest_network():
-    client = Mock()
-    client.containers.list.return_value = []
-    client.containers.run.side_effect = [SimpleNamespace(id="guest-id"), SimpleNamespace(id="runner-id")]
-    state = {"owner": OWNER, "status": "PREFLIGHT_READY", "tools_image": "sha256:pinned"}
-    prepare_runtime(client, state, "config/android_profiles.yml", Mock())
-    assert state["status"] == "BLOCKED_UI_CALIBRATION"
-    assert state["runner_id"] == "runner-id"
-    second = client.containers.run.call_args_list[1]
-    assert second.args == ("sha256:pinned",)
-    assert second.kwargs["network_mode"] == "container:guest-id"
-    assert second.kwargs["labels"][OWNER_LABEL] == OWNER
+@pytest.mark.parametrize("verb", ["run", "cleanup"])
+def test_retired_module_entry_leaves_work_and_private_input_untouched(tmp_path, verb):
+    import subprocess
 
-
-def test_resume_preserves_google_challenge_without_login_retry():
-    client = Mock()
-    client.containers.list.return_value = [SimpleNamespace(labels={OWNER_LABEL: OWNER})]
-    state = {"owner": OWNER, "status": "USER_ACTION_REQUIRED", "login_stage": "GOOGLE_DEVICE_CHALLENGE"}
-    prepare_runtime(client, state, "config/android_profiles.yml", Mock())
-    assert state["status"] == "USER_ACTION_REQUIRED"
-    client.containers.run.assert_not_called()
+    private = tmp_path / "secret.json"
+    private.write_text('{"synthetic":"must-not-be-read"}')
+    os.chmod(private, 0o600)
+    evidence = tmp_path / "evidence"
+    before = private.stat()
+    result = subprocess.run(  # noqa: S603 - fixed Python module and synthetic fixture argv; no shell
+        [
+            sys.executable,
+            "-m",
+            "pixav.pixel_injector.canary",
+            verb,
+            "--source",
+            str(tmp_path / "source.mp4"),
+            "--profile",
+            str(tmp_path / "profile.yml"),
+            "--secret",
+            str(private),
+            "--evidence",
+            str(evidence),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+        env={**os.environ, "DOCKER_HOST": "unix:///pixav-retired-test-must-not-connect.sock"},
+    )
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == {"status": "RETIRED", "reason_code": "LEGACY_DOCKER_CANARY_RETIRED"}
+    assert not result.stderr and not evidence.exists()
+    after = private.stat()
+    assert (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_atime_ns,
+    ) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_atime_ns)
