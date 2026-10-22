@@ -106,14 +106,13 @@ class AndroidApk(BaseModel):
         return value
 
 
-class WindowsEnvironmentV2(_WindowsEnvironment):
+class _WindowsSplitEnvironment(_WindowsEnvironment):
     """Pin the installed base and every split without accepting later updates."""
 
-    schema_id: Literal["windows-pixel-environment-v2"] = Field(alias="schema")
     photos_apks: tuple[AndroidApk, ...] = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")
-    def complete_photos_apks(self) -> WindowsEnvironmentV2:
+    def complete_photos_apks(self) -> _WindowsSplitEnvironment:
         paths = [PurePosixPath(apk.path) for apk in self.photos_apks]
         bases = [apk for apk in self.photos_apks if PurePosixPath(apk.path).name == "base.apk"]
         if (
@@ -126,7 +125,24 @@ class WindowsEnvironmentV2(_WindowsEnvironment):
         return self
 
 
-WindowsEnvironmentContract = Annotated[WindowsEnvironment | WindowsEnvironmentV2, Field(discriminator="schema_id")]
+class WindowsEnvironmentV2(_WindowsSplitEnvironment):
+    """Retain the original split-APK payload and implicit software launch."""
+
+    schema_id: Literal["windows-pixel-environment-v2"] = Field(alias="schema")
+
+
+class WindowsEnvironmentV3(_WindowsSplitEnvironment):
+    """Explicit host-GPU launch; its identity requires a new registration."""
+
+    schema_id: Literal["windows-pixel-environment-v3"] = Field(alias="schema")
+    emulator_cpu_cores: int = Field(strict=True, ge=4, le=4)
+    emulator_memory_mib: int = Field(strict=True, ge=4096, le=4096)
+    emulator_gpu: Literal["host"]
+
+
+WindowsEnvironmentContract = Annotated[
+    WindowsEnvironment | WindowsEnvironmentV2 | WindowsEnvironmentV3, Field(discriminator="schema_id")
+]
 
 
 class EnvironmentFiles:
@@ -238,6 +254,15 @@ class EnvironmentFiles:
             PureWindowsPath(values.get(name, "")) != path for name, path in expected.items()
         ):
             raise ValueError("running hardware configuration belongs to a different instance or image")
+        if isinstance(environment, WindowsEnvironmentV3):
+            launch = {
+                "hw.cpu.ncore": str(environment.emulator_cpu_cores),
+                "hw.ramSize": str(environment.emulator_memory_mib),
+                "hw.gpu.mode": environment.emulator_gpu,
+                "hw.gpu.enabled": "true",
+            }
+            if any(values.get(name) != value for name, value in launch.items()):
+                raise ValueError("running hardware launch configuration differs from the pinned profile")
 
     def verify(self) -> None:
         self.verify_directory()

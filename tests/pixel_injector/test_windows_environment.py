@@ -177,3 +177,133 @@ def test_split_environment_refuses_incomplete_or_ambiguous_apks(defect):
         data["photos_apks"] = []
     with pytest.raises(ValueError):
         WindowsEnvironmentV2.model_validate(data)
+
+
+def host_gpu_environment_data(boot_id, avd_name="synthetic"):
+    data = split_environment_data(boot_id, avd_name)
+    data.update(
+        schema="windows-pixel-environment-v3",
+        observed_at="2026-10-22T00:00:00Z",
+        emulator_cpu_cores=4,
+        emulator_memory_mib=4096,
+        emulator_gpu="host",
+    )
+    return data
+
+
+def test_host_gpu_environment_is_explicit_and_part_of_native_identity():
+    import uuid
+
+    from pydantic import TypeAdapter
+
+    from pixav.pixel_injector.windows_environment import WindowsEnvironmentContract
+    from pixav.pixel_injector.windows_host_models import NativeIdentity, canonical_digest
+
+    boot = uuid.uuid4()
+    data = host_gpu_environment_data(boot)
+    parsed = TypeAdapter(WindowsEnvironmentContract).validate_python(data)
+    assert parsed.model_dump(mode="json", by_alias=True) == data
+    assert parsed.emulator_cpu_cores == 4 and parsed.emulator_gpu == "host"
+    with pytest.raises(ValueError):
+        parsed.emulator_gpu = "swiftshader_indirect"
+    process = {"pid": 100, "created_filetime": "130000000000000000", "sha256": "a" * 64}
+    native = NativeIdentity.model_validate(
+        {
+            "schema": "windows-native-control-v1",
+            "sdk_root": r"D:\Synthetic\Sdk",
+            "serial": "emulator-5554",
+            "avd_name": "synthetic",
+            "boot_id": str(boot),
+            "processes": {"adb": process, "emulator": {**process, "pid": 104}, "qemu": {**process, "pid": 108}},
+            "environment": data,
+        }
+    )
+    assert native.payload()["environment"] == data
+    old_native = {**native.payload(), "environment": split_environment_data(boot)}
+    assert canonical_digest(native.payload()) != canonical_digest(old_native)
+
+
+def test_legacy_split_environment_does_not_gain_host_launch_defaults():
+    import uuid
+
+    from pydantic import TypeAdapter
+
+    from pixav.pixel_injector.windows_environment import WindowsEnvironmentContract
+
+    data = split_environment_data(uuid.uuid4())
+    data["observed_at"] = "2026-10-22T00:00:00Z"
+    parsed = TypeAdapter(WindowsEnvironmentContract).validate_python(data)
+    assert parsed.model_dump(mode="json", by_alias=True) == data
+    assert not hasattr(parsed, "emulator_gpu")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("emulator_cpu_cores", None),
+        ("emulator_cpu_cores", 2),
+        ("emulator_cpu_cores", 8),
+        ("emulator_cpu_cores", 4.0),
+        ("emulator_cpu_cores", "4"),
+        ("emulator_memory_mib", 2048),
+        ("emulator_memory_mib", 4096.0),
+        ("emulator_gpu", "swiftshader_indirect"),
+        ("emulator_gpu", "auto"),
+        ("photos_apks", []),
+        ("schema", "windows-pixel-environment-v2"),
+    ],
+)
+def test_host_gpu_environment_refuses_implicit_or_unqualified_launch(field, value):
+    import uuid
+
+    from pydantic import TypeAdapter
+
+    from pixav.pixel_injector.windows_environment import WindowsEnvironmentContract
+
+    data = host_gpu_environment_data(uuid.uuid4())
+    data[field] = value
+    with pytest.raises(ValueError):
+        TypeAdapter(WindowsEnvironmentContract).validate_python(data)
+
+
+@pytest.mark.parametrize("defect", [None, "hw.cpu.ncore", "hw.ramSize", "hw.gpu.mode", "hw.gpu.enabled", "missing-gpu"])
+def test_host_gpu_hardware_file_must_agree_with_the_bound_launch(tmp_path, monkeypatch, defect):
+    import uuid
+    from pathlib import PureWindowsPath
+
+    from pydantic import TypeAdapter
+
+    from pixav.pixel_injector import windows_environment as module
+
+    data = host_gpu_environment_data(uuid.uuid4())
+    environment = TypeAdapter(module.WindowsEnvironmentContract).validate_python(data)
+    avd = PureWindowsPath(environment.avd_path)
+    image = PureWindowsPath(r"D:\Synthetic\Sdk\system-images\android-35\google_apis_playstore\x86_64")
+    values = {
+        "avd.name": environment.avd_name,
+        "disk.dataPartition.path": avd / "userdata-qemu.img",
+        "disk.cachePartition.path": avd / "cache.img",
+        "disk.encryptionKeyPartition.path": avd / "encryptionkey.img",
+        "disk.ramdisk.path": environment.private_ramdisk.path,
+        "kernel.path": image / "kernel-ranchu",
+        "disk.systemPartition.initPath": image / "system.img",
+        "disk.vendorPartition.initPath": image / "vendor.img",
+        "hw.cpu.ncore": "4",
+        "hw.ramSize": "4096",
+        "hw.gpu.mode": "host",
+        "hw.gpu.enabled": "true",
+    }
+    if defect == "missing-gpu":
+        del values["hw.gpu.mode"]
+    elif defect:
+        values[defect] = "unqualified"
+    hardware = tmp_path / "hardware-qemu.ini"
+    hardware.write_text("\n".join(f"{name} = {value}" for name, value in values.items()))
+    monkeypatch.setattr(module, "Path", lambda path: hardware)
+    files = module.EnvironmentFiles.__new__(module.EnvironmentFiles)
+    files.environment = environment
+    if defect:
+        with pytest.raises(ValueError, match="launch"):
+            files.verify_hardware(image)
+    else:
+        files.verify_hardware(image)

@@ -45,6 +45,20 @@ $pixavHandles = @{}
 $pixavRecords = @{}
 function Assert-PixavLaunch([string] $CommandLine) {
     if (!$pixavSpec.environment) {return}
+    $pixavLaunchCores='2'
+    $pixavLaunchGpu='swiftshader_indirect'
+    switch ($pixavSpec.environment.schema) {
+        'windows-pixel-environment-v1' {}
+        'windows-pixel-environment-v2' {}
+        'windows-pixel-environment-v3' {
+            $pixavCores=$pixavSpec.environment.emulator_cpu_cores
+            $pixavMemory=$pixavSpec.environment.emulator_memory_mib
+            if ((($pixavCores -isnot [int]) -and ($pixavCores -isnot [long])) -or $pixavCores -ne 4 -or (($pixavMemory -isnot [int]) -and ($pixavMemory -isnot [long])) -or $pixavMemory -ne 4096 -or $pixavSpec.environment.emulator_gpu -cne 'host') {throw 'NATIVE_LAUNCH_PROFILE_MISMATCH'}
+            $pixavLaunchCores='4'
+            $pixavLaunchGpu='host'
+        }
+        default {throw 'NATIVE_ENVIRONMENT_SCHEMA_UNSUPPORTED'}
+    }
     [int]$pixavCount=0
     $pixavArgv=[PixavNativeProcess]::CommandLineToArgvW($CommandLine,[ref]$pixavCount)
     if ($pixavArgv -eq [IntPtr]::Zero) {throw 'NATIVE_LAUNCH_ARGUMENTS_UNAVAILABLE'}
@@ -54,7 +68,7 @@ function Assert-PixavLaunch([string] $CommandLine) {
             $pixavPointer=[Runtime.InteropServices.Marshal]::ReadIntPtr($pixavArgv,$pixavIndex*[IntPtr]::Size)
             $pixavArguments += [Runtime.InteropServices.Marshal]::PtrToStringUni($pixavPointer)
         }
-        $pixavExpected=@('-avd',$pixavSpec.avd_name,'-datadir',$pixavSpec.environment.avd_path,'-sysdir',(Join-Path $pixavSdk 'system-images\android-35\google_apis_playstore\x86_64'),'-port',$pixavPort.ToString(),'-cores','2','-memory','4096','-gpu','swiftshader_indirect','-no-window','-no-snapshot-load','-no-snapshot-save','-no-boot-anim','-ramdisk',$pixavSpec.environment.private_ramdisk.path)
+        $pixavExpected=@('-avd',$pixavSpec.avd_name,'-datadir',$pixavSpec.environment.avd_path,'-sysdir',(Join-Path $pixavSdk 'system-images\android-35\google_apis_playstore\x86_64'),'-port',$pixavPort.ToString(),'-cores',$pixavLaunchCores,'-memory','4096','-gpu',$pixavLaunchGpu,'-no-window','-no-snapshot-load','-no-snapshot-save','-no-boot-anim','-ramdisk',$pixavSpec.environment.private_ramdisk.path)
         if ($pixavArguments.Count -ne $pixavExpected.Count) {throw 'NATIVE_LAUNCH_BINDING_MISMATCH'}
         for ($pixavIndex=0;$pixavIndex -lt $pixavExpected.Count;$pixavIndex++) {
             if (![string]::Equals($pixavArguments[$pixavIndex],$pixavExpected[$pixavIndex],[StringComparison]::OrdinalIgnoreCase)) {throw 'NATIVE_LAUNCH_BINDING_MISMATCH'}
@@ -152,7 +166,7 @@ test "$(/debug_ramdisk/magisk -V)" = 30700 || exit 75
             if ($pixavLine -notmatch '^package:(/[A-Za-z0-9_./=+~-]+\.apk)$') {throw 'NATIVE_PACKAGE_PATH_UNCONFIRMED'}
             $pixavPaths+= $matches[1]
         }
-        $pixavSplitContract=$pixavPackage -eq 'com.google.android.apps.photos' -and $pixavEnvironment.schema -eq 'windows-pixel-environment-v2'
+        $pixavSplitContract=$pixavPackage -eq 'com.google.android.apps.photos' -and $pixavEnvironment.schema -in @('windows-pixel-environment-v2','windows-pixel-environment-v3')
         if ($pixavSplitContract) {
             if ($pixavPaths.Count -ne @($pixavEnvironment.photos_apks).Count) {throw 'NATIVE_PHOTOS_APK_SET_CHANGED'}
             foreach ($pixavPath in $pixavPaths) {
