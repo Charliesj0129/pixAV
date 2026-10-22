@@ -7,10 +7,12 @@ reconciliation; no exception here destroys the guest or retries credentials.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 import struct
 import tempfile
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -21,7 +23,6 @@ from typing import Any, Literal
 import httpx
 import yaml
 
-from pixav.media_loader.video_parts import sha256
 from pixav.pixel_injector.android_target import CONTAINER_ANDROID_TARGET
 from pixav.pixel_injector.canary import OWNER_LABEL, CanaryBlockedError
 from pixav.pixel_injector.canary_acceptance import collect_item
@@ -30,6 +31,7 @@ from pixav.pixel_injector.session import RedroidSession, WindowsAndroidSession
 from pixav.pixel_injector.uploader import media_provider_scan_command
 from pixav.pixel_injector.windows_device import WindowsAndroidDevice
 from pixav.shared.logging import install_http_url_log_redaction
+from pixav.shared.media_file import file_version, open_media_file, run_media_work
 from pixav.shared.models import Account
 from pixav.shared.storage_models import TransferableFile
 
@@ -40,6 +42,21 @@ PHOTOS_PACKAGE = "com.google.android.apps.photos"
 # before the read completes.
 MEDIA_SCAN_ATTEMPTS = 24
 MEDIA_SCAN_DELAY_SECONDS = 5.0
+
+
+def _push_source_version(
+    path: Path, part: TransferableFile, *, stopped: threading.Event | None = None
+) -> tuple[int, int, int, int, int]:
+    try:
+        with open_media_file(path) as source:
+            before = file_version(os.fstat(source.descriptor))
+            if path.name != part.filename or source.facts() != (part.sha256, part.size_bytes):
+                raise ValueError("PART_CONTENT_CHANGED")
+            if before != file_version(os.fstat(source.descriptor)) or (stopped is not None and stopped.is_set()):
+                raise ValueError("PART_CHANGED_OR_CANCELLED")
+            return before
+    except (OSError, ValueError):
+        raise CanaryBlockedError("part changed before upload") from None
 
 
 class UserActionRequiredError(CanaryBlockedError):
@@ -196,7 +213,13 @@ class MaestroPartUploader:
             ):
                 raise CanaryBlockedError("guest ownership mismatch")
 
-    async def adb(self, *args: str, timeout: int = 120, answers_with_exit_code: bool = False) -> str:
+    async def adb(
+        self,
+        *args: str,
+        timeout: int = 120,
+        answers_with_exit_code: bool = False,
+        media_version: tuple[int, int, int, int, int] | None = None,
+    ) -> str:
         """Run one ADB command against the retained guest.
 
         A non-zero exit means the guest did not do what it was told, which is
@@ -210,20 +233,42 @@ class MaestroPartUploader:
         def execute() -> str:
             self.target.require_runner(self.runner)
             arguments = list(args)
+            command = ["adb", "-s", self.target.serial, *arguments]
+            if arguments[:1] == ["push"]:
+                if len(arguments) != 3 or media_version is None:
+                    raise CanaryBlockedError("ADB media copy requires its verified source binding")
+                command = [
+                    "python",
+                    "-m",
+                    "pixav.pixel_injector.adb_media",
+                    "--source",
+                    arguments[1],
+                    "--destination",
+                    arguments[2],
+                    "--serial",
+                    self.target.serial,
+                    "--sha256",
+                    self.part.sha256,
+                    "--size",
+                    str(self.part.size_bytes),
+                    "--source-version",
+                    *map(str, media_version),
+                    "--timeout",
+                    str(timeout),
+                ]
             if self.windows_device is not None and self.windows_device.ui_session_id and arguments[:1] == ["shell"]:
                 # Bind shell children to this opaque resource session. The host
                 # observes the marker before allowing a normal warm handoff.
-                command = arguments[1] if len(arguments) == 2 else shlex.join(arguments[1:])
+                shell_command = arguments[1] if len(arguments) == 2 else shlex.join(arguments[1:])
                 arguments = [
                     "shell",
-                    f"env PIXAV_PHOTOS_UI_SESSION={self.windows_device.ui_session_id} /system/bin/sh -c {shlex.quote(command)}",
+                    f"env PIXAV_PHOTOS_UI_SESSION={self.windows_device.ui_session_id} /system/bin/sh -c {shlex.quote(shell_command)}",
                 ]
+                command = ["adb", "-s", self.target.serial, *arguments]
             previous = self.runner.client.api.timeout
             self.runner.client.api.timeout = timeout + 30
             try:
-                result = self.runner.exec_run(
-                    ["timeout", "--kill-after=5s", str(timeout), "adb", "-s", self.target.serial, *arguments]
-                )
+                result = self.runner.exec_run(["timeout", "--kill-after=5s", str(timeout), *command])
                 if result.exit_code and not answers_with_exit_code:
                     raise CanaryBlockedError("ADB operation failed; retained guest requires reconciliation")
                 return result.output.decode(errors="replace")
@@ -487,19 +532,19 @@ class MaestroPartUploader:
     async def push_file(self, session: RedroidSession | WindowsAndroidSession, local_path: str) -> str:
         self.guard(session)
         path = Path(local_path)
-        if (
-            path.is_symlink()
-            or path.name != self.part.filename
-            or path.stat().st_size != self.part.size_bytes
-            or await asyncio.to_thread(sha256, path) != self.part.sha256
-        ):
-            raise CanaryBlockedError("part changed before upload")
+        version = await run_media_work(_push_source_version, path, self.part)
         stage = "/data/local/tmp/" + self.part.filename
         remote = "/sdcard/DCIM/Camera/" + self.part.filename
         if not self.recovery.get("push_intent"):
             self.recovery["push_intent"] = True
             await self.receipt("push")
-            await self.adb("push", self.source_root + "/" + self.part.filename, stage, timeout=21600)
+            await self.adb(
+                "push",
+                self.source_root + "/" + self.part.filename,
+                stage,
+                timeout=21600,
+                media_version=version,
+            )
         # An interrupted push may have left partial bytes. Never infer successful publication.
         if (await self.adb("shell", "sha256sum", stage, timeout=21600)).split()[0] != self.part.sha256:
             raise UploadReviewRequiredError(

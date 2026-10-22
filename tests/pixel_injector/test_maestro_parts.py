@@ -204,6 +204,74 @@ async def test_fresh_push_journals_each_effect_before_call(upload):
     assert u.recovery["backup_intent"]
 
 
+@pytest.mark.parametrize("replace_during_push", [False, True])
+async def test_managed_push_keeps_the_read_inode_locked_in_the_transfer_child(upload, monkeypatch, replace_during_push):
+    """Run the real tools command against a synthetic local ADB reader."""
+    import os
+    import subprocess
+    import sys
+
+    from pixav.shared.media_file import open_media_file
+
+    u, session, root = upload
+    source = root / u.part.filename
+    source.write_bytes(b"original")
+    retained = root / "retained.mp4"
+    marker = root / "transfer-result"
+    binary = root / "adb"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import fcntl,os,sys\nfrom pathlib import Path\n"
+        "source=Path(os.environ['PIXAV_TEST_SOURCE'])\n"
+        "marker=Path(os.environ['PIXAV_TEST_MARKER'])\n"
+        "fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW)\n"
+        "try:\n"
+        " try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+        " except BlockingIOError:pass\n"
+        " else:marker.write_text('SOURCE_WAS_UNLOCKED');sys.exit(42)\n"
+        "finally:os.close(fd)\n"
+        "if os.environ['PIXAV_TEST_REPLACE']=='1':\n"
+        " source.rename(source.parent/'retained.mp4');source.write_bytes(b'foreign')\n"
+        "assert sys.argv[-2].startswith('/proc/self/fd/')\n"
+        "assert Path(sys.argv[-2]).read_bytes()==b'original'\n"
+        "marker.write_text('LOCKED_INHERITED_READER')\n"
+    )
+    binary.chmod(0o700)
+    monkeypatch.setenv("PATH", str(root) + os.pathsep + str(Path(sys.executable).parent) + os.pathsep + os.defpath)
+    monkeypatch.setenv("PIXAV_TEST_SOURCE", str(source))
+    monkeypatch.setenv("PIXAV_TEST_MARKER", str(marker))
+    monkeypatch.setenv("PIXAV_TEST_REPLACE", "1" if replace_during_push else "0")
+    u.source_root = str(root)
+    u.adb = MaestroPartUploader.adb.__get__(u)
+    u.runner.client = SimpleNamespace(api=SimpleNamespace(timeout=60))
+
+    def execute(command):
+        if "push" in command or "pixav.pixel_injector.adb_media" in command:
+            result = subprocess.run(  # noqa: S603 - actual tools argv, synthetic local reader only; no Android/server
+                command, capture_output=True, timeout=15, check=False
+            )
+            return SimpleNamespace(exit_code=result.returncode, output=result.stdout)
+        if "sha256sum" in command:
+            output = u.part.sha256 + " synthetic"
+        else:
+            output = f"Row: 0 _id=42, _display_name={u.part.filename}, _size=8"
+        return SimpleNamespace(exit_code=0, output=output.encode())
+
+    u.runner.exec_run = execute
+    if replace_during_push:
+        with pytest.raises(CanaryBlockedError):
+            await u.push_file(session, str(source))
+        assert source.read_bytes() == b"foreign" and retained.read_bytes() == b"original"
+        assert "completed_at" not in u.recovery["operations"]["push"]
+        assert not u.recovery.get("publish_intent")
+    else:
+        await u.push_file(session, str(source))
+        assert u.recovery["operations"]["push"]["identity_verified"]
+    assert marker.read_text() == "LOCKED_INHERITED_READER"
+    with open_media_file(source, exclusive=True):
+        pass
+
+
 async def test_corrupt_stage_and_ambiguous_media_store_stop(upload):
     u, session, root = upload
     path = root / u.part.filename
