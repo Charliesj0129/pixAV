@@ -57,7 +57,9 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - 只用自己的 token 解除 pause，不直接刪 key；DLQ 不自動 replay，人工 replay 留操作者、原因與原 attempt 歷史。VPN kill switch 阻流且須實測，出口 IP 比對只告警。
 - 登入 challenge 停 retry 進 USER_ACTION_REQUIRED 交人工，不重送帳密。保留 ownership、guest/checkpoint 與未知副作用的 reconciliation 資料。
 - Android 帳號以 `Accounts:` 與實際 Account rows 核對，不把 authenticator 註冊算成已登入帳號。人工 scrcpy bootstrap 期間維持 system pause 並停止 native managed control；交回前核對及關閉 exact controller／Android child，重驗 quiescence 與當次 enrollment，避免並行 UI writer。
+- Windows environment v1／v2 保留舊 launch 與 canonical identity；4 核心／4096 MiB／host GPU 使用明確 v3 欄位並重建 identity／generation，不以隱含預設接受新配置。當次 SDK／AVD／APK、process／boot、檔案 sharing 與 UI quiescence 證據不得代替 registry enrollment 或原 guest／operation reconciliation。
 - 原帳號 cold 模式只接受私有 cookie-only secret reference，經 stdin 傳入新 context；child 僅掛空白工作目錄。登入收據須核對帳號／owner／item／session／原件 digest 與完整解碼，不以匿名歷史收據補齊新契約；UI 鎖失聯先停止 exact child，不能留下仍操作帳號的背景下載。
+- 人工瀏覽器登入使用全新私有 profile 與 exact process 的 loopback 控制入口，先核對 Windows ACL；不讀既有 profile、不自動提交帳密、不記錄登入畫面。操作者完成後重驗原 DB／Android／瀏覽器帳號 binding，僅匯出必要 cookies，不把 producer profile 傳給 cold child。
 - 新 adapter/服務在 README 記錄 timeout、health/metrics、secret 管理、版本/license、volume、資源限制、備份與 rollback；外部契約須實測。migration 先驗 expand/contract 與 restore，不讓不相容的舊 process 繼續執行。
 
 ## 驗證
