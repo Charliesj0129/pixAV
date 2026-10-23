@@ -168,6 +168,7 @@ def manifests(roots):
         text,
     )
     manifest = yaml.safe_load(text)
+    manifest["secrets"]["redis_client_url"]["file"] = str(secrets / "redis_client_url")
     for service in manifest["services"].values():
         if service.get("environment"):
             service["environment"] = {key: str(value) for key, value in service["environment"].items()}
@@ -241,6 +242,18 @@ def test_media_has_worker_role_and_no_socket_guest_or_cookie(manifests):
     service = config["services"]["media_loader"]
     assert {m["target"] for m in service["volumes"]} == {"/app/data/downloads", "/app/data/remuxed"}
     assert service["environment"]["PIXAV_DB_USER"] == "pixav_worker"
+
+
+def test_media_accepts_exact_separate_redis_reference(manifests, tmp_path):
+    config, args = select(manifests, "media")
+    private = tmp_path / "candidate-private"
+    private.mkdir(mode=0o700)
+    reference = private / "redis-url"
+    reference.write_text("synthetic-private-reference")
+    reference.chmod(0o600)
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    args.redis_client_url_secret = reference
+    deployment.validate_application(config, args)
 
 
 @pytest.mark.parametrize("defect", ["legacy", "qbit-url", "socket", "cookie", "role", "network"])

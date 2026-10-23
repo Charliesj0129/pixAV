@@ -47,6 +47,8 @@ def deployment(tmp_path, request):
         if request.param == "resolver"
         else {}
     )
+    if request.param == "resolver":
+        config["secrets"]["redis_client_url"]["file"] = str(secrets / "redis_client_url")
     replacements = {
         "PIXAV_MANAGED_APP_IMAGE": "sha256:" + "a" * 64,
         "PIXAV_MANAGED_GATEWAY_IMAGE": "sha256:" + "b" * 64,
@@ -103,6 +105,19 @@ def validate(config, args):
 
 def test_private_profiles_preserve_reader_and_network_boundaries(deployment):
     validate(*deployment)
+
+
+@pytest.mark.parametrize("deployment", ["resolver"], indirect=True)
+def test_resolver_accepts_exact_separate_redis_reference(deployment, tmp_path):
+    config, args = deployment
+    private = tmp_path / "candidate-private"
+    private.mkdir(mode=0o700)
+    reference = private / "redis-url"
+    reference.write_text("synthetic-private-reference")
+    reference.chmod(0o600)
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    args.redis_client_url_secret = reference
+    validate(config, args)
 
 
 @pytest.mark.parametrize("deployment", ["resolver"], indirect=True)

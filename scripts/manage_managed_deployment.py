@@ -952,6 +952,18 @@ def validate_application(config: dict, args: argparse.Namespace) -> None:  # noq
         if name == "photos_auth":
             if path != args.photos_auth_secret or stat.S_IMODE(path.parent.stat().st_mode) != 0o700:
                 raise ValueError("ACTIVITY_PRIVATE_AUTH_REQUIRED")
+        elif name == "redis_client_url":
+            selected = getattr(args, "redis_client_url_secret", None)
+            if path != (selected if selected is not None else args.secrets_root / name):
+                raise ValueError("REDIS_CLIENT_URL_BINDING_INVALID")
+            if selected is not None:
+                try:
+                    uid = int(next(iter(config["services"].values()))["user"].split(":")[0])
+                    parent, source = path.parent.stat(), path.stat()
+                except OSError:
+                    raise ValueError("REDIS_CLIENT_URL_PRIVATE_REFERENCE_REQUIRED") from None
+                if stat.S_IMODE(parent.st_mode) != 0o700 or parent.st_uid != uid or source.st_uid != uid:
+                    raise ValueError("REDIS_CLIENT_URL_PRIVATE_REFERENCE_REQUIRED")
         elif path.parent != args.secrets_root:
             raise ValueError("APPLICATION_PRIVATE_SECRETS_REQUIRED")
         if (
@@ -969,6 +981,14 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
     profile = getattr(args, "profile", "windows-tools")
     if getattr(args, "postgres_host_root", None) is not None and profile != "core":
         raise ValueError("POSTGRES_HOST_ROOT_REQUIRES_CORE_PROFILE")
+    if getattr(args, "redis_client_url_secret", None) is not None and profile not in {
+        "authority",
+        "storage",
+        "playback",
+        "media",
+        "resolver",
+    }:
+        raise ValueError("REDIS_CLIENT_URL_REQUIRES_APPLICATION_PROFILE")
     private = args.env_file
     if (
         private.resolve() != private
@@ -1035,6 +1055,7 @@ def preflight(args: argparse.Namespace) -> dict:  # noqa: C901 -- profile and id
         "database_touched": False,
         "runtime_instances_verified": False,
         "postgres_root_explicit": getattr(args, "postgres_host_root", None) is not None,
+        "redis_client_url_explicit": getattr(args, "redis_client_url_secret", None) is not None,
         "golden_path": "OPEN",
     }
 
@@ -1065,6 +1086,9 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--postgres-host-root", type=Path, help="explicit prepared PostgreSQL bind; core profile only")
     parser.add_argument("--secrets-root", type=Path)
+    parser.add_argument(
+        "--redis-client-url-secret", type=Path, help="explicit private Redis URL; application profiles only"
+    )
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--staging-root", type=Path)
     parser.add_argument("--photos-auth-secret", type=Path)

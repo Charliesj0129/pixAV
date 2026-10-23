@@ -464,6 +464,8 @@ def authority_config(core_config, monkeypatch):
     manifest = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker-compose.managed.yml").read_text())
     manifest["services"] = {"maxwell_core": manifest["services"]["maxwell_core"]}
     manifest["secrets"] = {name: manifest["secrets"][name] for name in names}
+    # Resolve this fixture's default; actual Compose tests cover nested interpolation.
+    manifest["secrets"]["redis_client_url"]["file"] = str(secrets / "redis_client_url")
     replacements = {
         "PIXAV_MANAGED_APP_IMAGE": "sha256:" + "a" * 64,
         "PIXAV_MANAGED_COLD_IMAGE": "sha256:" + "b" * 64,
@@ -535,8 +537,140 @@ def test_negative_operator_redis_database_is_refused(authority_config):
         module.validate_application(config, args)
 
 
+def test_separate_redis_url_requires_exact_operator_selection(authority_config, tmp_path):
+    config, args = authority_config
+    private = tmp_path / "candidate-secrets"
+    private.mkdir(mode=0o700)
+    reference = private / "redis-url"
+    reference.write_text("synthetic-private-reference")
+    reference.chmod(0o600)
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    with pytest.raises(ValueError):
+        module.validate_application(config, args)
+    args.redis_client_url_secret = reference
+    module.validate_application(config, args)
+
+
+def test_default_redis_url_cannot_silently_select_a_different_file_in_the_same_root(authority_config):
+    config, args = authority_config
+    reference = args.secrets_root / "another-redis-url"
+    reference.write_text("synthetic-unselected-reference")
+    reference.chmod(0o600)
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    with pytest.raises(ValueError):
+        module.validate_application(config, args)
+
+
+def test_explicit_redis_url_must_match_the_resolved_compose_reference(authority_config):
+    config, args = authority_config
+    reference = args.secrets_root / "another-redis-url"
+    reference.write_text("synthetic-unselected-reference")
+    reference.chmod(0o600)
+    args.redis_client_url_secret = reference
+    with pytest.raises(ValueError):
+        module.validate_application(config, args)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "public-parent",
+        "public-file",
+        "file-link",
+        "parent-link",
+        "relative",
+        "missing",
+        "directory",
+        "file-owner",
+        "parent-owner",
+    ],
+)
+def test_separate_redis_url_rejects_unsafe_private_references(authority_config, tmp_path, monkeypatch, defect):
+    import os
+    from pathlib import Path
+
+    config, args = authority_config
+    private = tmp_path / "candidate-secrets"
+    private.mkdir(mode=0o700)
+    reference = private / "redis-url"
+    reference.write_text("synthetic-private-reference")
+    reference.chmod(0o600)
+    if defect == "public-parent":
+        private.chmod(0o755)
+    elif defect == "public-file":
+        reference.chmod(0o644)
+    elif defect == "file-link":
+        link = private / "alias"
+        link.symlink_to(reference)
+        reference = link
+    elif defect == "parent-link":
+        link = tmp_path / "alias"
+        link.symlink_to(private, target_is_directory=True)
+        reference = link / reference.name
+    elif defect == "relative":
+        monkeypatch.chdir(private)
+        reference = Path("redis-url")
+    elif defect in {"missing", "directory"}:
+        reference.unlink()
+        if defect == "directory":
+            reference.mkdir(mode=0o700)
+    else:
+        selected = reference if defect == "file-owner" else private
+        original = Path.stat
+
+        def changed_owner(self, *positional, **keywords):
+            value = original(self, *positional, **keywords)
+            if self == selected:
+                fields = list(value)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return value
+
+        monkeypatch.setattr(Path, "stat", changed_owner)
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    args.redis_client_url_secret = reference
+    with pytest.raises(ValueError):
+        module.validate_application(config, args)
+
+
+def test_separate_redis_url_preflight_does_not_read_or_change_reference_content(authority_config, tmp_path):
+    config, args = authority_config
+    private = tmp_path / "candidate-secrets"
+    private.mkdir(mode=0o700)
+    reference = private / "redis-url"
+    reference.write_text("synthetic-opaque-content-not-parsed-by-config-preflight")
+    reference.chmod(0o600)
+    before = reference.stat()
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    args.redis_client_url_secret = reference
+    module.validate_application(config, args)
+    after = reference.stat()
+    assert (before.st_ino, before.st_size, before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns) == (
+        after.st_ino,
+        after.st_size,
+        after.st_atime_ns,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+
+
+@pytest.mark.parametrize("profile", ["windows-tools", "core", "schema", "vpn", "torrent", "library"])
+def test_redis_url_override_refuses_other_profiles_before_environment_or_daemon_io(profile):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        project="pixav-managed-synthetic",
+        profile=profile,
+        redis_client_url_secret=Path("/synthetic/private/redis-url"),
+    )
+    with pytest.raises(ValueError, match="REDIS_CLIENT_URL_REQUIRES_APPLICATION_PROFILE"):
+        module.preflight(args)
+
+
 @pytest.mark.parametrize("database", [None, "1"])
-def test_real_compose_binds_redis_database_for_all_application_profiles(tmp_path, database):
+@pytest.mark.parametrize("url_setting", ["unset", "empty", "separate"])
+def test_real_compose_binds_redis_database_for_all_application_profiles(tmp_path, database, url_setting):
     import json
     import os
     import shutil
@@ -556,9 +690,13 @@ def test_real_compose_binds_redis_database_for_all_application_profiles(tmp_path
         "PIXAV_STORAGE_WORKER_OWNER": "11111111-1111-4111-8111-111111111111",
         "PIXAV_STORAGE_WINDOWS_RUNTIME_ID": "22222222-2222-4222-8222-222222222222",
         "PIXAV_STORAGE_WINDOWS_RUNTIME_GENERATION": "7",
+        "PIXAV_MANAGED_SECRETS_ROOT": str(tmp_path / "secrets"),
     }
     if database is not None:
         values["PIXAV_EXPECTED_REDIS_DATABASE"] = database
+    selected = tmp_path / "candidate-private/redis-url"
+    if url_setting != "unset":
+        values["PIXAV_MANAGED_REDIS_CLIENT_URL_FILE"] = str(selected) if url_setting == "separate" else ""
     private.write_text("".join(key + "=" + value + "\n" for key, value in values.items()))
     env = {key: value for key, value in os.environ.items() if not key.startswith("PIXAV_")}
     result = subprocess.run(  # noqa: S603 - config only, no daemon or operator data
@@ -581,9 +719,18 @@ def test_real_compose_binds_redis_database_for_all_application_profiles(tmp_path
         check=True,
         timeout=30,
     )
-    services = json.loads(result.stdout)["services"]
+    config = json.loads(result.stdout)
+    services = config["services"]
     for name in ("maxwell_core", "storage_worker", "playback_worker", "media_loader", "strm_resolver"):
         assert services[name]["environment"]["PIXAV_EXPECTED_REDIS_DATABASE"] == (database or "0")
+        assert {row["source"]: row["target"] for row in services[name]["secrets"]}[
+            "redis_client_url"
+        ] == "/run/secrets/PIXAV_REDIS_URL"
+    assert config["secrets"]["redis_client_url"]["file"] == str(
+        selected if url_setting == "separate" else tmp_path / "secrets/redis_client_url"
+    )
+    for name in ("authority_password", "worker_password", "reader_password", "windows_key"):
+        assert config["secrets"][name]["file"] == str(tmp_path / "secrets" / name)
 
 
 @pytest.mark.parametrize("defect", ["admin-secret", "legacy-mode", "wrong-run-id", "raw-password", "database-mount"])
@@ -630,6 +777,7 @@ def activity_config(authority_config, request):
     manifest["services"] = {name: manifest["services"][name]}
     names = [row["source"] if isinstance(row, dict) else row for row in manifest["services"][name]["secrets"]]
     manifest["secrets"] = {key: manifest["secrets"][key] for key in names}
+    manifest["secrets"]["redis_client_url"]["file"] = str(args.secrets_root / "redis_client_url")
     uid, gid = authority["services"]["maxwell_core"]["user"].split(":")
     replacements = {
         "PIXAV_MANAGED_APP_IMAGE": "sha256:" + "a" * 64,
@@ -670,6 +818,18 @@ def activity_config(authority_config, request):
 
 def test_activity_profile_binds_only_worker_credentials_and_exact_data_roots(activity_config):
     module.validate_application(*activity_config)
+
+
+def test_activity_profile_accepts_exact_separate_redis_reference(activity_config, tmp_path):
+    config, args = activity_config
+    private = tmp_path / "candidate-private"
+    private.mkdir(mode=0o700)
+    reference = private / "redis-url"
+    reference.write_text("synthetic-private-reference")
+    reference.chmod(0o600)
+    config["secrets"]["redis_client_url"]["file"] = str(reference)
+    args.redis_client_url_secret = reference
+    module.validate_application(config, args)
 
 
 @pytest.mark.parametrize(

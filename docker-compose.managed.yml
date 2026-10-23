@@ -691,7 +691,7 @@ secrets:
   reader_password:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/reader_password
   redis_client_url:
-    file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_client_url
+    file: ${PIXAV_MANAGED_REDIS_CLIENT_URL_FILE:-${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/redis_client_url}
   qbit_password:
     file: ${PIXAV_MANAGED_SECRETS_ROOT:-.verify/managed-unconfigured}/qbit_password
   windows_ca:
