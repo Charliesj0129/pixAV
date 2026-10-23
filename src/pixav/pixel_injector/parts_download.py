@@ -16,6 +16,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pixav.media_loader.preparation import inspect_media
 from pixav.media_loader.video_parts import PartMedia, contained_file, require_space, retained_temporary, sha256
@@ -93,21 +94,30 @@ def _browser_original(
                 verify_browser_account(page, auth)
             page.goto(part.share_url, wait_until="domcontentloaded", timeout=60000)
             if auth is not None:
+                if urlsplit(page.url).hostname == "accounts.google.com":
+                    raise AccountSessionRequiredError("Photos session requires operator login")
                 page.goto(
                     page.url + ("&" if "?" in page.url else "?") + "hl=en",
                     wait_until="domcontentloaded",
                     timeout=60000,
                 )
-            videos = page.get_by_role("link", name=re.compile(r"^Video -"))
-            videos.first.wait_for(state="visible", timeout=30000)
-            if videos.count() != 1:
-                raise OriginalMismatchError("Photos album must contain exactly one video")
-            videos.click(timeout=30000)
+                if urlsplit(page.url).hostname == "accounts.google.com":
+                    raise AccountSessionRequiredError("Photos session requires operator login")
+            # An independently inspected private item can be reopened by its
+            # original account. The filename and complete bytes remain required.
+            private_item = auth is not None and "/photo/" in urlsplit(page.url).path
+            if not private_item:
+                videos = page.get_by_role("link", name=re.compile(r"^Video -"))
+                videos.first.wait_for(state="visible", timeout=30000)
+                if videos.count() != 1:
+                    raise OriginalMismatchError("Photos album must contain exactly one video")
+                videos.click(timeout=30000)
             # Wait for the viewer before opening its menu. During navigation
             # the album's identically named menu still offers Download all.
-            page.get_by_role("button", name="Open info", exact=True).wait_for(state="visible", timeout=30000)
+            info = page.get_by_role("button", name=re.compile(r"^(?:Open info|顯示詳細資訊)$"))
+            info.wait_for(state="visible", timeout=30000)
             if auth is not None:
-                page.get_by_role("button", name="Open info", exact=True).click(timeout=30000)
+                info.click(timeout=30000)
                 filename = getattr(part, "provider_filename", part.filename)
                 page.get_by_text(filename, exact=True).wait_for(state="visible", timeout=30000)
                 account_binding = {
@@ -123,24 +133,23 @@ def _browser_original(
                     "cookie_only": True,
                     "local_media_inputs": False,
                 }
-                page.get_by_role("button", name="Close info", exact=True).click(timeout=30000)
-            page.get_by_role("button", name="More options", exact=True).last.click(timeout=30000)
+                page.get_by_role("button", name=re.compile(r"^(?:Close info|隱藏詳細資訊)$")).click(timeout=30000)
+            page.get_by_role("button", name=re.compile(r"^(?:More options|更多選項)$")).last.click(timeout=30000)
             # The individual original action has been verified against full
             # hashes. Download-all ZIP preparation can stall on a backed-up
             # video; do not substitute the browser's playback rendition.
             # Keep the start wait
             # bounded separately from the six-hour process deadline.
             with page.expect_download(timeout=600000) as pending:
-                page.get_by_role("menuitem", name=re.compile(r"^Download(?: - Shift\+D)?$")).click(timeout=30000)
+                page.get_by_role(
+                    "menuitem",
+                    name=re.compile(r"^(?:Download(?: - Shift\+D)?|下載(?:\s*-\s*Shift\s*\+\s*D(?:\s*鍵)?)?)$"),
+                ).click(timeout=30000)
             download = pending.value
             download.save_as(original)
             if download.suggested_filename != getattr(part, "provider_filename", part.filename):
                 raise OriginalMismatchError("Photos original filename does not match provider identity")
             version = browser.version
-        except Exception as error:
-            if auth is not None and type(error).__name__ == "TimeoutError":
-                raise AccountSessionRequiredError("authenticated Photos UI requires review") from None
-            raise
         finally:
             browser.close()
     return version, account_binding

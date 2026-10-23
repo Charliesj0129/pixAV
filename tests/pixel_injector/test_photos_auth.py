@@ -312,7 +312,18 @@ def test_full_decoder_refuses_exit_failure_or_error_output(tmp_path, monkeypatch
         decode_original(tmp_path / "synthetic.mp4")
 
 
-@pytest.mark.parametrize("fault", [None, "wrong_item", "expired_session", "source-change-during-decode"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "private_item",
+        "item_unavailable",
+        "provider_session_expired",
+        "wrong_item",
+        "expired_session",
+        "source-change-during-decode",
+    ],
+)
 def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit(tmp_path, monkeypatch, fault):
     """Regression: asyncio media probing must run after sync Playwright exits."""
     import sys
@@ -326,11 +337,19 @@ def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit
     part = segment().model_copy(update={"size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
     browser = MagicMock(version="synthetic-browser")
     page = browser.new_context.return_value.new_page.return_value
-    page.url = "https://photos.google.com/share/synthetic"
+    page.url = {
+        "private_item": "https://photos.google.com/photo/synthetic",
+        "provider_session_expired": "https://accounts.google.com/synthetic-login",
+    }.get(fault, "https://photos.google.com/share/synthetic")
+    if fault == "private_item":
+        part = part.model_copy(update={"share_url": page.url})
     page.locator.return_value.evaluate_all.return_value = [f"Google Account: Synthetic ({EMAIL})"]
     page.get_by_role.return_value.count.return_value = 1
+    browser_timeout = type("TimeoutError", (Exception,), {})
     if fault == "expired_session":
         page.locator.return_value.first.wait_for.side_effect = TimeoutError()
+    if fault == "item_unavailable":
+        page.get_by_role.return_value.first.wait_for.side_effect = browser_timeout()
     download = MagicMock(suggested_filename="wrong.mp4" if fault == "wrong_item" else part.provider_filename)
     download.save_as.side_effect = lambda path: path.write_bytes(data)
     page.expect_download.return_value.__enter__.return_value.value = download
@@ -365,8 +384,12 @@ def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit
             source.path.write_bytes(data)
 
     monkeypatch.setattr(parts_download, "decode_original", decode)
-    error = AccountSessionRequiredError if fault == "expired_session" else OriginalMismatchError
-    if fault in ("wrong_item", "expired_session"):
+    error = {
+        "expired_session": AccountSessionRequiredError,
+        "provider_session_expired": AccountSessionRequiredError,
+        "item_unavailable": browser_timeout,
+    }.get(fault, OriginalMismatchError)
+    if fault in ("wrong_item", "expired_session", "provider_session_expired", "item_unavailable"):
         with pytest.raises(error):
             parts_download.download_original(part, tmp_path, authentication=SECRET)
         assert not decoded
@@ -386,6 +409,17 @@ def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit
     browser.new_context.return_value.add_cookies.assert_called_once_with(SECRET["cookies"])
     page.get_by_text.assert_called_once_with(part.provider_filename, exact=True)
     assert "synthetic-cookie-secret" not in json.dumps(result)
+    if fault == "private_item":
+        calls = page.get_by_role.call_args_list
+        assert not any(call.args[0] == "link" for call in calls)
+        buttons = [call.kwargs["name"] for call in calls if call.args[0] == "button"]
+        assert any(hasattr(name, "fullmatch") and name.fullmatch("顯示詳細資訊") for name in buttons)
+        assert any(hasattr(name, "fullmatch") and name.fullmatch("更多選項") for name in buttons)
+        download_name = next(call.kwargs["name"] for call in calls if call.args[0] == "menuitem")
+        assert download_name.fullmatch("下載")
+        assert download_name.fullmatch("下載 - Shift+D")
+        assert download_name.fullmatch("下載 - Shift + D 鍵")
+        assert not download_name.fullmatch("下載全部")
 
 
 @pytest.mark.integration

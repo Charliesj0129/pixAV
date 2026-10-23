@@ -260,7 +260,7 @@ def original_browser(browser_stub):
             assert name.match("Video - synthetic item")
             return videos
         if role == "button":
-            assert name in ("More options", "Open info")
+            assert any(name.fullmatch(label) for label in ("More options", "Open info"))
             return more_options
         assert role == "menuitem"
         assert name.fullmatch("Download - Shift+D") and name.fullmatch("Download")
