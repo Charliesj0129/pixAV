@@ -121,6 +121,21 @@ async def photos_ui_session(
     context = require_activity_context()
     request = context.request
     account_matches = request.account_id == runtime.account_id
+    if role == "cold_read" and request.stage == "verify" and request.account_id is None:
+        account_matches = bool(
+            await pool.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM remote_asset_segments segment
+                JOIN operation_intents operation ON operation.id=$4 AND operation.execution_id=$5
+                  AND operation.stage='verify'
+                WHERE segment.asset_id=$1 AND segment.segment_index=$2 AND segment.account_id=$3
+                  AND operation.identity='verify:'||segment.asset_id::text||':'||segment.segment_index::text)""",
+                request.asset_id,
+                request.segment_index,
+                runtime.account_id,
+                request.operation_id,
+                request.execution_id,
+            )
+        )
     if role == "cold_read" and request.stage == "playback" and request.account_id is None:
         account_matches = bool(
             await pool.fetchval(

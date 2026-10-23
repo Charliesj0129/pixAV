@@ -458,6 +458,70 @@ async def test_unreviewed_upload_cannot_open_cold_scope_or_start_native_tools(ma
     assert await state.pool.fetchval("SELECT count(*) FROM photos_ui_sessions") == 0
 
 
+@pytest.mark.parametrize("defect", [None, "asset", "segment", "operation", "explicit-account"])
+async def test_verify_without_account_binds_cold_reader_to_exact_original_segment(managed, defect):
+    state = managed
+    report = await reviewed_original_upload(state)
+    execution = uuid.UUID(report["execution_id"])
+    asset = uuid.UUID(
+        json.loads(await state.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", execution))["asset_id"]
+    )
+    operation = uuid.uuid4()
+    identity = f"verify:{asset}:0"
+    await state.pool.execute("UPDATE remote_assets SET state='CREATED' WHERE id=$1", asset)
+    await state.pool.execute(
+        """UPDATE remote_asset_segments SET state='backed_up',uploaded_at=now(),usage_counted_at=now(),
+        share_url='https://photos.google.com/share/synthetic' WHERE asset_id=$1""",
+        asset,
+    )
+    await state.pool.execute("UPDATE executions SET stage='verify' WHERE id=$1", execution)
+    await state.pool.execute(
+        "INSERT INTO operation_intents(id,execution_id,stage,identity) VALUES($1,$2,'verify',$3)",
+        operation,
+        execution,
+        identity,
+    )
+    await state.pool.execute(
+        "UPDATE activity_attempts SET stage='verify',operation_id=$2 WHERE id=$1",
+        uuid.UUID(report["attempt_id"]),
+        operation,
+    )
+    report.update(role="cold_read", operation_id=str(operation))
+    original = (await envelope(state.pool, report)).model_copy(
+        update={
+            "account_id": None,
+            "asset_id": asset,
+            "segment_index": 0,
+            "identity": identity,
+        }
+    )
+    changes = {
+        "asset": {"asset_id": uuid.uuid4()},
+        "segment": {"segment_index": 1},
+        "operation": {"operation_id": uuid.uuid4()},
+        "explicit-account": {"account_id": uuid.uuid4()},
+    }
+    original = original.model_copy(update=changes.get(defect, {}))
+    with activity_context(original, uuid.UUID(report["worker_token"])):
+        if defect:
+            with pytest.raises(CanaryBlockedError, match="activity/account binding"):
+                async with state.runtime.cold(state.binding[2]):
+                    pytest.fail("a different verification target obtained the account")
+            assert not state.calls
+        else:
+            async with state.runtime.cold(state.binding[2]) as lease:
+                lease.check()
+                assert state.host.state["binding"]["role"] == "cold_read"
+    state.runner.start.assert_not_called()
+    if not defect:
+        assert (
+            await WindowsUIReconciler(
+                state.pool, state.docker, state.bridge, docker_daemon_id="synthetic-daemon", cold_image="synthetic-cold"
+            ).tick()
+            == 1
+        )
+
+
 async def test_original_review_cold_fence_survives_restore_and_quiescent_function_rollback(managed):
     from tests.integration.test_phase0_restore import postgres_tool
 
