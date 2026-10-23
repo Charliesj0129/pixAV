@@ -333,6 +333,11 @@ services:
         source: ${PIXAV_MANAGED_STAGING_HOST_ROOT:?set the existing daemon-host staging directory}
         target: ${PIXAV_MANAGED_STAGING_HOST_ROOT:?set the existing daemon-host staging directory}
         bind: {create_host_path: false}
+      - type: bind
+        source: ${PIXAV_MANAGED_DATA_ROOT:-.verify/managed-unconfigured}/downloads
+        target: /app/data/downloads
+        read_only: true
+        bind: {create_host_path: false}
     healthcheck:
       test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8005/health", timeout=3)']
       interval: 5s

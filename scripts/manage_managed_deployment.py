@@ -403,6 +403,7 @@ def validate_activity_mounts(service: dict, args: argparse.Namespace) -> None:  
     if args.profile == "storage":
         expected.update(
             {
+                "/app/data/downloads": (args.data_root / "downloads", True),
                 "/app/data/remuxed": (args.data_root / "remuxed", True),
                 "/app/data/storage-readback": (args.data_root / "storage-readback", False),
                 str(staging): (staging, False),

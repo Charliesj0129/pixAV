@@ -820,6 +820,22 @@ def test_activity_profile_binds_only_worker_credentials_and_exact_data_roots(act
     module.validate_application(*activity_config)
 
 
+def test_accepted_mp4_download_is_readable_only_by_storage(activity_config):
+    config, args = activity_config
+    service = config["services"][args.profile + "_worker"]
+    downloads = [mount for mount in service["volumes"] if mount["target"] == "/app/data/downloads"]
+    if args.profile == "storage":
+        assert len(downloads) == 1
+        assert downloads[0]["source"] == str(args.data_root / "downloads")
+        assert downloads[0]["read_only"] is True
+        module.validate_application(config, args)
+        downloads[0]["read_only"] = False
+        with pytest.raises(ValueError, match="ACTIVITY_MOUNTS_INVALID"):
+            module.validate_application(config, args)
+    else:
+        assert downloads == []
+
+
 def test_activity_profile_accepts_exact_separate_redis_reference(activity_config, tmp_path):
     config, args = activity_config
     private = tmp_path / "candidate-private"
