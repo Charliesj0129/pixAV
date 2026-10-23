@@ -255,6 +255,7 @@ class MaestroPartUploader:
             self.target.require_runner(self.runner)
             arguments = list(args)
             command = ["adb", "-s", self.target.serial, *arguments]
+            reader_options = {}
             if arguments[:1] == ["push"]:
                 if len(arguments) != 3 or media_version is None:
                     raise CanaryBlockedError("ADB media copy requires its verified source binding")
@@ -277,6 +278,9 @@ class MaestroPartUploader:
                     "--timeout",
                     str(timeout),
                 ]
+                # Staging is owned by this worker. Root in the isolated tools
+                # container has no DAC capabilities and cannot read its 0700 parent.
+                reader_options = {"user": f"{os.geteuid()}:{os.getegid()}", "workdir": "/"}
             if self.windows_device is not None and self.windows_device.ui_session_id and arguments[:1] == ["shell"]:
                 # Bind shell children to this opaque resource session. The host
                 # observes the marker before allowing a normal warm handoff.
@@ -289,7 +293,7 @@ class MaestroPartUploader:
             previous = self.runner.client.api.timeout
             self.runner.client.api.timeout = timeout + 30
             try:
-                result = self.runner.exec_run(["timeout", "--kill-after=5s", str(timeout), *command])
+                result = self.runner.exec_run(["timeout", "--kill-after=5s", str(timeout), *command], **reader_options)
                 if result.exit_code and not answers_with_exit_code:
                     raise CanaryBlockedError("ADB operation failed; retained guest requires reconciliation")
                 return result.output.decode(errors="replace")

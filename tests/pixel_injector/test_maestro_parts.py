@@ -245,8 +245,12 @@ async def test_managed_push_keeps_the_read_inode_locked_in_the_transfer_child(up
     u.adb = MaestroPartUploader.adb.__get__(u)
     u.runner.client = SimpleNamespace(api=SimpleNamespace(timeout=60))
 
-    def execute(command):
+    def execute(command, **options):
         if "push" in command or "pixav.pixel_injector.adb_media" in command:
+            # The retained tools image defaults to root without DAC capabilities.
+            # Its reader must use the owner of the worker's private staging.
+            if options.get("user") != f"{os.geteuid()}:{os.getegid()}" or options.get("workdir") != "/":
+                return SimpleNamespace(exit_code=2, output=b"media reader identity refused")
             result = subprocess.run(  # noqa: S603 - actual tools argv, synthetic local reader only; no Android/server
                 command, capture_output=True, timeout=15, check=False
             )
