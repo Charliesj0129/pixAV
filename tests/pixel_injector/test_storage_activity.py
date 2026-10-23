@@ -539,6 +539,44 @@ async def test_retained_runtime_or_ui_review_stops_automatic_retry():
     assert pool._row["recovery"] == {"backup_intent": True, "media_id": "123"}
 
 
+async def test_native_review_reports_its_code_location_without_private_error(caplog):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock()
+    client._client.post.side_effect = httpx.ConnectError("synthetic private transport detail")
+
+    class NativeFailure:
+        async def upload(self, segment, account, journal):
+            client.call("observe", SimpleNamespace(model_dump_json=lambda: "{}"))
+
+    original, token = request(), uuid.uuid4()
+    result = await worker(FakePool(segment_row()), uploader=NativeFailure()).execute(original, token)
+
+    assert result.outcome == "user_action" and result.error_code == "USER_ACTION_REQUIRED"
+    assert "pixav.pixel_injector.windows_control.call:" in caplog.text
+    assert "synthetic private transport detail" not in caplog.text
+    assert str(token) not in caplog.text and str(original.account_id) not in caplog.text
+
+
+async def test_ui_review_diagnostic_does_not_log_exception_message(caplog):
+    from pixav.pixel_injector.canary import CanaryBlockedError
+
+    private = "synthetic credential and provider URL must remain private"
+    result = await worker(FakePool(segment_row()), uploader=Uploader(CanaryBlockedError(private))).execute(
+        request(), uuid.uuid4()
+    )
+
+    assert result.outcome == "user_action" and result.error_code == "USER_ACTION_REQUIRED"
+    assert "pixav.pixel_injector.storage_activity._upload:" in caplog.text
+    assert private not in caplog.text and private not in result.model_dump_json()
+
+
 @pytest.mark.parametrize("error", ["TimeoutError", "ModuleNotFoundError"])
 async def test_readonly_dependency_failure_is_retryable_not_remote_loss(error):
     from unittest.mock import AsyncMock

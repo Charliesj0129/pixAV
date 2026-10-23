@@ -178,6 +178,7 @@ class StorageActivityWorker:
         except (CanaryBlockedError, AccountSessionRequiredError) as exc:
             # Includes login challenges. The adapter requires UI/runtime review;
             # infrastructure retries cannot resolve an unknown remote effect.
+            logger.warning("storage review required at %s", _review_location(exc))
             return ActivityResult(**fields, outcome="user_action", error_code=_review_error_code(exc))
         except QuotaExhaustedError:
             return ActivityResult(**fields, outcome="quota_exhausted", error_code="QUOTA_EXHAUSTED")
@@ -385,3 +386,15 @@ def _review_error_code(error: CanaryBlockedError | AccountSessionRequiredError) 
     if isinstance(error, AccountSessionRequiredError):
         return "PHOTOS_ACCOUNT_SESSION_REQUIRED"
     return error.code if isinstance(error, UploadReviewRequiredError) else "USER_ACTION_REQUIRED"
+
+
+def _review_location(error: Exception) -> str:
+    """Locate the failed adapter step without logging exception text or locals."""
+    location = __name__
+    trace = error.__traceback__
+    while trace is not None:
+        module = trace.tb_frame.f_globals.get("__name__", "")
+        if module.startswith("pixav."):
+            location = f"{module}.{trace.tb_frame.f_code.co_name}:{trace.tb_lineno}"
+        trace = trace.tb_next
+    return location
