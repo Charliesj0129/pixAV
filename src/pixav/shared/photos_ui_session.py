@@ -130,7 +130,11 @@ async def photos_ui_session(
                 runtime.account_id,
             )
         )
-    if not account_matches or (role == "upload") != (request.stage == "upload"):
+    # The persistent claim additionally requires an exact authority-accepted
+    # original review before admitting a cold reader in the upload stage.
+    if not account_matches or (
+        (role == "upload") != (request.stage == "upload") and not (role == "cold_read" and request.stage == "upload")
+    ):
         raise CanaryBlockedError("Photos UI activity/account binding changed")
     if not 0 < heartbeat_seconds <= 15:
         raise ValueError("Photos UI heartbeat interval must be at most 15 seconds")

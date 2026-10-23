@@ -23,7 +23,7 @@ from pixav.pixel_injector.windows_host_models import (
 from pixav.pixel_injector.windows_managed_runtime import WindowsManagedRuntime
 from pixav.pixel_injector.windows_registration import WindowsRegistration, WindowsRuntimeRegistry
 from pixav.shared.activity_context import activity_context
-from tests.integration.test_external_android_runtime import envelope, request
+from tests.integration.test_external_android_runtime import envelope, halt_evidence, request
 from tests.pixel_injector.test_windows_environment import environment_data
 
 pytestmark = pytest.mark.integration
@@ -328,6 +328,171 @@ async def test_cold_reader_without_effect_can_release_after_independent_observat
     )
     assert await reconciler.tick() == 1
     assert await state.pool.fetchval("SELECT state FROM photos_ui_sessions") == "STOPPED"
+
+
+async def reviewed_original_upload(state):
+    """An authority-accepted original review, still owned by its upload attempt."""
+    pool = state.pool
+    report = await request(pool, state.binding)
+    execution, operation = uuid.UUID(report["execution_id"]), uuid.UUID(report["operation_id"])
+    asset, artifact = uuid.uuid4(), uuid.uuid4()
+    video = await pool.fetchval(
+        "SELECT video_id FROM tasks WHERE id=(SELECT task_id FROM executions WHERE id=$1)", execution
+    )
+    await pool.execute(
+        "INSERT INTO workflow_artifacts(id,execution_id,operation_id,path,facts) VALUES($1,$2,$3,'/synthetic/original.mp4','{}')",
+        artifact,
+        execution,
+        operation,
+    )
+    await pool.execute(
+        """INSERT INTO remote_assets(id,video_id,artifact_id,policy_version,expected,segment_count)
+        VALUES($1,$2,$3,'photos-original-v2','{}',1)""",
+        asset,
+        video,
+        artifact,
+    )
+    review = {
+        "status": "ACCEPTED",
+        "evidence": {
+            "version": "upload-outcome-review-v1",
+            "outcome": "EXISTING_ORIGINAL",
+            "execution_id": str(execution),
+            "operation_id": str(operation),
+            "asset_id": str(asset),
+            "segment_index": 0,
+            "account_id": str(state.binding[2]),
+            "guest_owner": str(state.binding[1]),
+            "segment_sha256": "c" * 64,
+            "generation": report["generation"] - 1,
+        },
+    }
+    await pool.execute(
+        """INSERT INTO remote_asset_segments(asset_id,segment_index,start_seconds,end_seconds,size_bytes,
+        sha256,local_path,media_info,account_id,state,recovery)
+        VALUES($1,0,0,1,1,$2,'/synthetic/original.mp4','{}',$3,'upload_intent',$4::jsonb)""",
+        asset,
+        "c" * 64,
+        state.binding[2],
+        json.dumps({"upload_outcome_review": review}),
+    )
+    await pool.execute("UPDATE operation_intents SET identity=$2 WHERE id=$1", operation, f"upload:{asset}:0")
+    await pool.execute(
+        "UPDATE executions SET checkpoint=$2::jsonb WHERE id=$1",
+        execution,
+        json.dumps({"asset_id": str(asset), "upload_outcome_review": review}),
+    )
+    return report
+
+
+async def test_existing_original_review_can_use_cold_scope_without_starting_upload_tools(managed):
+    state = managed
+    report = await reviewed_original_upload(state)
+    original = await envelope(state.pool, report)
+    with activity_context(original, uuid.UUID(report["worker_token"])):
+        async with state.runtime.cold(state.binding[2]) as lease:
+            lease.check()
+            assert state.host.state["binding"]["role"] == "cold_read"
+    state.runner.start.assert_not_called()
+    assert await state.pool.fetchval("SELECT role FROM photos_ui_sessions") == "cold_read"
+    assert await state.pool.fetchval("SELECT operation_id FROM photos_ui_sessions") == original.operation_id
+    assert (
+        await WindowsUIReconciler(
+            state.pool, state.docker, state.bridge, docker_daemon_id="synthetic-daemon", cold_image="synthetic-cold"
+        ).tick()
+        == 1
+    )
+
+
+@pytest.mark.parametrize("defect", [None, "pending", "wrong-operation", "wrong-owner", "wrong-hash", "segment-only"])
+async def test_only_exact_authority_accepted_original_can_claim_upload_stage_cold_reader(managed, defect):
+    state = managed
+    report = await reviewed_original_upload(state)
+    execution = uuid.UUID(report["execution_id"])
+    checkpoint = json.loads(await state.pool.fetchval("SELECT checkpoint FROM executions WHERE id=$1", execution))
+    review = checkpoint["upload_outcome_review"]
+    if defect == "pending":
+        review["status"] = "PENDING"
+    elif defect in ("wrong-operation", "wrong-owner", "wrong-hash"):
+        key, value = {
+            "wrong-operation": ("operation_id", str(uuid.uuid4())),
+            "wrong-owner": ("guest_owner", str(uuid.uuid4())),
+            "wrong-hash": ("segment_sha256", "d" * 64),
+        }[defect]
+        review["evidence"][key] = value
+    await state.pool.execute(
+        "UPDATE remote_asset_segments SET recovery=$1::jsonb", json.dumps({"upload_outcome_review": review})
+    )
+    if defect == "segment-only":
+        checkpoint.pop("upload_outcome_review")
+    await state.pool.execute(
+        "UPDATE executions SET checkpoint=$2::jsonb WHERE id=$1", execution, json.dumps(checkpoint)
+    )
+    accepted = await state.pool.fetchval(
+        "SELECT acquire_photos_ui_session($1::jsonb)", json.dumps({**report, "role": "cold_read"})
+    )
+    assert accepted is (defect is None)
+    if accepted:
+        assert await state.pool.fetchval(
+            "SELECT heartbeat_photos_ui_session($1,$2)", uuid.UUID(report["id"]), uuid.UUID(report["token"])
+        )
+        checkpoint["upload_outcome_review"]["status"] = "REJECTED"
+        await state.pool.execute(
+            "UPDATE executions SET checkpoint=$2::jsonb WHERE id=$1", execution, json.dumps(checkpoint)
+        )
+        assert not await state.pool.fetchval(
+            "SELECT heartbeat_photos_ui_session($1,$2)", uuid.UUID(report["id"]), uuid.UUID(report["token"])
+        )
+        assert await state.pool.fetchval("SELECT state FROM photos_ui_sessions") == "HALT_REQUIRED"
+
+
+async def test_unreviewed_upload_cannot_open_cold_scope_or_start_native_tools(managed):
+    state = managed
+    report = await request(state.pool, state.binding)
+    with activity_context(await envelope(state.pool, report), uuid.UUID(report["worker_token"])):
+        with pytest.raises(CanaryBlockedError, match="persistent resource claim rejected"):
+            async with state.runtime.cold(state.binding[2]):
+                pytest.fail("unreviewed upload obtained a cold reader")
+    state.runner.start.assert_not_called()
+    assert not state.calls
+    assert await state.pool.fetchval("SELECT count(*) FROM photos_ui_sessions") == 0
+
+
+async def test_original_review_cold_fence_survives_restore_and_quiescent_function_rollback(managed):
+    from tests.integration.test_phase0_restore import postgres_tool
+
+    state = managed
+    report = {**await reviewed_original_upload(state), "role": "cold_read"}
+    assert await state.pool.fetchval("SELECT acquire_photos_ui_session($1::jsonb)", json.dumps(report))
+    before = await state.pool.fetchval("SELECT to_jsonb(s)::text FROM photos_ui_sessions s")
+    database = await state.pool.fetchval("SELECT current_database()")
+    assert database.startswith("pixav_test_")
+    dump = postgres_tool("pg_dump", "-U", "pixav_test", "-Fc", "-d", database)
+    postgres_tool(
+        "pg_restore", "-U", "pixav_test", "--clean", "--if-exists", "--exit-on-error", "-d", database, payload=dump
+    )
+    assert before == await state.pool.fetchval("SELECT to_jsonb(s)::text FROM photos_ui_sessions s")
+    assert await state.pool.fetchval(
+        "SELECT heartbeat_photos_ui_session($1,$2)", uuid.UUID(report["id"]), uuid.UUID(report["token"])
+    )
+    evidence = halt_evidence(report, identity_sha256=state.host.manifest.identity_sha256)
+    assert await state.pool.fetchval(
+        "SELECT record_verified_photos_ui_halt($1,$2,$3::jsonb)",
+        uuid.UUID(report["id"]),
+        uuid.UUID(report["token"]),
+        json.dumps(evidence),
+    )
+    old = Path("migrations/022_external_android_runtime.sql").read_text()
+    start, end = old.index("CREATE FUNCTION acquire_photos_ui_session("), old.index("-- Only the authority may submit")
+    await state.pool.execute(old[start:end].replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"))
+    next_report = {**report, "id": str(uuid.uuid4()), "token": str(uuid.uuid4())}
+    assert not await state.pool.fetchval("SELECT acquire_photos_ui_session($1::jsonb)", json.dumps(next_report))
+    next_report["role"] = "upload"
+    assert await state.pool.fetchval("SELECT acquire_photos_ui_session($1::jsonb)", json.dumps(next_report))
+    await state.pool.execute(Path("migrations/027_existing_original_review_cold_scope.sql").read_text())
+    assert await state.pool.fetchval(
+        "SELECT heartbeat_photos_ui_session($1,$2)", uuid.UUID(next_report["id"]), uuid.UUID(next_report["token"])
+    )
 
 
 async def test_created_cold_reader_is_retired_before_fence_release(managed):
