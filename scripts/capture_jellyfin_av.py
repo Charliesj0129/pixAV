@@ -121,6 +121,7 @@ async def _presented_time(page) -> float:
 async def _wait_picture(page, target: float, *, picture_reader=None) -> None:
     deadline = time.monotonic() + 60
     previous: tuple[float, float] | None = None
+    moving_since: float | None = None
     while time.monotonic() < deadline:
         try:
             picture = await (picture_reader or _picture_time)(page)
@@ -129,10 +130,19 @@ async def _wait_picture(page, target: float, *, picture_reader=None) -> None:
                 elapsed = sampled_at - previous[1]
                 progress = picture - previous[0]
                 if abs(picture - target) <= 2 and elapsed * 0.65 <= progress <= elapsed * 1.3:
-                    return
+                    if moving_since is None:
+                        moving_since = previous[1]
+                    # A couple of presented frames can precede a startup buffer
+                    # stall. Keep that settling inside the seek/resume operation,
+                    # before opening its independently verified recording window.
+                    if sampled_at - moving_since >= 0.6 - 1e-9:
+                        return
+                else:
+                    moving_since = None
             previous = (picture, sampled_at)
         except ValueError:
             previous = None
+            moving_since = None
         await page.wait_for_timeout(200)
     raise ValueError("client did not display the requested picture time")
 
@@ -631,21 +641,8 @@ async def _capture(  # noqa: C901 -- explicit UI acceptance steps
                         else:
                             if abs(resumed_picture - resume_at) > 2:
                                 raise ValueError("initial resume picture exceeds the two-second tolerance")
-                        # A ready HTML video can still show the first resume
-                        # frame while decoding starts. Observe actual presented
-                        # frames, without changing playback time or the capture
-                        # tolerance, before opening its recording window.
-                        await page.evaluate("""() => new Promise((resolve,reject) => {
-                            const v=document.querySelector('video');
-                            const timer=setTimeout(()=>reject(new Error('resume frames did not advance')),3000);
-                            let first;
-                            const next=(_,metadata)=>{
-                                first ??= metadata.mediaTime;
-                                if(metadata.mediaTime-first>=.08){clearTimeout(timer);resolve();}
-                                else v.requestVideoFrameCallback(next);
-                            };
-                            v.requestVideoFrameCallback(next);
-                        })""")
+                        if fault != "resume-wrong":
+                            await _wait_picture(page, resume_at, picture_reader=picture_reader)
                         await checkpoint("resume", resume_at)
                         # Inspect the ending last so short clips cannot finish
                         # while the next seek/resume control is being opened.
