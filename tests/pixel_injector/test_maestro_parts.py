@@ -647,6 +647,23 @@ async def test_a_contacts_dialog_left_by_an_interrupted_share_is_cleared(upload)
     assert u.recovery["original_setting"] is True
 
 
+async def test_unavailable_home_logs_only_fixed_scene_flags(upload, caplog):
+    u, _, _ = upload
+    private = "synthetic private account and item text"
+    u.attributes = AsyncMock(
+        return_value=[{"resource-id": "com.google.android.apps.nexuslauncher:id/workspace", "text": private}]
+    )
+    u.adb.return_value = "Error: " + private
+
+    with pytest.raises(CanaryBlockedError, match="home screen did not open"):
+        await u._photos_home(attempts=2)
+
+    assert "launcher=True" in caplog.text and "photos=False" in caplog.text
+    assert "Photos launcher error categories: ['Error']" in caplog.text
+    assert private not in caplog.text
+    assert not u.recovery.get("push_intent") and not u.recovery.get("publish_intent")
+
+
 async def test_a_screen_that_is_not_photos_home_is_cleared_to_it_bdd_048_003(upload):
     """Delivering the intent is not the app being in front, nor at its home screen."""
     u, _, _ = upload

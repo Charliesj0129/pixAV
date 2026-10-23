@@ -7,6 +7,7 @@ reconciliation; no exception here destroys the guest or retries credentials.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shlex
@@ -37,6 +38,7 @@ from pixav.shared.models import Account
 from pixav.shared.storage_models import TransferableFile
 
 PHOTOS_PACKAGE = "com.google.android.apps.photos"
+logger = logging.getLogger(__name__)
 
 # How long to let MediaProvider finish reading a freshly published file before
 # its row is judged. A 128 MB video is not read instantly, and the row appears
@@ -466,7 +468,7 @@ class MaestroPartUploader:
         existing task forward and finishes whatever is stacked above its home
         screen.
         """
-        await self.adb(
+        result = await self.adb(
             "shell",
             "am",
             "start",
@@ -478,6 +480,9 @@ class MaestroPartUploader:
             PHOTOS_PACKAGE,
             "--activity-clear-top",
         )
+        errors = [kind for kind in ("Error", "Permission Denial", "unable to resolve") if kind in result]
+        if errors:
+            logger.warning("Photos launcher error categories: %s", errors)
 
     async def _photos_home(self, attempts: int = 8) -> None:
         """Wait for the Photos home screen, opening it as often as it takes.
@@ -490,6 +495,7 @@ class MaestroPartUploader:
         answered first because they are drawn over a home screen whose disc is
         still in the hierarchy behind them.
         """
+        attrs: list[dict] = []
         for remaining in range(attempts, 0, -1):
             attrs = await self.attributes()
             text = "\n".join(a.get("text", "") for a in attrs)
@@ -507,6 +513,16 @@ class MaestroPartUploader:
                 return
             elif remaining > 1:
                 await self._open_photos_home()
+        ids = [str(a.get("resource-id") or "") for a in attrs]
+        logger.warning(
+            "Photos home unavailable: nodes=%d photos=%s launcher=%s system_ui=%s account_menu=%s backup_settings=%s",
+            len(attrs),
+            any(x.startswith(PHOTOS_PACKAGE + ":") for x in ids),
+            any(x.startswith("com.google.android.apps.nexuslauncher:") for x in ids),
+            any(x.startswith("com.android.systemui:") for x in ids),
+            any("/og_bento_" in x for x in ids),
+            any("/photos_backup_overview_" in x for x in ids),
+        )
         raise CanaryBlockedError("Photos home screen did not open; retain guest")
 
     async def _photos_ready(self) -> None:
