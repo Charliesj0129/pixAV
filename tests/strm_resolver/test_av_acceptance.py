@@ -181,6 +181,39 @@ def test_recording_analysis_rejects_audiovisual_faults(tmp_path, monkeypatch, fa
         assert result["first_seconds"] == 2 and result["frame_count"] == 12
 
 
+@pytest.mark.parametrize("fault", [None, "mute", "wrong-tone"])
+def test_audio_sampling_avoids_a_tone_transition_at_a_quantized_picture_frame(tmp_path, monkeypatch, fault):
+    spec = SyntheticAVSpec(identity=uuid.uuid4(), duration_seconds=90, tone_base_hz=550)
+    times = [39.8, 40.0, 40.0, 40.2, 40.2, 40.4, 40.4, 40.6, 40.6, 40.8, 40.8, 41.0]
+    frames = []
+    for index, seconds in enumerate(times):
+        frame = bytearray(frame_at(seconds))
+        frame[120 * WIDTH * 3 :] = bytes([index * 5]) * ((360 - 120) * WIDTH * 3)
+        frames.append(bytes(frame))
+    raw = b"".join(frames)
+    half = len(pcm_tone(550)) // 2
+    transition = pcm_tone(1180)[:half] + pcm_tone(550)[half:]
+    stable = pcm_tone(1500 if fault == "wrong-tone" else 550, 0 if fault == "mute" else 0.25)
+    recording = tmp_path / "client.mkv"
+    recording.write_bytes(b"private transition recording")
+
+    def decode(command, **kwargs):
+        if "rawvideo" in command:
+            return SimpleNamespace(stdout=raw, stderr=b"")
+        offset = float(command[command.index("-ss") + 1]) - 10
+        return SimpleNamespace(stdout=transition if abs(offset - 0.1) < 1e-9 else stable, stderr=b"")
+
+    monkeypatch.setattr("pixav.strm_resolver.av_acceptance.subprocess.run", decode)
+    window = {"kind": "resume", "recording_seconds": 10, "expected_seconds": 38.6, "crop": [1280, 720, 0, 0]}
+    if fault:
+        with pytest.raises(ValueError, match="muted|wrong tone"):
+            analyze_window(recording, spec, window)
+    else:
+        result = analyze_window(recording, spec, window)
+        assert len(result["audio_checks"]) == 2
+        assert all(check["dominant_hz"] == 550 for check in result["audio_checks"])
+
+
 @pytest.fixture
 def capture_bundle(tmp_path, monkeypatch):
     import hashlib

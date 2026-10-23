@@ -287,8 +287,8 @@ def _analyze_window(recording: MediaFile, spec: SyntheticAVSpec, window: dict) -
     for offset in ((0.1, 0.5, 0.9, 1.5, 2.5, 3.5) if duration == 4.0 else (0.1, 0.5, 0.9)):
         index = round(offset * 10)
         source_time = times[index] + 0.1
-        # Avoid a tone-change edge; analyze a shorter interval on its earlier side.
-        if int(times[index] // 5) != int((times[index] + 0.2) // 5):
+        # Keep the audio interval a decoded frame away from a tone change.
+        if int(max(0, times[index] - 0.1) // 5) != int((times[index] + 0.2) // 5):
             continue
         recording.assert_current()
         audio = subprocess.run(  # noqa: S603 -- inherited locked input and numeric seek; no shell
