@@ -135,7 +135,7 @@ async def _wait_picture(page, target: float, *, picture_reader=None) -> None:
                     # A couple of presented frames can precede a startup buffer
                     # stall. Keep that settling inside the seek/resume operation,
                     # before opening its independently verified recording window.
-                    if sampled_at - moving_since >= 0.6 - 1e-9:
+                    if sampled_at - moving_since >= 0.8 - 1e-9:
                         return
                 else:
                     moving_since = None

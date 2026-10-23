@@ -132,7 +132,7 @@ def test_missing_and_stale_media_clock_refuse_a_checkpoint(monkeypatch):
 @pytest.mark.asyncio
 async def test_picture_readiness_waits_for_moving_frames_after_resume(monkeypatch):
     clock = [0.0]
-    frames = iter([20.0, 20.0, 20.0, 20.2, 20.4, 20.6])
+    frames = iter([20.0, 20.0, 20.0, 20.2, 20.4, 20.6, 20.8])
 
     class Page:
         async def wait_for_timeout(self, milliseconds):
@@ -144,7 +144,7 @@ async def test_picture_readiness_waits_for_moving_frames_after_resume(monkeypatc
     monkeypatch.setattr("scripts.capture_jellyfin_av.time.monotonic", lambda: clock[0])
     monkeypatch.setattr("scripts.capture_jellyfin_av._picture_time", picture_time)
     await _wait_picture(Page(), 20)
-    assert clock[0] == pytest.approx(1.0)
+    assert clock[0] == pytest.approx(1.2)
 
 
 @pytest.mark.asyncio
@@ -165,7 +165,8 @@ async def test_correct_but_permanently_frozen_resume_picture_is_rejected(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_short_moving_burst_before_a_frozen_resume_cannot_start_a_window(monkeypatch):
+@pytest.mark.parametrize("burst_seconds", [0.2, 0.7])
+async def test_short_moving_burst_before_a_frozen_resume_cannot_start_a_window(monkeypatch, burst_seconds):
     clock = [0.0]
 
     class Page:
@@ -173,7 +174,7 @@ async def test_short_moving_burst_before_a_frozen_resume_cannot_start_a_window(m
             clock[0] += milliseconds / 1000
 
     async def picture_time(page):
-        return 20 + min(clock[0], 0.2)
+        return 20 + min(clock[0], burst_seconds)
 
     monkeypatch.setattr("scripts.capture_jellyfin_av.time.monotonic", lambda: clock[0])
     with pytest.raises(ValueError, match="requested picture time"):
@@ -193,7 +194,7 @@ async def test_resume_buffering_restarts_the_continuous_picture_readiness_window
 
     monkeypatch.setattr("scripts.capture_jellyfin_av.time.monotonic", lambda: clock[0])
     await _wait_picture(Page(), 20, picture_reader=picture_time)
-    assert clock[0] >= 1.4 - 1e-9
+    assert clock[0] >= 1.6 - 1e-9
 
 
 @pytest.mark.asyncio
