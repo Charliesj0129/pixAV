@@ -477,3 +477,98 @@ assert b'non monotonically increasing dts' in old.stderr
         capture_output=True,
         timeout=60,
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("tail_clock", ["repeated", "backward"])
+def test_real_decoder_tail_clock_keeps_every_frame_and_rejects_corruption(tmp_path, tail_clock):
+    """A null-sink timestamp error must not reject successfully decoded frames."""
+    import inspect
+    import os
+    import subprocess
+
+    from pixav.pixel_injector.parts_download import decode_original
+    from pixav.shared import media_file
+
+    if os.getenv("PIXAV_RUN_MEDIA_TESTS") != "1":
+        pytest.skip("opt-in real FFmpeg tools container")
+    expression = {
+        "repeated": r"if(gte(N\,27)\,81000\,N*3000)",
+        "backward": r"if(eq(N\,29)\,78000\,if(eq(N\,28)\,81000\,N*3000))",
+    }[tail_clock]
+    code = r"""
+import hashlib, json, subprocess, tempfile
+from pathlib import Path
+class OriginalMismatchError(Exception):
+    pass
+base = ['/usr/bin/ffmpeg', '-v', 'error', '-nostdin']
+path = Path('/work/synthetic.mp4')
+subprocess.run(base + [
+    '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=30:duration=1',
+    '-f', 'lavfi', '-i', 'sine=frequency=550:sample_rate=48000:duration=1',
+    '-vf', 'settb=1/90000,setpts=' + __EXPRESSION__,
+    '-fps_mode', 'passthrough', '-enc_time_base:v', '1:90000',
+    '-c:v', 'libx264', '-preset', 'medium', '-bf', '3', '-c:a', 'aac',
+    '-video_track_timescale', '90000', str(path)], check=True, capture_output=True)
+before = path.read_bytes()
+old = subprocess.run(base + ['-xerror', '-i', str(path),
+    '-map', '0:v:0', '-map', '0:a?', '-fps_mode:v', 'passthrough',
+    '-enc_time_base:v', '-1', '-f', 'null', '-'], capture_output=True, check=True)
+assert b'non monotonically increasing dts' in old.stderr
+""".replace("__EXPRESSION__", repr(expression))
+    code = inspect.getsource(media_file) + "\n" + code + "\n" + inspect.getsource(decode_original)
+    code += r"""
+original_run = subprocess.run
+progress = Path('/work/progress.txt')
+def observe_frames(command, **kwargs):
+    return original_run(command[:-3] + ['-progress', str(progress)] + command[-3:], **kwargs)
+subprocess.run = observe_frames
+try:
+    decode_original(path)
+finally:
+    subprocess.run = original_run
+values = dict(line.split('=', 1) for line in progress.read_text().splitlines() if '=' in line)
+assert values['progress'] == 'end' and int(values['frame']) == 30
+assert path.read_bytes() == before
+packets = json.loads(subprocess.run([
+    '/usr/bin/ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_packets',
+    '-show_entries', 'packet=pos', '-of', 'json', str(path)],
+    capture_output=True, check=True).stdout)['packets']
+offset = int(packets[0]['pos'])
+corrupt = bytearray(before)
+corrupt[offset:offset + 4] = b'\x7f\xff\xff\xff'
+damaged = Path('/work/corrupt.mp4')
+damaged.write_bytes(corrupt)
+try:
+    decode_original(damaged)
+except OriginalMismatchError:
+    pass
+else:
+    raise AssertionError('full decoder accepted a damaged NAL payload')
+"""
+    subprocess.run(  # noqa: S603 - opt-in synthetic bytes, no account or provider access
+        [  # noqa: S607 - operator-installed Docker CLI for this integration test
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cpus",
+            "1",
+            "--memory",
+            "1g",
+            "--pids-limit",
+            "128",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{tmp_path}:/work",
+            os.getenv("PIXAV_READBACK_CONTRACT_IMAGE", "pixav-photos-canary:maestro-2.10.0"),
+            "python",
+            "-c",
+            code,
+        ],
+        check=True,
+        capture_output=True,
+        timeout=90,
+    )

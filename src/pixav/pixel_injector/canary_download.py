@@ -187,6 +187,11 @@ def decode_original(path: Path | MediaFile, *, timeout: int = 21600) -> None:
                 "passthrough",
                 "-enc_time_base:v",
                 "-1",
+                # The discarded null sink still requires increasing DTS, even
+                # when every source frame decoded successfully. Adjust only
+                # its packet clock; keep every frame and all decoder errors.
+                "-bsf:v",
+                r"setts=ts=max(TS\,PREV_OUTDTS+1)",
                 "-f",
                 "null",
                 "-",
