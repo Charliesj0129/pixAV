@@ -5,6 +5,7 @@ from io import StringIO
 import pytest
 
 from scripts.capture_jellyfin_av import (
+    _capture_ending,
     _capture_targets,
     _checkpoint_time,
     _close_capture_client,
@@ -301,3 +302,48 @@ def test_near_end_supplement_does_not_leave_resume_in_jellyfin_completed_region(
     assert targets[-1][0] == "seek"
     assert 60 < targets[-1][1] + 10 < spec.duration_seconds * 0.9
     assert ("supplemental", spec.supplemental_seconds[0]) in targets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_delay", [0.0, 0.4, 0.8])
+async def test_real_end_window_keeps_ten_seconds_of_media_after_player_settles(monkeypatch, metadata_delay):
+    from pixav.strm_resolver.real_av_acceptance import RealAVSpec
+
+    spec = RealAVSpec(duration_seconds=120, manifest_sha256="a" * 64)
+    clock = [0.0]
+    sought = [0.0]
+
+    class Page:
+        async def wait_for_timeout(self, milliseconds):
+            clock[0] += milliseconds / 1000
+
+    async def picture_time(page):
+        return sought[0] + clock[0]
+
+    async def seek(target):
+        sought[0] = target
+        await _wait_picture(Page(), target, picture_reader=picture_time)
+        clock[0] += metadata_delay
+
+    async def checkpoint(kind, expected):
+        assert kind == "end" and expected == spec.duration_seconds - 10
+        presented = await picture_time(None)
+        assert presented + 10 <= spec.duration_seconds
+        assert abs(presented - expected) + 0.5 <= 2
+
+    monkeypatch.setattr("scripts.capture_jellyfin_av.time.monotonic", lambda: clock[0])
+    await _capture_ending(spec, seek, checkpoint)
+
+
+@pytest.mark.asyncio
+async def test_synthetic_ending_keeps_its_existing_marker_window():
+    import uuid
+    from unittest.mock import AsyncMock
+
+    from pixav.strm_resolver.av_acceptance import SyntheticAVSpec
+
+    spec = SyntheticAVSpec(identity=uuid.UUID(int=1), duration_seconds=30)
+    seek, checkpoint = AsyncMock(), AsyncMock()
+    await _capture_ending(spec, seek, checkpoint)
+    seek.assert_awaited_once_with(spec.duration_seconds - 4)
+    checkpoint.assert_awaited_once_with("end", spec.duration_seconds - 4)

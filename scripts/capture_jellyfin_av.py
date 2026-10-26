@@ -297,6 +297,15 @@ def _capture_targets(spec: SyntheticAVSpec | RealAVSpec, junction_seconds: list[
     return targets
 
 
+async def _capture_ending(spec: SyntheticAVSpec | RealAVSpec, seek, checkpoint) -> None:
+    real = isinstance(spec, RealAVSpec)
+    ending = spec.duration_seconds - (10 if real else 4)
+    # Native seek readiness and checkpoint metadata take time while playback
+    # advances. Settle earlier so the full ten-second window stays in the media.
+    await seek(ending - 2 if real else ending)
+    await checkpoint("end", ending)
+
+
 async def _configure_capture_resolution(page, maximum_height: int) -> dict:
     """Set the native preference in this fresh client, never reuse a browser profile."""
     if maximum_height != 1080:
@@ -646,9 +655,7 @@ async def _capture(  # noqa: C901 -- explicit UI acceptance steps
                         await checkpoint("resume", resume_at)
                         # Inspect the ending last so short clips cannot finish
                         # while the next seek/resume control is being opened.
-                        ending = spec.duration_seconds - (10 if real else 4)
-                        await seek(ending)
-                        await checkpoint("end", ending)
+                        await _capture_ending(spec, seek, checkpoint)
                 finally:
                     if process.poll() is None:
                         process.send_signal(signal.SIGINT)
