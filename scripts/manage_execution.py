@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inspect and manually recover managed executions, and withdraw lost assets.
 
-Reading is always safe. Replay, cancel, resume, retry-now and reopen are
+Reading is always safe. Replay, cancel, hold-upload, resume, retry-now and reopen are
 explicit operator acts that require a name and a reason, and they create
 auditable new history rather than rewriting what happened: the original
 execution and its attempts are preserved. Resume additionally refuses to clear
@@ -9,7 +9,8 @@ any recovery fact that records a remote effect, so releasing a held execution
 can never redo one blindly. Reopen gives a diagnosed infrastructure failure its
 attempt budget back on the same execution, asset and recovery journal, which is
 what keeps a fixed fault from being answered with a replay -- a second upload of
-media that is already uploaded.
+media that is already uploaded. Hold-upload parks one upload that no worker
+holds yet in USER_ACTION_REQUIRED, and resume releases it.
 
 ``invalidate-asset`` is the one act here that is not about an execution: it
 withdraws a durability claim for a remote copy the operator has confirmed is
@@ -33,6 +34,7 @@ from typing import Any
 from pixav.config import get_settings
 from pixav.maxwell_core.media_workflow import MediaWorkflow
 from pixav.maxwell_core.storage_workflow import StorageWorkflow
+from pixav.maxwell_core.upload_hold import hold_upload
 from pixav.shared.db import create_pool
 from pixav.shared.instance import database_identity
 from pixav.shared.upload_outcome_review import parse_upload_review
@@ -159,6 +161,10 @@ async def _write(args: argparse.Namespace, workflow: MediaWorkflow, pool: Any) -
     """Operator acts. Each one refuses a state it has no business changing."""
     if args.command in {"retry-verification", "reconcile-existing", "review-upload-outcome"}:
         return await _review_storage(args, pool)
+    if args.command == "hold-upload":
+        await hold_upload(pool, args.execution_id, operator=args.operator, reason=args.reason)
+        print(f"held upload execution {args.execution_id}; release it with resume")
+        return 0
     if args.command == "resume":
         await StorageWorkflow(pool).resume_after_user_action(
             args.execution_id,
@@ -244,6 +250,7 @@ def main() -> None:
     for name, help_text in (
         ("replay", "start a new audited execution"),
         ("cancel", "stop an open execution"),
+        ("hold-upload", "park an upload that is not running yet, until it is resumed"),
         ("resume", "release an execution held for user action, after inspecting the device"),
         ("retry-now", "bring a waiting execution's next attempt forward, after fixing the cause"),
         ("reopen", "return a retry-exhausted infrastructure failure to READY, after fixing the cause"),

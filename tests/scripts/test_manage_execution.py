@@ -187,3 +187,27 @@ async def test_list_defaults_to_the_open_states(wire, capsys):
 
     assert await cli._run(args("list")) == 0
     assert "WAITING_QUOTA" in capsys.readouterr().out
+
+
+async def test_hold_upload_names_the_operator_and_the_release_path(wire, capsys, monkeypatch):
+    pool, _ = wire(Pool(), Workflow())
+    calls = []
+
+    async def hold(target_pool, execution_id, *, operator, reason):
+        calls.append((target_pool, execution_id, operator, reason))
+
+    monkeypatch.setattr(cli, "hold_upload", hold)
+    assert await cli._run(args("hold-upload")) == 0
+    assert calls == [(pool, EXECUTION, "operator", "manual recovery")]
+    assert "resume" in capsys.readouterr().out
+
+
+async def test_hold_upload_reports_a_refusal(wire, capsys, monkeypatch):
+    wire(Pool(), Workflow())
+
+    async def hold(*_args, **_kwargs):
+        raise ValueError("only an upload that is not running or held may be held")
+
+    monkeypatch.setattr(cli, "hold_upload", hold)
+    assert await cli._run(args("hold-upload")) == 2
+    assert "refused: only an upload" in capsys.readouterr().out
