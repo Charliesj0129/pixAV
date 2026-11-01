@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import suppress
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -388,8 +389,33 @@ def _review_error_code(error: CanaryBlockedError | AccountSessionRequiredError) 
     return error.code if isinstance(error, UploadReviewRequiredError) else "USER_ACTION_REQUIRED"
 
 
+_NATIVE_REJECTION = re.compile(r"Windows native control rejected: (NATIVE_[A-Z_]{1,80}); retain resource fence")
+
+
 def _review_location(error: Exception) -> str:
-    """Locate the failed adapter step without logging exception text or locals."""
+    """Locate the failed adapter step without logging exception text or locals.
+
+    A cleanup step can fail after the original step and replace it; the
+    earliest replaced adapter step is the one that started the halt.
+    """
+    location = _step_location(error)
+    earlier, seen = error.__context__, {id(error)}
+    origin = None
+    codes = [_NATIVE_REJECTION.fullmatch(str(error))]
+    while earlier is not None and id(earlier) not in seen:
+        seen.add(id(earlier))
+        if (step := _step_location(earlier)) != __name__:
+            origin = step
+        codes.append(_NATIVE_REJECTION.fullmatch(str(earlier)))
+        earlier = earlier.__context__
+    if origin is not None:
+        location = f"{location} after {origin}"
+    # Only the host's fixed rejection token is kept; other exception text is not.
+    code = next((match[1] for match in reversed(codes) if match), None)
+    return location if code is None else f"{location} code {code}"
+
+
+def _step_location(error: BaseException) -> str:
     location = __name__
     trace = error.__traceback__
     while trace is not None:

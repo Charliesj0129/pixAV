@@ -640,3 +640,57 @@ async def test_existing_item_share_never_uploads_and_requires_new_cold_bytes(def
         upload.share_existing.assert_not_awaited()
     else:
         upload.share_existing.assert_awaited_once()
+
+
+def test_review_location_names_the_step_a_later_error_replaced():
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy, run_flow
+    from pixav.pixel_injector.storage_activity import _review_location
+
+    foreign = SimpleNamespace(labels={})
+    try:
+        try:
+            hierarchy(foreign, "owner")
+        finally:
+            run_flow(foreign, "owner", Path("flow.yaml"))
+    except CanaryBlockedError as error:
+        location = _review_location(error)
+    assert location.startswith("pixav.pixel_injector.canary_maestro.run_flow:")
+    assert " after pixav.pixel_injector.canary_maestro.hierarchy:" in location
+    assert "ownership" not in location
+
+
+def test_review_location_without_an_earlier_error_names_one_step():
+    from types import SimpleNamespace
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy
+    from pixav.pixel_injector.storage_activity import _review_location
+
+    with pytest.raises(CanaryBlockedError) as caught:
+        hierarchy(SimpleNamespace(labels={}), "owner")
+    location = _review_location(caught.value)
+    assert location.startswith("pixav.pixel_injector.canary_maestro.hierarchy:")
+    assert " after " not in location
+
+
+def test_review_location_keeps_only_the_fixed_native_rejection_code():
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.storage_activity import _review_location
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock(post=Mock(return_value=httpx.Response(409, json={"detail": "NATIVE_RESOURCE_HALTED"})))
+    with pytest.raises(CanaryBlockedError) as caught:
+        client.call("observe", Mock(model_dump_json=Mock(return_value="{}")))
+    location = _review_location(caught.value)
+    assert location.startswith("pixav.pixel_injector.windows_control.call:")
+    assert location.endswith(" code NATIVE_RESOURCE_HALTED")
+    assert "retain" not in location

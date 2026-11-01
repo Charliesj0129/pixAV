@@ -704,10 +704,14 @@ class MaestroPartUploader:
             await self.commands(
                 [{"scrollUntilVisible": {"element": "pixav-.*\\.mp4", "direction": "DOWN", "timeout": 20000}}]
             )
-        finally:
+        except BaseException:
             # The player may initialize after VIEW accepted the first pause.
-            # Also pause when UI inspection fails and leaves the guest retained.
-            await self.adb("shell", "input", "keyevent", "127")
+            # Also pause when UI inspection fails and leaves the guest retained,
+            # but a halted runtime refuses that pause: keep the original error.
+            with suppress(Exception):
+                await self.adb("shell", "input", "keyevent", "127")
+            raise
+        await self.adb("shell", "input", "keyevent", "127")
 
     async def clipboard(self) -> str | None:
         def parse(raw: str) -> str | None:
@@ -798,6 +802,10 @@ class MaestroPartVerifier:
         upload = self.uploader
         upload.guard(session)
         deadline = time.monotonic() + min(timeout, 21600)
+        # Each recheck reopens (and pauses) the full video and dumps the UI. A
+        # long original backup needs hours, so back off instead of loading the
+        # guest every few seconds.
+        delay = 15
         while time.monotonic() < deadline:
             await upload.open_details()
             attrs = await upload.attributes()
@@ -811,7 +819,8 @@ class MaestroPartVerifier:
             try:
                 item = collect_item(attrs, upload.part.filename, {**video, "sha256": upload.part.sha256})
             except CanaryBlockedError:
-                await asyncio.sleep(15)
+                await asyncio.sleep(max(0, min(delay, deadline - time.monotonic())))
+                delay = min(delay * 2, 120)
                 continue
             upload.backup_evidence = {**item, "backed_up": True, "original_quality": True}
             await upload.receipt("backup", complete=True)
