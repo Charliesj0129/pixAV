@@ -76,6 +76,14 @@ def observed_media(path: Path) -> dict:
     return json.loads(asyncio.run(inspect_media(str(path))).model_dump_json())
 
 
+def _signed_out(url: str) -> bool:
+    """A signed-out Photos visit lands on the sign-in page or Google's Photos product page."""
+    parts = urlsplit(url)
+    return parts.hostname == "accounts.google.com" or (
+        parts.hostname in {"google.com", "www.google.com"} and parts.path.startswith("/photos")
+    )
+
+
 def _browser_original(
     part: TransferableFile, temporary: Path, original: Path, auth: AccountCookieSecret | None
 ) -> tuple[str, dict | None]:
@@ -94,14 +102,14 @@ def _browser_original(
                 verify_browser_account(page, auth)
             page.goto(part.share_url, wait_until="domcontentloaded", timeout=60000)
             if auth is not None:
-                if urlsplit(page.url).hostname == "accounts.google.com":
+                if _signed_out(page.url):
                     raise AccountSessionRequiredError("Photos session requires operator login")
                 page.goto(
                     page.url + ("&" if "?" in page.url else "?") + "hl=en",
                     wait_until="domcontentloaded",
                     timeout=60000,
                 )
-                if urlsplit(page.url).hostname == "accounts.google.com":
+                if _signed_out(page.url):
                     raise AccountSessionRequiredError("Photos session requires operator login")
             # An independently inspected private item can be reopened by its
             # original account. The filename and complete bytes remain required.
