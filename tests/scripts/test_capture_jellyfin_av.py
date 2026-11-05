@@ -347,3 +347,76 @@ async def test_synthetic_ending_keeps_its_existing_marker_window():
     await _capture_ending(spec, seek, checkpoint)
     seek.assert_awaited_once_with(spec.duration_seconds - 4)
     checkpoint.assert_awaited_once_with("end", spec.duration_seconds - 4)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (["0", "6000000", "4000000", "3000000", "1500000", "720000", "420000"], "6000000"),
+        (["12000000", "8000000", "6000000"], "8000000"),
+        (["Auto", "", None, "-1", "0", "6000000"], "6000000"),
+    ],
+)
+def test_capture_bitrate_uses_highest_visible_choice_within_ceiling(options, expected):
+    from scripts.capture_jellyfin_av import _capture_bitrate
+
+    assert _capture_bitrate(options) == expected
+
+
+@pytest.mark.parametrize("options", [[], ["0", "Auto", None], ["12000000"], ["8 Mbps", "6e6"]])
+def test_capture_bitrate_refuses_missing_bounded_choice(options):
+    from scripts.capture_jellyfin_av import _capture_bitrate
+
+    with pytest.raises(ValueError, match="bounded bitrate"):
+        _capture_bitrate(options)
+
+
+async def test_quality_menu_without_eight_mbps_selects_six_and_checks_decoded_height():
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _select_capture_quality
+
+    settings = Mock(click=AsyncMock())
+    quality = Mock(click=AsyncMock())
+    choices = Mock(
+        first=Mock(wait_for=AsyncMock()),
+        evaluate_all=AsyncMock(return_value=["6000000", "4000000", "3000000", "1500000", "720000", "420000"]),
+    )
+    selected = Mock(count=AsyncMock(return_value=1), click=AsyncMock())
+    locators = {
+        ".btnVideoOsdSettings": settings,
+        "button.actionSheetMenuItem[data-id]:visible": choices,
+        'button.actionSheetMenuItem[data-id="6000000"]:visible': selected,
+    }
+    page = Mock(
+        mouse=Mock(move=AsyncMock()),
+        locator=Mock(side_effect=locators.__getitem__),
+        get_by_text=Mock(return_value=quality),
+        get_by_role=Mock(return_value=Mock(click=AsyncMock(side_effect=TimeoutError("8 Mbps absent")))),
+        wait_for_function=AsyncMock(),
+    )
+    assert await _select_capture_quality(page, 1080) == 6_000_000
+    selected.click.assert_awaited_once()
+    assert page.wait_for_function.await_count == 2
+    assert "e.dataset.id" in page.wait_for_function.call_args_list[0].args[0]
+    assert page.wait_for_function.call_args.kwargs["arg"] == 1080
+    page.get_by_role.assert_not_called()
+
+
+@pytest.mark.parametrize("resume", [False, True])
+async def test_play_selects_explicit_start_or_resume_action(resume):
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _play
+
+    button = Mock(wait_for=AsyncMock(), click=AsyncMock())
+    page = Mock(
+        goto=AsyncMock(),
+        reload=AsyncMock(),
+        locator=Mock(return_value=Mock(first=button)),
+        wait_for_function=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    await _play(page, "http://jellyfin:8096/web/#/details?id=synthetic", resume=resume)
+    selector = page.locator.call_args.args[0]
+    assert ('data-action="resume"' if resume else 'data-action="play"') in selector

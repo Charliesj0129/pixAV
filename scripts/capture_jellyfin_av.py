@@ -219,7 +219,11 @@ async def _play(page, details: str, *, resume: bool = False) -> None:
         # The details view can retain pre-stop UserData during hash navigation.
         # Reload and wait for its actual Resume action, never inject a position.
         await page.reload(wait_until="domcontentloaded", timeout=60000)
-    selector = '.btnPlay[data-action="resume"][title="Resume"]:not(.hide)' if resume else ".btnPlay:not(.hide)"
+    selector = (
+        '.btnPlay[data-action="resume"][title="Resume"]:not(.hide)'
+        if resume
+        else '.btnPlay[data-action="play"]:not(.hide)'
+    )
     button = page.locator(selector).first
     await button.wait_for(state="visible", timeout=30000)
     await button.click()
@@ -344,23 +348,48 @@ async def _configure_capture_resolution(page, maximum_height: int) -> dict:
         "maximum_height": maximum_height,
         "native_preference_retained": True,
         "limit_supported_resolution": True,
-        "quality": "8 Mbps",
     }
 
 
-async def _select_capture_quality(page, maximum_height: int) -> None:
+def _capture_bitrate(options: list[str | None]) -> str:
+    bounded = [
+        value
+        for value in options
+        if isinstance(value, str) and value.isascii() and value.isdecimal() and 0 < int(value) <= 8_000_000
+    ]
+    if not bounded:
+        raise ValueError("Jellyfin quality menu has no bounded bitrate")
+    return max(bounded, key=int)
+
+
+async def _select_capture_quality(page, maximum_height: int) -> int:
     # Explicit bitrate selection requests transcoding; a resolution ceiling alone
     # does not constrain a direct-play original. All actions use the native UI.
     await page.mouse.move(640, 660)
     await page.locator(".btnVideoOsdSettings").click(timeout=15000)
     await page.get_by_text("Quality", exact=True).click(timeout=15000)
-    await page.get_by_role("button", name="8 Mbps", exact=True).click(timeout=15000)
+    # The settings sheet can remain visible during the quality-sheet transition.
+    # Its Quality row also contains a bitrate label, but its data-id is not numeric.
+    await page.wait_for_function(
+        """() => [...document.querySelectorAll('button.actionSheetMenuItem[data-id]')].some(
+            e => e.getBoundingClientRect().height > 0 && /^[0-9]+$/.test(e.dataset.id)
+                && Number(e.dataset.id) > 0)""",
+        timeout=15000,
+    )
+    choices = page.locator("button.actionSheetMenuItem[data-id]:visible")
+    bitrate = _capture_bitrate(await choices.evaluate_all("es => es.map(e => e.getAttribute('data-id'))"))
+    selected = page.locator(f'button.actionSheetMenuItem[data-id="{bitrate}"]:visible')
+    if await selected.count() != 1:
+        raise ValueError("Jellyfin quality choice is ambiguous")
+    await selected.click(timeout=15000)
     await page.wait_for_function(
         "height => {const v=document.querySelector('video');return v && v.readyState>=3 && !v.paused"
         " && v.videoHeight>0 && v.videoHeight<=height}",
         arg=maximum_height,
         timeout=60000,
     )
+
+    return int(bitrate)
 
 
 async def _manual_login_field(page):
@@ -441,7 +470,9 @@ async def _capture(  # noqa: C901 -- explicit UI acceptance steps
             details = base + "/web/#/details?id=" + config["item_id"] + "&serverId=" + info["Id"]
             await _play(page, details)
             if real and config.get("max_client_height"):
-                await _select_capture_quality(page, config["max_client_height"])
+                trace["native_client_quality"]["bitrate_bps"] = await _select_capture_quality(
+                    page, config["max_client_height"]
+                )
             if await picture_reader(page) > 2:
                 await seek(0)
             session = await page.evaluate(
