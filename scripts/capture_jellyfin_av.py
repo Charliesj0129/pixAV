@@ -187,7 +187,11 @@ async def _seek(page, target: float, duration: float, *, stuck: bool = False, pi
         rect = await slider.bounding_box()
         if not rect:
             raise ValueError("Jellyfin seek control has no geometry")
-        if picture_reader is _presented_time:
+        if picture_reader is _presented_time and target == 0:
+            # The exact left edge can miss the native range hit area. Home is
+            # a real keyboard seek and avoids injecting a media position.
+            await slider.press("Home")
+        elif picture_reader is _presented_time:
             control = await slider.evaluate("""e => {
                 const r=(e.sliderBubbleTrack||e).getBoundingClientRect(),input=e.getBoundingClientRect();
                 return {min:Number(e.min),max:Number(e.max),step:Number(e.step),
@@ -224,13 +228,43 @@ async def _play(page, details: str, *, resume: bool = False) -> None:
         if resume
         else '.btnPlay[data-action="play"]:not(.hide)'
     )
+    if not resume:
+        await page.locator(
+            '.btnPlay[data-action="play"]:visible, .btnPlay[data-action="resume"]:visible'
+        ).first.wait_for(state="visible", timeout=30000)
+        if not await page.locator(selector).count():
+            selector = '.btnPlay[data-action="resume"][title="Resume"]:not(.hide)'
     button = page.locator(selector).first
     await button.wait_for(state="visible", timeout=30000)
     await button.click()
     await page.wait_for_function(
         "() => {const v=document.querySelector('video');return v && v.readyState>=3 && !v.paused}", timeout=60000
     )
-    await page.wait_for_timeout(600)
+    if resume:
+        await _buffer_resume(page)
+    else:
+        await page.wait_for_timeout(600)
+
+
+async def _buffer_resume(page) -> None:
+    """Keep the real bookmark while the resumed stream buffers, using only UI actions."""
+    await page.get_by_role("button", name="Pause", exact=True).click(timeout=15000)
+    await page.wait_for_function(
+        """() => {
+            const v=document.querySelector('video');
+            if(!v || !v.paused || v.seeking || v.readyState<3) return false;
+            const end=Math.min(v.duration,v.currentTime+10);
+            for(let i=0;i<v.buffered.length;i++)
+                if(v.buffered.start(i)<=v.currentTime && v.buffered.end(i)>=end) return true;
+            return false;
+        }""",
+        timeout=60000,
+    )
+    await page.get_by_role("button", name="Play", exact=True).click(timeout=15000)
+    await page.wait_for_function(
+        "() => {const v=document.querySelector('video');return v && !v.paused && v.readyState>=3}",
+        timeout=15000,
+    )
 
 
 async def _wait_saved_resume(page, server_id: str, item_id: str, target: float) -> float:
@@ -381,11 +415,15 @@ async def _select_capture_quality(page, maximum_height: int) -> int:
     selected = page.locator(f'button.actionSheetMenuItem[data-id="{bitrate}"]:visible')
     if await selected.count() != 1:
         raise ValueError("Jellyfin quality choice is ambiguous")
+    previous_source = await page.locator("video").first.evaluate("v => v.currentSrc")
+    if not previous_source:
+        raise ValueError("Jellyfin quality change has no active media source")
     await selected.click(timeout=15000)
     await page.wait_for_function(
-        "height => {const v=document.querySelector('video');return v && v.readyState>=3 && !v.paused"
-        " && v.videoHeight>0 && v.videoHeight<=height}",
-        arg=maximum_height,
+        "({height,previous_source}) => {const v=document.querySelector('video');"
+        "return v && v.currentSrc !== previous_source && v.currentSrc && v.readyState>=3 && !v.paused"
+        " && !v.seeking && v.videoHeight>0 && v.videoHeight<=height}",
+        arg={"height": maximum_height, "previous_source": previous_source},
         timeout=60000,
     )
 

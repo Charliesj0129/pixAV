@@ -708,7 +708,7 @@ repository 已退休舊隔離 Compose 模板。新的 managed deployment 必須�
 
 [capture runner](scripts/capture_jellyfin_av.py) 與 [capture image](docker/jellyfin-capture.Dockerfile) 操作 headed Chromium 的真 Jellyfin Web。影像由 FFmpeg `x11grab` 錄製，聲音取自 PulseAudio sink monitor；Xvfb／Openbox／xdotool 只提供隔離桌面與原生全螢幕操作，不自行維護 UI automation framework。建置時核對 tools base，部署以 `PIXAV_ACCEPTANCE_CAPTURE_IMAGE` 固定映像 ID。`acceptance-av` profile 使用專用 internal network，只連 Jellyfin；只掛私有 capture 設定與輸出目錄，不掛原始影片、staging、guest 或 Docker socket。capture 為 8 CPU／4 GiB，shm 1 GiB；隔離 Jellyfin 為 8 CPU／4 GiB，供 4K 軟體轉碼；單輪 UI capture 最長 600 秒，FFmpeg 分析每個程序最多 30 秒。
 
-capture 的原生品質選單需等數字 bitrate 選項出現，再選不超過 8 Mbps 的最高可見值；trace 記錄實際 `bitrate_bps`，缺可用選項或選項不唯一時拒絕。初次播放明確選 `data-action="play"`，續播才選 `data-action="resume"`，避免已有書籤時誤用第一個播放按鈕。這些 UI 操作不代替獨立影音比對及人工覆核。
+capture 的原生品質選單需等數字 bitrate 選項出現，再選不超過 8 Mbps 的最高可見值；trace 記錄實際 `bitrate_bps`，缺可用選項或選項不唯一時拒絕。切換品質後須等媒體來源實際更換並恢復可播放，不能把切換前的 readyState 當成完成。初次播放優先選 `data-action="play"`；若詳情頁只有 `resume`，先進入播放器再以進度條原生 Home 鍵回片頭並驗證實際畫面，正式續播窗口仍核對原書籤。這些 UI 操作不代替獨立影音比對及人工覆核。
 
 [synthetic recording analyzer](src/pixav/strm_resolver/av_acceptance.py) 使用帶 checksum 的畫面時間碼、移動圖案及每五秒改變的已知音調。畫面時間由錄影解碼，不能以 DOM clock 代替；同時檢查 marker 以外的 motion、至少兩段音訊 RMS／頻率／幅度及進度，seek／resume 誤差最多兩秒。產生合成原件的容器只供 seeder／獨立 client contract，不能把 local 項目宣稱成 Photos Golden Path。錄影、UI trace、逐點分析、client／server／session／item identity 與 hash 存私有位置。`--fault mute|freeze|wrong-tone|seek-stuck|resume-wrong` 是本專案的故障入口。
 

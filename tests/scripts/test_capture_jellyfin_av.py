@@ -385,6 +385,7 @@ async def test_quality_menu_without_eight_mbps_selects_six_and_checks_decoded_he
     selected = Mock(count=AsyncMock(return_value=1), click=AsyncMock())
     locators = {
         ".btnVideoOsdSettings": settings,
+        "video": Mock(first=Mock(evaluate=AsyncMock(return_value="blob:synthetic-old-source"))),
         "button.actionSheetMenuItem[data-id]:visible": choices,
         'button.actionSheetMenuItem[data-id="6000000"]:visible': selected,
     }
@@ -399,12 +400,16 @@ async def test_quality_menu_without_eight_mbps_selects_six_and_checks_decoded_he
     selected.click.assert_awaited_once()
     assert page.wait_for_function.await_count == 2
     assert "e.dataset.id" in page.wait_for_function.call_args_list[0].args[0]
-    assert page.wait_for_function.call_args.kwargs["arg"] == 1080
+    assert page.wait_for_function.call_args.kwargs["arg"] == {
+        "height": 1080,
+        "previous_source": "blob:synthetic-old-source",
+    }
+    assert "v.currentSrc !== previous_source" in page.wait_for_function.call_args.args[0]
     page.get_by_role.assert_not_called()
 
 
-@pytest.mark.parametrize("resume", [False, True])
-async def test_play_selects_explicit_start_or_resume_action(resume):
+@pytest.mark.parametrize("resume,play_available", [(False, True), (False, False), (True, False)])
+async def test_play_selects_explicit_start_or_resume_action(monkeypatch, resume, play_available):
     from unittest.mock import AsyncMock, Mock
 
     from scripts.capture_jellyfin_av import _play
@@ -413,10 +418,57 @@ async def test_play_selects_explicit_start_or_resume_action(resume):
     page = Mock(
         goto=AsyncMock(),
         reload=AsyncMock(),
-        locator=Mock(return_value=Mock(first=button)),
+        locator=Mock(return_value=Mock(first=button, count=AsyncMock(return_value=int(play_available)))),
         wait_for_function=AsyncMock(),
         wait_for_timeout=AsyncMock(),
     )
+    buffering = AsyncMock()
+    monkeypatch.setattr("scripts.capture_jellyfin_av._buffer_resume", buffering)
     await _play(page, "http://jellyfin:8096/web/#/details?id=synthetic", resume=resume)
+    assert buffering.await_count == int(resume)
     selector = page.locator.call_args.args[0]
-    assert ('data-action="resume"' if resume else 'data-action="play"') in selector
+    assert ('data-action="resume"' if resume or not play_available else 'data-action="play"') in selector
+
+
+async def test_real_seek_to_start_uses_native_home_key(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _presented_time, _seek
+
+    video = Mock(evaluate=AsyncMock(return_value=True))
+    slider = Mock(
+        wait_for=AsyncMock(),
+        hover=AsyncMock(),
+        press=AsyncMock(),
+        bounding_box=AsyncMock(return_value={"width": 100, "height": 20}),
+    )
+    page = Mock(
+        mouse=Mock(move=AsyncMock(), click=AsyncMock()),
+        locator=Mock(side_effect=lambda selector: Mock(first=video) if selector == "video" else slider),
+        get_by_role=Mock(return_value=Mock(click=AsyncMock())),
+        wait_for_function=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    monkeypatch.setattr("scripts.capture_jellyfin_av._wait_picture", AsyncMock())
+    await _seek(page, 0, 2400, picture_reader=_presented_time)
+    slider.press.assert_awaited_once_with("Home")
+    page.mouse.click.assert_not_awaited()
+
+
+async def test_resume_buffer_uses_native_pause_and_play_without_seeking():
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _buffer_resume
+
+    pause, play = Mock(click=AsyncMock()), Mock(click=AsyncMock())
+    page = Mock(
+        get_by_role=Mock(side_effect=lambda role, *, name, exact: pause if name == "Pause" else play),
+        wait_for_function=AsyncMock(),
+    )
+    await _buffer_resume(page)
+    pause.click.assert_awaited_once()
+    play.click.assert_awaited_once()
+    predicates = [c.args[0] for c in page.wait_for_function.call_args_list]
+    assert any("v.buffered.end(i)" in x and "v.paused" in x for x in predicates)
+    page.locator.assert_not_called()
+    page.evaluate.assert_not_called()
