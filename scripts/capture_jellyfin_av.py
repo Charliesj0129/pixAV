@@ -158,9 +158,23 @@ def _real_seek_geometry(control: dict, target: float, duration: float) -> tuple[
     return control["left"] + control["width"] * target / duration, control["top"] + control["height"] / 2
 
 
-async def _seek(page, target: float, duration: float, *, stuck: bool = False, picture_reader=None) -> None:
+async def _reveal_osd(page, name: str | None = None):
+    """Move the real pointer so Jellyfin shows its auto-hiding bottom controls.
+
+    With a button name, wait (bounded) until that control is actually visible
+    and return it; the OSD hides again while the pointer stays still.
+    """
     await page.mouse.move(640, 360)
     await page.mouse.move(640, 660, steps=10)
+    if name is None:
+        return None
+    button = page.get_by_role("button", name=name, exact=True)
+    await button.wait_for(state="visible", timeout=15000)
+    return button
+
+
+async def _seek(page, target: float, duration: float, *, stuck: bool = False, picture_reader=None) -> None:
+    await _reveal_osd(page)
     if not stuck:
         video = page.locator("video").first
         if not await video.evaluate("v => v.paused"):
@@ -187,7 +201,11 @@ async def _seek(page, target: float, duration: float, *, stuck: bool = False, pi
         rect = await slider.bounding_box()
         if not rect:
             raise ValueError("Jellyfin seek control has no geometry")
-        if picture_reader is _presented_time:
+        if picture_reader is _presented_time and target == 0:
+            # The exact left edge can miss the native range hit area. Home is
+            # a real keyboard seek and avoids injecting a media position.
+            await slider.press("Home")
+        elif picture_reader is _presented_time:
             control = await slider.evaluate("""e => {
                 const r=(e.sliderBubbleTrack||e).getBoundingClientRect(),input=e.getBoundingClientRect();
                 return {min:Number(e.min),max:Number(e.max),step:Number(e.step),
@@ -219,14 +237,51 @@ async def _play(page, details: str, *, resume: bool = False) -> None:
         # The details view can retain pre-stop UserData during hash navigation.
         # Reload and wait for its actual Resume action, never inject a position.
         await page.reload(wait_until="domcontentloaded", timeout=60000)
-    selector = '.btnPlay[data-action="resume"][title="Resume"]:not(.hide)' if resume else ".btnPlay:not(.hide)"
+    selector = (
+        '.btnPlay[data-action="resume"][title="Resume"]:visible' if resume else '.btnPlay[data-action="play"]:visible'
+    )
+    if not resume:
+        await page.locator(
+            '.btnPlay[data-action="play"]:visible, .btnPlay[data-action="resume"]:visible'
+        ).first.wait_for(state="visible", timeout=30000)
+        if not await page.locator(selector).count():
+            selector = '.btnPlay[data-action="resume"][title="Resume"]:visible'
     button = page.locator(selector).first
     await button.wait_for(state="visible", timeout=30000)
     await button.click()
     await page.wait_for_function(
         "() => {const v=document.querySelector('video');return v && v.readyState>=3 && !v.paused}", timeout=60000
     )
-    await page.wait_for_timeout(600)
+    if resume:
+        await _buffer_resume(page)
+    else:
+        await page.wait_for_timeout(600)
+
+
+async def _buffer_resume(page) -> None:
+    """Keep the real bookmark while the resumed stream buffers, using only UI actions."""
+    # The OSD auto-hides; reveal it before each native control action.
+    await (await _reveal_osd(page, "Pause")).click(timeout=15000)
+    buffered = await page.wait_for_function(
+        """() => {
+            const v=document.querySelector('video');
+            if(!v || !v.paused || v.seeking || v.readyState<3) return false;
+            if(!Number.isFinite(v.duration)) return 'nonfinite-duration';
+            const end=Math.min(v.duration,v.currentTime+10);
+            for(let i=0;i<v.buffered.length;i++)
+                if(v.buffered.start(i)<=v.currentTime && v.buffered.end(i)>=end) return 'buffered';
+            return false;
+        }""",
+        timeout=60000,
+    )
+    if await buffered.json_value() == "nonfinite-duration":
+        raise ValueError("client media duration is not finite")
+    # Buffering can outlast the OSD timeout, so reveal it again before Play.
+    await (await _reveal_osd(page, "Play")).click(timeout=15000)
+    await page.wait_for_function(
+        "() => {const v=document.querySelector('video');return v && !v.paused && v.readyState>=3}",
+        timeout=15000,
+    )
 
 
 async def _wait_saved_resume(page, server_id: str, item_id: str, target: float) -> float:
@@ -344,23 +399,52 @@ async def _configure_capture_resolution(page, maximum_height: int) -> dict:
         "maximum_height": maximum_height,
         "native_preference_retained": True,
         "limit_supported_resolution": True,
-        "quality": "8 Mbps",
     }
 
 
-async def _select_capture_quality(page, maximum_height: int) -> None:
+def _capture_bitrate(options: list[str | None]) -> str:
+    bounded = [
+        value
+        for value in options
+        if isinstance(value, str) and value.isascii() and value.isdecimal() and 0 < int(value) <= 8_000_000
+    ]
+    if not bounded:
+        raise ValueError("Jellyfin quality menu has no bounded bitrate")
+    return max(bounded, key=int)
+
+
+async def _select_capture_quality(page, maximum_height: int) -> int:
     # Explicit bitrate selection requests transcoding; a resolution ceiling alone
     # does not constrain a direct-play original. All actions use the native UI.
     await page.mouse.move(640, 660)
     await page.locator(".btnVideoOsdSettings").click(timeout=15000)
     await page.get_by_text("Quality", exact=True).click(timeout=15000)
-    await page.get_by_role("button", name="8 Mbps", exact=True).click(timeout=15000)
+    # The settings sheet can remain visible during the quality-sheet transition.
+    # Its Quality row also contains a bitrate label, but its data-id is not numeric.
     await page.wait_for_function(
-        "height => {const v=document.querySelector('video');return v && v.readyState>=3 && !v.paused"
-        " && v.videoHeight>0 && v.videoHeight<=height}",
-        arg=maximum_height,
+        """() => [...document.querySelectorAll('button.actionSheetMenuItem[data-id]')].some(
+            e => e.getBoundingClientRect().height > 0 && /^[0-9]+$/.test(e.dataset.id)
+                && Number(e.dataset.id) > 0)""",
+        timeout=15000,
+    )
+    choices = page.locator("button.actionSheetMenuItem[data-id]:visible")
+    bitrate = _capture_bitrate(await choices.evaluate_all("es => es.map(e => e.getAttribute('data-id'))"))
+    selected = page.locator(f'button.actionSheetMenuItem[data-id="{bitrate}"]:visible')
+    if await selected.count() != 1:
+        raise ValueError("Jellyfin quality choice is ambiguous")
+    previous_source = await page.locator("video").first.evaluate("v => v.currentSrc")
+    if not previous_source:
+        raise ValueError("Jellyfin quality change has no active media source")
+    await selected.click(timeout=15000)
+    await page.wait_for_function(
+        "({height,previous_source}) => {const v=document.querySelector('video');"
+        "return v && v.currentSrc !== previous_source && v.currentSrc && v.readyState>=3 && !v.paused"
+        " && !v.seeking && v.videoHeight>0 && v.videoHeight<=height}",
+        arg={"height": maximum_height, "previous_source": previous_source},
         timeout=60000,
     )
+
+    return int(bitrate)
 
 
 async def _manual_login_field(page):
@@ -441,7 +525,9 @@ async def _capture(  # noqa: C901 -- explicit UI acceptance steps
             details = base + "/web/#/details?id=" + config["item_id"] + "&serverId=" + info["Id"]
             await _play(page, details)
             if real and config.get("max_client_height"):
-                await _select_capture_quality(page, config["max_client_height"])
+                trace["native_client_quality"]["bitrate_bps"] = await _select_capture_quality(
+                    page, config["max_client_height"]
+                )
             if await picture_reader(page) > 2:
                 await seek(0)
             session = await page.evaluate(
@@ -618,8 +704,7 @@ async def _capture(  # noqa: C901 -- explicit UI acceptance steps
                         # Freeze the actual player through its UI before measuring
                         # the saved bookmark. Screenshot decoding and opening
                         # Back otherwise let this short clip advance by seconds.
-                        await page.mouse.move(640, 360)
-                        await page.mouse.move(640, 660, steps=10)
+                        await _reveal_osd(page)
                         if not await video.evaluate("v => v.paused"):
                             await page.get_by_role("button", name="Pause", exact=True).click(timeout=15000)
                         await page.wait_for_function("() => document.querySelector('video')?.paused", timeout=5000)

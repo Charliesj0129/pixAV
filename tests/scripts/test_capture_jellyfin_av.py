@@ -347,3 +347,213 @@ async def test_synthetic_ending_keeps_its_existing_marker_window():
     await _capture_ending(spec, seek, checkpoint)
     seek.assert_awaited_once_with(spec.duration_seconds - 4)
     checkpoint.assert_awaited_once_with("end", spec.duration_seconds - 4)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (["0", "6000000", "4000000", "3000000", "1500000", "720000", "420000"], "6000000"),
+        (["12000000", "8000000", "6000000"], "8000000"),
+        (["Auto", "", None, "-1", "0", "6000000"], "6000000"),
+    ],
+)
+def test_capture_bitrate_uses_highest_visible_choice_within_ceiling(options, expected):
+    from scripts.capture_jellyfin_av import _capture_bitrate
+
+    assert _capture_bitrate(options) == expected
+
+
+@pytest.mark.parametrize("options", [[], ["0", "Auto", None], ["12000000"], ["8 Mbps", "6e6"]])
+def test_capture_bitrate_refuses_missing_bounded_choice(options):
+    from scripts.capture_jellyfin_av import _capture_bitrate
+
+    with pytest.raises(ValueError, match="bounded bitrate"):
+        _capture_bitrate(options)
+
+
+async def test_quality_menu_without_eight_mbps_selects_six_and_checks_decoded_height():
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _select_capture_quality
+
+    settings = Mock(click=AsyncMock())
+    quality = Mock(click=AsyncMock())
+    choices = Mock(
+        first=Mock(wait_for=AsyncMock()),
+        evaluate_all=AsyncMock(return_value=["6000000", "4000000", "3000000", "1500000", "720000", "420000"]),
+    )
+    selected = Mock(count=AsyncMock(return_value=1), click=AsyncMock())
+    locators = {
+        ".btnVideoOsdSettings": settings,
+        "video": Mock(first=Mock(evaluate=AsyncMock(return_value="blob:synthetic-old-source"))),
+        "button.actionSheetMenuItem[data-id]:visible": choices,
+        'button.actionSheetMenuItem[data-id="6000000"]:visible': selected,
+    }
+    page = Mock(
+        mouse=Mock(move=AsyncMock()),
+        locator=Mock(side_effect=locators.__getitem__),
+        get_by_text=Mock(return_value=quality),
+        get_by_role=Mock(return_value=Mock(click=AsyncMock(side_effect=TimeoutError("8 Mbps absent")))),
+        wait_for_function=AsyncMock(),
+    )
+    assert await _select_capture_quality(page, 1080) == 6_000_000
+    selected.click.assert_awaited_once()
+    assert page.wait_for_function.await_count == 2
+    assert "e.dataset.id" in page.wait_for_function.call_args_list[0].args[0]
+    assert page.wait_for_function.call_args.kwargs["arg"] == {
+        "height": 1080,
+        "previous_source": "blob:synthetic-old-source",
+    }
+    assert "v.currentSrc !== previous_source" in page.wait_for_function.call_args.args[0]
+    page.get_by_role.assert_not_called()
+
+
+@pytest.mark.parametrize("resume,play_available", [(False, True), (False, False), (True, False)])
+async def test_play_selects_explicit_start_or_resume_action(monkeypatch, resume, play_available):
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _play
+
+    button = Mock(wait_for=AsyncMock(), click=AsyncMock())
+    page = Mock(
+        goto=AsyncMock(),
+        reload=AsyncMock(),
+        locator=Mock(return_value=Mock(first=button, count=AsyncMock(return_value=int(play_available)))),
+        wait_for_function=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    buffering = AsyncMock()
+    monkeypatch.setattr("scripts.capture_jellyfin_av._buffer_resume", buffering)
+    await _play(page, "http://jellyfin:8096/web/#/details?id=synthetic", resume=resume)
+    assert buffering.await_count == int(resume)
+    selector = page.locator.call_args.args[0]
+    assert ('data-action="resume"' if resume or not play_available else 'data-action="play"') in selector
+
+
+async def test_real_seek_to_start_uses_native_home_key(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _presented_time, _seek
+
+    video = Mock(evaluate=AsyncMock(return_value=True))
+    slider = Mock(
+        wait_for=AsyncMock(),
+        hover=AsyncMock(),
+        press=AsyncMock(),
+        bounding_box=AsyncMock(return_value={"width": 100, "height": 20}),
+    )
+    page = Mock(
+        mouse=Mock(move=AsyncMock(), click=AsyncMock()),
+        locator=Mock(side_effect=lambda selector: Mock(first=video) if selector == "video" else slider),
+        get_by_role=Mock(return_value=Mock(click=AsyncMock())),
+        wait_for_function=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    monkeypatch.setattr("scripts.capture_jellyfin_av._wait_picture", AsyncMock())
+    await _seek(page, 0, 2400, picture_reader=_presented_time)
+    slider.press.assert_awaited_once_with("Home")
+    page.mouse.click.assert_not_awaited()
+
+
+async def test_resume_buffer_uses_native_pause_and_play_without_seeking():
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _buffer_resume
+
+    pause = Mock(click=AsyncMock(), wait_for=AsyncMock())
+    play = Mock(click=AsyncMock(), wait_for=AsyncMock())
+    page = Mock(
+        mouse=Mock(move=AsyncMock()),
+        get_by_role=Mock(side_effect=lambda role, *, name, exact: pause if name == "Pause" else play),
+        wait_for_function=AsyncMock(return_value=Mock(json_value=AsyncMock(return_value="buffered"))),
+    )
+    await _buffer_resume(page)
+    pause.click.assert_awaited_once()
+    play.click.assert_awaited_once()
+    predicates = [c.args[0] for c in page.wait_for_function.call_args_list]
+    assert any("v.buffered.end(i)" in x and "v.paused" in x for x in predicates)
+    page.locator.assert_not_called()
+    page.evaluate.assert_not_called()
+
+
+def _osd_page(events, *, buffer_state="buffered"):
+    """A page whose actions record their order; buttons hide unless revealed."""
+    from unittest.mock import AsyncMock, Mock
+
+    def button(name):
+        async def wait_for(**kwargs):
+            events.append(("wait_visible", name, kwargs.get("timeout")))
+
+        async def click(**kwargs):
+            events.append(("click", name))
+
+        return Mock(wait_for=AsyncMock(side_effect=wait_for), click=AsyncMock(side_effect=click))
+
+    buttons = {"Pause": button("Pause"), "Play": button("Play")}
+
+    async def move(x, y, **kwargs):
+        events.append(("move", x, y))
+
+    async def wait_for_function(predicate, **kwargs):
+        events.append(("wait_function", "buffered" if "v.buffered" in predicate else "playing"))
+        return Mock(json_value=AsyncMock(return_value=buffer_state if "v.buffered" in predicate else True))
+
+    return Mock(
+        mouse=Mock(move=AsyncMock(side_effect=move)),
+        get_by_role=Mock(side_effect=lambda role, *, name, exact: buttons[name]),
+        wait_for_function=AsyncMock(side_effect=wait_for_function),
+    )
+
+
+async def test_resume_buffer_reveals_controls_before_pause_and_after_buffering_before_play():
+    from scripts.capture_jellyfin_av import _buffer_resume
+
+    events: list = []
+    await _buffer_resume(_osd_page(events))
+    pause_click = events.index(("click", "Pause"))
+    buffered = events.index(("wait_function", "buffered"))
+    play_click = events.index(("click", "Play"))
+    assert pause_click < buffered < play_click
+    before_pause, before_play = events[:pause_click], events[buffered + 1 : play_click]
+    for window, name in ((before_pause, "Pause"), (before_play, "Play")):
+        assert ("move", 640, 360) in window and ("move", 640, 660) in window
+        assert window.index(("move", 640, 660)) < window.index(("wait_visible", name, 15000))
+
+
+async def test_resume_buffer_refuses_non_finite_duration_without_pressing_play():
+    from scripts.capture_jellyfin_av import _buffer_resume
+
+    events: list = []
+    page = _osd_page(events, buffer_state="nonfinite-duration")
+    with pytest.raises(ValueError, match="client media duration is not finite"):
+        await _buffer_resume(page)
+    assert ("click", "Play") not in events
+    predicate = page.wait_for_function.call_args_list[0].args[0]
+    assert "Number.isFinite(v.duration)" in predicate
+    assert predicate.index("Number.isFinite(v.duration)") < predicate.index("Math.min(v.duration")
+
+
+@pytest.mark.parametrize("resume,play_available", [(False, True), (False, False), (True, False)])
+async def test_play_counts_and_waits_on_the_same_visible_actions(monkeypatch, resume, play_available):
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.capture_jellyfin_av import _play
+
+    selectors: list[str] = []
+    button = Mock(wait_for=AsyncMock(), click=AsyncMock())
+
+    def locator(selector):
+        selectors.append(selector)
+        return Mock(first=button, count=AsyncMock(return_value=int(play_available)))
+
+    page = Mock(
+        goto=AsyncMock(),
+        reload=AsyncMock(),
+        locator=Mock(side_effect=locator),
+        wait_for_function=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    monkeypatch.setattr("scripts.capture_jellyfin_av._buffer_resume", AsyncMock())
+    await _play(page, "http://jellyfin:8096/web/#/details?id=synthetic", resume=resume)
+    assert selectors
+    assert all(":visible" in selector and ".hide" not in selector for selector in selectors)
