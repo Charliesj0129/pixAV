@@ -16,6 +16,16 @@ from pixav.pixel_injector.session import RedroidSession
 from pixav.shared.models import Account, VideoPart
 
 ACCOUNT_DISC = {"resource-id": "com.google.android.apps.photos:id/selected_account_disc"}
+ROOMY_DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/block/dm-36 67108864 1024 67000000 1% /data\n"
+
+
+def guest_space_answer(args) -> str | None:
+    """Answers for the free-space and stage-removal questions a push asks."""
+    if "df" in args:
+        return ROOMY_DF
+    if any("[ -e " in arg for arg in args):
+        return "ABSENT\n"
+    return None
 
 
 @pytest.fixture
@@ -169,6 +179,8 @@ async def test_resume_reconciles_guest_and_media_store_without_repush_bdd_048_00
     u.adb.side_effect = [
         u.part.sha256 + " stage",
         u.part.sha256 + " remote",
+        "",
+        "ABSENT\n",
         f"Row: 0 _id=42, _display_name={u.part.filename}, _size=8",
     ]
     remote = await u.push_file(session, str(path))
@@ -190,6 +202,8 @@ async def test_fresh_push_journals_each_effect_before_call(upload):
         if "cp" in args:
             assert u.recovery["publish_intent"]
         effects.append(args)
+        if (answer := guest_space_answer(args)) is not None:
+            return answer
         if "sha256sum" in args:
             return u.part.sha256 + " file"
         if args[0] == "shell" and args[1].startswith("content query"):
@@ -255,7 +269,9 @@ async def test_managed_push_keeps_the_read_inode_locked_in_the_transfer_child(up
                 command, capture_output=True, timeout=15, check=False
             )
             return SimpleNamespace(exit_code=result.returncode, output=result.stdout)
-        if "sha256sum" in command:
+        if (answer := guest_space_answer(command)) is not None:
+            output = answer
+        elif "sha256sum" in command:
             output = u.part.sha256 + " synthetic"
         else:
             output = f"Row: 0 _id=42, _display_name={u.part.filename}, _size=8"
@@ -395,6 +411,8 @@ async def test_managed_segments_are_pushed_from_their_own_asset_directory(upload
     path.write_bytes(b"original")
 
     async def adb(*args, **kwargs):
+        if (answer := guest_space_answer(args)) is not None:
+            return answer
         if "sha256sum" in args:
             return u.part.sha256 + " file"
         if args[0] == "shell" and args[1].startswith("content query"):

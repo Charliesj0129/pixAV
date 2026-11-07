@@ -548,6 +548,49 @@ async def test_storage_resume_cannot_release_a_held_playback_execution(workflow)
     assert await workflow.pool.fetchval("SELECT state FROM executions") == "USER_ACTION_REQUIRED"
 
 
+async def test_a_held_upload_is_not_dispatched_until_resumed(workflow):
+    """An operator can park one upload without the system pause or an account cooldown."""
+    from pixav.maxwell_core.upload_hold import hold_upload
+
+    await reach_upload(workflow)
+    await add_account(workflow)
+    execution = await workflow.pool.fetchval("SELECT id FROM executions")
+    generation = await workflow.pool.fetchval("SELECT generation FROM executions")
+
+    await hold_upload(workflow.pool, execution, operator="fixture-operator", reason="another upload is verifying")
+
+    row = await workflow.pool.fetchrow("SELECT state,blocked_reason,generation,checkpoint FROM executions")
+    assert (row["state"], row["blocked_reason"]) == ("USER_ACTION_REQUIRED", "OPERATOR_UPLOAD_HOLD")
+    assert row["generation"] == generation + 1
+    assert json.loads(row["checkpoint"])["operator_upload_hold"]["state_before"] == "READY"
+    assert await workflow.pool.fetchval("SELECT state FROM remote_asset_segments") == "prepared"
+    assert await workflow.next_activity() is None
+    assert await workflow.pool.fetchval("SELECT count(*) FROM account_leases") == 0
+
+    await StorageWorkflow(workflow.pool).resume_after_user_action(
+        execution, operator="fixture-operator", reason="verification finished"
+    )
+    assert (await workflow.next_activity()).stage == "upload"
+
+
+async def test_a_running_or_non_upload_execution_cannot_be_held(workflow):
+    from pixav.maxwell_core.upload_hold import hold_upload
+
+    await reach_upload(workflow)
+    await add_account(workflow)
+    execution = await workflow.pool.fetchval("SELECT id FROM executions")
+    await workflow.next_activity()
+    assert await workflow.pool.fetchval("SELECT state FROM executions") == "RUNNING"
+    with pytest.raises(ValueError, match="not running"):
+        await hold_upload(workflow.pool, execution, operator="fixture-operator", reason="too late")
+    with pytest.raises(ValueError, match="operator and reason"):
+        await hold_upload(workflow.pool, execution, operator=" ", reason="")
+    await workflow.pool.execute("UPDATE executions SET state='READY',stage='verify'")
+    with pytest.raises(ValueError, match="only an upload"):
+        await hold_upload(workflow.pool, execution, operator="fixture-operator", reason="wrong stage")
+    assert await workflow.pool.fetchval("SELECT count(*) FROM account_leases") == 1
+
+
 async def test_verification_failure_never_becomes_durable_bdd_055_059(workflow):
     await reach_upload(workflow)
     await add_account(workflow)

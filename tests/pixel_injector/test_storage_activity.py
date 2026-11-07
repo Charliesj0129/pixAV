@@ -197,6 +197,7 @@ async def test_login_challenge_stops_automatic_submission_bdd_045():
         "WRONG_PROVIDER_ITEM",
         "REMOTE_OUTCOME_UNKNOWN",
         "RUNTIME_BINDING_CHANGED",
+        "GUEST_SPACE_INSUFFICIENT",
     ],
 )
 async def test_upload_review_codes_are_fixed_and_do_not_expose_private_exception(code):

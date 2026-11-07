@@ -39,7 +39,8 @@ pixAV 的目標是將外部媒體轉成已驗證、可長期由 Google Photos �
 - `.env`、`secrets/`、`backups/` 不進版控；credential 不進 log、model repr、metrics、fixture、projection 或 Maestro YAML。private playback 必須驗收未授權 client 與撤銷裝置被拒絕。
 - 新 cohort 的真實影音採版本化 evidence，完整 manifest／reference／錄影與全部交界須可重算；自動 capture 不能代替操作者實看實聽，舊版人工證據不自動升級。
 - 2026-10-12 操作者授權設計 checkpoint 重置：舊隔離影片／分段／回載／播放 cache／影音錄影可依 exact-target manifest 人工丟棄且不備份影片本體。先保留並驗證 D 槽的程式／設定／DB／roles／ledger／queue／guest／未知上傳紀錄與認證；此為一次性人工重置，不記 Golden Path PASS，不放寬正式 cleanup 或未知副作用 reconciliation。舊 cohort 的已刪媒體與錄影不抵新驗收，下一輪用新 cohort 重跑全部 gate。
-- staging cleanup 必須同時滿足遠端 DURABLE、有效完整性證據、播放 READY 且實播驗證完成、完整 publication、retention 到期、無 active execution/reader、path/ownership 與操作守衛通過。資格檢查到 unlink 之間防止競態；cleanup crash 後核對 filesystem 並留下 audit。
+- staging cleanup 必須同時滿足遠端 DURABLE、有效完整性證據、播放 READY 且實播驗證完成、完整 publication、retention 到期、無 active execution/reader、path/ownership 與操作守衛通過。資格檢查到 unlink 之間防止競態；cleanup crash 後核對 filesystem 並留下 audit。2026-11-01 操作者決定本輪 host staging retention 部署值為 6 小時，其他條件不變。
+- upload environment 內的 guest stage 與 published copy 不是備份：該段 DURABLE 後依 exact path／hash／runtime binding 刪除，刪 published copy 後須新 cold read-back 證明遠端仍在；結果不明或待人工的段保留。推送前 guest 可用空間須至少兩倍段大小加餘裕，不足不推送、不留半寫入檔。上述尚未實作，未實作前不得以手動刪除取代授權流程。
 - Linux 媒體 reader／writer 使用共同 descriptor 鎖協定；子程序須繼承鎖，unlink 以固定 parent descriptor 執行並持鎖至 domain commit。尚未接入的 reader、qBittorrent 或其他 filesystem 不能以現有隔離鎖證據放行 cleanup；完整 coverage 與操作授權仍依 README 分別驗收。
 - cleanup 授權須符合當次 inode、DB／資產／publication binding；舊文字授權不回填成新核准。套用 025 expand migration 或 rollback 時維持 cleanup 關閉，停止會忽略 binding 的不相容 janitor；binding 不代替備份還原收據或操作者授權。
 - 026 expand migration 的收據核准由私有 `manage_cleanup files / authorize` 入口登錄，預設 dry-run，兩者不刪媒體；只有具權限操作者提供的 restore attestation 或明確 opt-in 的隔離例外可成為核准，不把檔案 hash 當實際還原證明。intent／audit 保留核准與收據摘要，缺歷史同意的 intent 不自動 recovery；完整 apply 操作入口、全部 reader／runtime 與 durability gates 通過前維持 cleanup 關閉；隔離 PostgreSQL／restore 或單一容器契約不能代替整輪驗收，不新增備份工作。

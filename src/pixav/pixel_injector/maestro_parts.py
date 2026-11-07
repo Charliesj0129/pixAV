@@ -29,6 +29,7 @@ from pixav.pixel_injector.android_target import CONTAINER_ANDROID_TARGET
 from pixav.pixel_injector.canary import OWNER_LABEL, CanaryBlockedError
 from pixav.pixel_injector.canary_acceptance import collect_item
 from pixav.pixel_injector.canary_maestro import hierarchy, run_flow
+from pixav.pixel_injector.guest_space import GUEST_STAGE_DIRECTORY, guest_push_required_bytes, parse_available_bytes
 from pixav.pixel_injector.session import RedroidSession, WindowsAndroidSession
 from pixav.pixel_injector.uploader import media_provider_scan_command
 from pixav.pixel_injector.windows_device import WindowsAndroidDevice
@@ -77,6 +78,7 @@ class UploadReviewRequiredError(CanaryBlockedError):
             "WRONG_PROVIDER_ITEM",
             "REMOTE_OUTCOME_UNKNOWN",
             "RUNTIME_BINDING_CHANGED",
+            "GUEST_SPACE_INSUFFICIENT",
         ],
         message: str,
     ) -> None:
@@ -86,6 +88,7 @@ class UploadReviewRequiredError(CanaryBlockedError):
             "WRONG_PROVIDER_ITEM",
             "REMOTE_OUTCOME_UNKNOWN",
             "RUNTIME_BINDING_CHANGED",
+            "GUEST_SPACE_INSUFFICIENT",
         }:
             raise ValueError("unsupported upload review classification")
         super().__init__(message)
@@ -574,9 +577,10 @@ class MaestroPartUploader:
         self.guard(session)
         path = Path(local_path)
         version = await run_media_work(_push_source_version, path, self.part)
-        stage = "/data/local/tmp/" + self.part.filename
+        stage = GUEST_STAGE_DIRECTORY + "/" + self.part.filename
         remote = "/sdcard/DCIM/Camera/" + self.part.filename
         if not self.recovery.get("push_intent"):
+            await self._admit_push()
             self.recovery["push_intent"] = True
             await self.receipt("push")
             await self.adb(
@@ -587,11 +591,14 @@ class MaestroPartUploader:
                 media_version=version,
             )
         # An interrupted push may have left partial bytes. Never infer successful publication.
-        if (await self.adb("shell", "sha256sum", stage, timeout=21600)).split()[0] != self.part.sha256:
-            raise UploadReviewRequiredError(
-                "GUEST_STAGE_HASH_MISMATCH", "guest stage hash mismatch; retained for reconciliation"
-            )
-        await self.receipt("push", complete=True)
+        # Once the stage release began, the published copy was already verified.
+        released = self.recovery.get("publish_intent") and self.recovery.get("stage_release_intent")
+        if not released:
+            if (await self.adb("shell", "sha256sum", stage, timeout=21600)).split()[0] != self.part.sha256:
+                raise UploadReviewRequiredError(
+                    "GUEST_STAGE_HASH_MISMATCH", "guest stage hash mismatch; retained for reconciliation"
+                )
+            await self.receipt("push", complete=True)
         if not self.recovery.get("publish_intent"):
             self.recovery["publish_intent"] = True
             await self.receipt("publish")
@@ -600,8 +607,44 @@ class MaestroPartUploader:
         if (await self.adb("shell", "sha256sum", remote, timeout=21600)).split()[0] != self.part.sha256:
             raise UploadReviewRequiredError("PUBLISHED_COPY_HASH_MISMATCH", "published guest file hash mismatch")
         await self.receipt("publish", complete=True)
+        await self._release_stage(stage)
         await self._media_store(remote)
         return remote
+
+    async def _admit_push(self) -> None:
+        """Refuse a push the guest cannot hold, before any byte is written."""
+        output = await self.adb("shell", "df", "-k", GUEST_STAGE_DIRECTORY)
+        available = parse_available_bytes(output)
+        if available is None or available < guest_push_required_bytes(self.part.size_bytes):
+            raise UploadReviewRequiredError("GUEST_SPACE_INSUFFICIENT", "guest free space below push requirement")
+
+    async def _release_stage(self, stage: str) -> None:
+        """Remove the stage copy once the published copy matched; it only doubles guest usage.
+
+        On a resume the earlier removal may have completed and the path may since
+        hold another file, so an absent stage is already released and a present
+        one must still match this part before it is removed.
+        """
+        if not self.recovery.get("stage_release_intent"):
+            self.recovery["stage_release_intent"] = True
+            await self.receipt("stage_release")
+        elif not await self._stage_present(stage):
+            await self.receipt("stage_release", complete=True)
+            return
+        elif (await self.adb("shell", "sha256sum", stage, timeout=21600)).split()[0] != self.part.sha256:
+            raise UploadReviewRequiredError(
+                "GUEST_STAGE_HASH_MISMATCH", "guest stage hash mismatch; retained for reconciliation"
+            )
+        await self.adb("shell", "rm", "-f", stage)
+        if await self._stage_present(stage):
+            raise CanaryBlockedError("guest stage copy was not removed")
+        await self.receipt("stage_release", complete=True)
+
+    async def _stage_present(self, stage: str) -> bool:
+        """Only an explicit ABSENT counts as gone; any other answer keeps the stage."""
+        quoted = shlex.quote(stage)
+        answer = await self.adb("shell", f"if [ -e {quoted} ]; then echo PRESENT; else echo ABSENT; fi")
+        return answer.strip() != "ABSENT"
 
     def _media_store_scanned(self, rows: str) -> bool:
         """True once the provider reports this part's own byte count."""

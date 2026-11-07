@@ -319,6 +319,7 @@ def test_full_decoder_refuses_exit_failure_or_error_output(tmp_path, monkeypatch
         "private_item",
         "item_unavailable",
         "provider_session_expired",
+        "provider_signed_out",
         "wrong_item",
         "expired_session",
         "source-change-during-decode",
@@ -340,6 +341,7 @@ def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit
     page.url = {
         "private_item": "https://photos.google.com/photo/synthetic",
         "provider_session_expired": "https://accounts.google.com/synthetic-login",
+        "provider_signed_out": "https://www.google.com/photos/about/",
     }.get(fault, "https://photos.google.com/share/synthetic")
     if fault == "private_item":
         part = part.model_copy(update={"share_url": page.url})
@@ -387,9 +389,16 @@ def test_authenticated_original_uses_fresh_context_and_probes_after_browser_exit
     error = {
         "expired_session": AccountSessionRequiredError,
         "provider_session_expired": AccountSessionRequiredError,
+        "provider_signed_out": AccountSessionRequiredError,
         "item_unavailable": browser_timeout,
     }.get(fault, OriginalMismatchError)
-    if fault in ("wrong_item", "expired_session", "provider_session_expired", "item_unavailable"):
+    if fault in (
+        "wrong_item",
+        "expired_session",
+        "provider_session_expired",
+        "provider_signed_out",
+        "item_unavailable",
+    ):
         with pytest.raises(error):
             parts_download.download_original(part, tmp_path, authentication=SECRET)
         assert not decoded
