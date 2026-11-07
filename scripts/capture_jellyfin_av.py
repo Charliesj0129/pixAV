@@ -158,9 +158,23 @@ def _real_seek_geometry(control: dict, target: float, duration: float) -> tuple[
     return control["left"] + control["width"] * target / duration, control["top"] + control["height"] / 2
 
 
-async def _seek(page, target: float, duration: float, *, stuck: bool = False, picture_reader=None) -> None:
+async def _reveal_osd(page, name: str | None = None):
+    """Move the real pointer so Jellyfin shows its auto-hiding bottom controls.
+
+    With a button name, wait (bounded) until that control is actually visible
+    and return it; the OSD hides again while the pointer stays still.
+    """
     await page.mouse.move(640, 360)
     await page.mouse.move(640, 660, steps=10)
+    if name is None:
+        return None
+    button = page.get_by_role("button", name=name, exact=True)
+    await button.wait_for(state="visible", timeout=15000)
+    return button
+
+
+async def _seek(page, target: float, duration: float, *, stuck: bool = False, picture_reader=None) -> None:
+    await _reveal_osd(page)
     if not stuck:
         video = page.locator("video").first
         if not await video.evaluate("v => v.paused"):
@@ -224,16 +238,14 @@ async def _play(page, details: str, *, resume: bool = False) -> None:
         # Reload and wait for its actual Resume action, never inject a position.
         await page.reload(wait_until="domcontentloaded", timeout=60000)
     selector = (
-        '.btnPlay[data-action="resume"][title="Resume"]:not(.hide)'
-        if resume
-        else '.btnPlay[data-action="play"]:not(.hide)'
+        '.btnPlay[data-action="resume"][title="Resume"]:visible' if resume else '.btnPlay[data-action="play"]:visible'
     )
     if not resume:
         await page.locator(
             '.btnPlay[data-action="play"]:visible, .btnPlay[data-action="resume"]:visible'
         ).first.wait_for(state="visible", timeout=30000)
         if not await page.locator(selector).count():
-            selector = '.btnPlay[data-action="resume"][title="Resume"]:not(.hide)'
+            selector = '.btnPlay[data-action="resume"][title="Resume"]:visible'
     button = page.locator(selector).first
     await button.wait_for(state="visible", timeout=30000)
     await button.click()
@@ -248,19 +260,24 @@ async def _play(page, details: str, *, resume: bool = False) -> None:
 
 async def _buffer_resume(page) -> None:
     """Keep the real bookmark while the resumed stream buffers, using only UI actions."""
-    await page.get_by_role("button", name="Pause", exact=True).click(timeout=15000)
-    await page.wait_for_function(
+    # The OSD auto-hides; reveal it before each native control action.
+    await (await _reveal_osd(page, "Pause")).click(timeout=15000)
+    buffered = await page.wait_for_function(
         """() => {
             const v=document.querySelector('video');
             if(!v || !v.paused || v.seeking || v.readyState<3) return false;
+            if(!Number.isFinite(v.duration)) return 'nonfinite-duration';
             const end=Math.min(v.duration,v.currentTime+10);
             for(let i=0;i<v.buffered.length;i++)
-                if(v.buffered.start(i)<=v.currentTime && v.buffered.end(i)>=end) return true;
+                if(v.buffered.start(i)<=v.currentTime && v.buffered.end(i)>=end) return 'buffered';
             return false;
         }""",
         timeout=60000,
     )
-    await page.get_by_role("button", name="Play", exact=True).click(timeout=15000)
+    if await buffered.json_value() == "nonfinite-duration":
+        raise ValueError("client media duration is not finite")
+    # Buffering can outlast the OSD timeout, so reveal it again before Play.
+    await (await _reveal_osd(page, "Play")).click(timeout=15000)
     await page.wait_for_function(
         "() => {const v=document.querySelector('video');return v && !v.paused && v.readyState>=3}",
         timeout=15000,
@@ -687,8 +704,7 @@ async def _capture(  # noqa: C901 -- explicit UI acceptance steps
                         # Freeze the actual player through its UI before measuring
                         # the saved bookmark. Screenshot decoding and opening
                         # Back otherwise let this short clip advance by seconds.
-                        await page.mouse.move(640, 360)
-                        await page.mouse.move(640, 660, steps=10)
+                        await _reveal_osd(page)
                         if not await video.evaluate("v => v.paused"):
                             await page.get_by_role("button", name="Pause", exact=True).click(timeout=15000)
                         await page.wait_for_function("() => document.querySelector('video')?.paused", timeout=5000)
