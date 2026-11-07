@@ -168,3 +168,51 @@ async def test_a_mismatched_published_copy_keeps_the_stage_copy(upload):
         await u.push_file(session, str(path))
     assert "stage_release_intent" not in u.recovery
     assert all(call.args[:2] != ("shell", "rm") for call in u.adb.await_args_list)
+
+
+def resumed_after_release(u, *, stage_hash: str | None):
+    """A resume after the release intent; ``stage_hash`` None means the earlier removal completed."""
+    u.recovery.update(push_intent=True, publish_intent=True, stage_release_intent=True, media_id="42")
+    inner = answers(u)
+    state = {"present": stage_hash is not None}
+
+    async def adb(*args, **kwargs):
+        if any("[ -e " in arg for arg in args):
+            return "PRESENT\n" if state["present"] else "ABSENT\n"
+        if args[:3] == ("shell", "rm", "-f"):
+            state["present"] = False
+            return ""
+        if "sha256sum" in args and args[-1].startswith("/data/local/tmp/"):
+            assert state["present"], "hashed an absent stage"
+            return f"{stage_hash} file"
+        return await inner(*args, **kwargs)
+
+    u.adb.side_effect = adb
+
+
+async def test_resume_treats_an_absent_stage_as_already_released(upload):
+    u, session, path = upload
+    resumed_after_release(u, stage_hash=None)
+    await u.push_file(session, str(path))
+    assert all(call.args[:2] != ("shell", "rm") for call in u.adb.await_args_list)
+    assert u.recovery["operations"]["stage_release"]["identity_verified"]
+
+
+async def test_resume_verifies_a_remaining_stage_before_removing_it(upload):
+    u, session, path = upload
+    resumed_after_release(u, stage_hash=u.part.sha256)
+    await u.push_file(session, str(path))
+    calls = [call.args for call in u.adb.await_args_list]
+    stage = f"/data/local/tmp/{u.part.filename}"
+    assert calls.index(("shell", "sha256sum", stage)) < calls.index(("shell", "rm", "-f", stage))
+    assert u.recovery["operations"]["stage_release"]["identity_verified"]
+
+
+async def test_resume_keeps_a_foreign_file_at_the_stage_path(upload):
+    u, session, path = upload
+    resumed_after_release(u, stage_hash="0" * 64)
+    with pytest.raises(UploadReviewRequiredError, match="stage") as caught:
+        await u.push_file(session, str(path))
+    assert caught.value.code == "GUEST_STAGE_HASH_MISMATCH"
+    assert all(call.args[:2] != ("shell", "rm") for call in u.adb.await_args_list)
+    assert "completed_at" not in u.recovery["operations"].get("stage_release", {})

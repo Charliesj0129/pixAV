@@ -619,17 +619,32 @@ class MaestroPartUploader:
             raise UploadReviewRequiredError("GUEST_SPACE_INSUFFICIENT", "guest free space below push requirement")
 
     async def _release_stage(self, stage: str) -> None:
-        """Remove the stage copy once the published copy matched; it only doubles guest usage."""
+        """Remove the stage copy once the published copy matched; it only doubles guest usage.
+
+        On a resume the earlier removal may have completed and the path may since
+        hold another file, so an absent stage is already released and a present
+        one must still match this part before it is removed.
+        """
         if not self.recovery.get("stage_release_intent"):
             self.recovery["stage_release_intent"] = True
             await self.receipt("stage_release")
-        quoted = shlex.quote(stage)
+        elif not await self._stage_present(stage):
+            await self.receipt("stage_release", complete=True)
+            return
+        elif (await self.adb("shell", "sha256sum", stage, timeout=21600)).split()[0] != self.part.sha256:
+            raise UploadReviewRequiredError(
+                "GUEST_STAGE_HASH_MISMATCH", "guest stage hash mismatch; retained for reconciliation"
+            )
         await self.adb("shell", "rm", "-f", stage)
-        if (
-            await self.adb("shell", f"if [ -e {quoted} ]; then echo PRESENT; else echo ABSENT; fi")
-        ).strip() != "ABSENT":
+        if await self._stage_present(stage):
             raise CanaryBlockedError("guest stage copy was not removed")
         await self.receipt("stage_release", complete=True)
+
+    async def _stage_present(self, stage: str) -> bool:
+        """Only an explicit ABSENT counts as gone; any other answer keeps the stage."""
+        quoted = shlex.quote(stage)
+        answer = await self.adb("shell", f"if [ -e {quoted} ]; then echo PRESENT; else echo ABSENT; fi")
+        return answer.strip() != "ABSENT"
 
     def _media_store_scanned(self, rows: str) -> bool:
         """True once the provider reports this part's own byte count."""
