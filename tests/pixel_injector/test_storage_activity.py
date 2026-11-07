@@ -696,6 +696,32 @@ def test_review_location_keeps_only_the_fixed_native_rejection_code():
     assert "retain" not in location
 
 
+def test_review_location_keeps_the_native_code_of_a_replaced_rejection():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy
+    from pixav.pixel_injector.storage_activity import _review_location
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock(post=Mock(return_value=httpx.Response(409, json={"detail": "NATIVE_RESOURCE_HALTED"})))
+    try:
+        try:
+            client.call("observe", Mock(model_dump_json=Mock(return_value="{}")))
+        finally:
+            hierarchy(SimpleNamespace(labels={}), "owner")
+    except CanaryBlockedError as error:
+        location = _review_location(error)
+    assert location.startswith("pixav.pixel_injector.canary_maestro.hierarchy:")
+    assert " after pixav.pixel_injector.windows_control.call:" in location
+    assert location.endswith(" code NATIVE_RESOURCE_HALTED")
+    assert "retain" not in location
+
+
 def _translated(suppress_context: bool) -> Exception:
     from types import SimpleNamespace
 
