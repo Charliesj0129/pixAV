@@ -890,6 +890,20 @@ async def test_details_failure_is_not_masked_by_a_pause_after_halt(upload):
     assert u.adb.await_args.args == ("shell", "input", "keyevent", "127")
 
 
+async def test_suppressed_details_pause_failure_is_logged_by_class_only(upload, caplog):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(side_effect=CanaryBlockedError("UI unavailable"))
+    u.adb.side_effect = ["", "", CanaryBlockedError("private pause detail")]
+    with caplog.at_level(logging.WARNING, logger="pixav.pixel_injector.maestro_parts"):
+        with pytest.raises(CanaryBlockedError, match="UI unavailable"):
+            await u.open_details()
+    records = [r for r in caplog.records if r.name == "pixav.pixel_injector.maestro_parts"]
+    assert len(records) == 1
+    assert "CanaryBlockedError" in records[0].getMessage()
+    assert "private pause detail" not in caplog.text
+
+
 async def test_details_pause_failure_after_success_still_stops(upload):
     u, _, _ = upload
     u.recovery["media_id"] = "123"

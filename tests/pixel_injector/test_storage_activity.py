@@ -694,3 +694,51 @@ def test_review_location_keeps_only_the_fixed_native_rejection_code():
     assert location.startswith("pixav.pixel_injector.windows_control.call:")
     assert location.endswith(" code NATIVE_RESOURCE_HALTED")
     assert "retain" not in location
+
+
+def _translated(suppress_context: bool) -> Exception:
+    from types import SimpleNamespace
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy
+
+    try:
+        try:
+            hierarchy(SimpleNamespace(labels={}), "owner")
+        except CanaryBlockedError as exc:
+            if suppress_context:
+                raise RuntimeError("translated") from None
+            raise RuntimeError("translated") from exc
+    except RuntimeError as error:
+        return error
+    raise AssertionError("translation did not raise")
+
+
+@pytest.mark.parametrize("suppress_context", [True, False], ids=["from-none", "from-exc"])
+def test_review_location_does_not_treat_explicit_translation_as_a_replaced_step(suppress_context):
+    from pixav.pixel_injector.storage_activity import _review_location
+
+    error = _translated(suppress_context)
+    assert error.__context__ is not None
+    location = _review_location(error)
+    assert " after " not in location
+    assert "private" not in location
+
+
+def test_review_location_does_not_report_connect_error_translation_as_after():
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.storage_activity import _review_location
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock(post=Mock(side_effect=httpx.ConnectError("private refused")))
+    with pytest.raises(CanaryBlockedError) as caught:
+        client.call("observe", Mock(model_dump_json=Mock(return_value="{}")))
+    location = _review_location(caught.value)
+    assert location.startswith("pixav.pixel_injector.windows_control.call:")
+    assert " after " not in location
+    assert "private" not in location

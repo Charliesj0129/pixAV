@@ -708,8 +708,10 @@ class MaestroPartUploader:
             # The player may initialize after VIEW accepted the first pause.
             # Also pause when UI inspection fails and leaves the guest retained,
             # but a halted runtime refuses that pause: keep the original error.
-            with suppress(Exception):
+            try:
                 await self.adb("shell", "input", "keyevent", "127")
+            except Exception as pause_error:
+                logger.warning("Photos details pause suppressed: %s", type(pause_error).__name__)
             raise
         await self.adb("shell", "input", "keyevent", "127")
 
