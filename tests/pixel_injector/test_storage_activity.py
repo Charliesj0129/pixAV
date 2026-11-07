@@ -640,3 +640,131 @@ async def test_existing_item_share_never_uploads_and_requires_new_cold_bytes(def
         upload.share_existing.assert_not_awaited()
     else:
         upload.share_existing.assert_awaited_once()
+
+
+def test_review_location_names_the_step_a_later_error_replaced():
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy, run_flow
+    from pixav.pixel_injector.storage_activity import _review_location
+
+    foreign = SimpleNamespace(labels={})
+    try:
+        try:
+            hierarchy(foreign, "owner")
+        finally:
+            run_flow(foreign, "owner", Path("flow.yaml"))
+    except CanaryBlockedError as error:
+        location = _review_location(error)
+    assert location.startswith("pixav.pixel_injector.canary_maestro.run_flow:")
+    assert " after pixav.pixel_injector.canary_maestro.hierarchy:" in location
+    assert "ownership" not in location
+
+
+def test_review_location_without_an_earlier_error_names_one_step():
+    from types import SimpleNamespace
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy
+    from pixav.pixel_injector.storage_activity import _review_location
+
+    with pytest.raises(CanaryBlockedError) as caught:
+        hierarchy(SimpleNamespace(labels={}), "owner")
+    location = _review_location(caught.value)
+    assert location.startswith("pixav.pixel_injector.canary_maestro.hierarchy:")
+    assert " after " not in location
+
+
+def test_review_location_keeps_only_the_fixed_native_rejection_code():
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.storage_activity import _review_location
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock(post=Mock(return_value=httpx.Response(409, json={"detail": "NATIVE_RESOURCE_HALTED"})))
+    with pytest.raises(CanaryBlockedError) as caught:
+        client.call("observe", Mock(model_dump_json=Mock(return_value="{}")))
+    location = _review_location(caught.value)
+    assert location.startswith("pixav.pixel_injector.windows_control.call:")
+    assert location.endswith(" code NATIVE_RESOURCE_HALTED")
+    assert "retain" not in location
+
+
+def test_review_location_keeps_the_native_code_of_a_replaced_rejection():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy
+    from pixav.pixel_injector.storage_activity import _review_location
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock(post=Mock(return_value=httpx.Response(409, json={"detail": "NATIVE_RESOURCE_HALTED"})))
+    try:
+        try:
+            client.call("observe", Mock(model_dump_json=Mock(return_value="{}")))
+        finally:
+            hierarchy(SimpleNamespace(labels={}), "owner")
+    except CanaryBlockedError as error:
+        location = _review_location(error)
+    assert location.startswith("pixav.pixel_injector.canary_maestro.hierarchy:")
+    assert " after pixav.pixel_injector.windows_control.call:" in location
+    assert location.endswith(" code NATIVE_RESOURCE_HALTED")
+    assert "retain" not in location
+
+
+def _translated(suppress_context: bool) -> Exception:
+    from types import SimpleNamespace
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.canary_maestro import hierarchy
+
+    try:
+        try:
+            hierarchy(SimpleNamespace(labels={}), "owner")
+        except CanaryBlockedError as exc:
+            if suppress_context:
+                raise RuntimeError("translated") from None
+            raise RuntimeError("translated") from exc
+    except RuntimeError as error:
+        return error
+    raise AssertionError("translation did not raise")
+
+
+@pytest.mark.parametrize("suppress_context", [True, False], ids=["from-none", "from-exc"])
+def test_review_location_does_not_treat_explicit_translation_as_a_replaced_step(suppress_context):
+    from pixav.pixel_injector.storage_activity import _review_location
+
+    error = _translated(suppress_context)
+    assert error.__context__ is not None
+    location = _review_location(error)
+    assert " after " not in location
+    assert "private" not in location
+
+
+def test_review_location_does_not_report_connect_error_translation_as_after():
+    from unittest.mock import Mock
+
+    import httpx
+
+    from pixav.pixel_injector.canary import CanaryBlockedError
+    from pixav.pixel_injector.storage_activity import _review_location
+    from pixav.pixel_injector.windows_control import WindowsHostClient
+
+    client = WindowsHostClient.__new__(WindowsHostClient)
+    client._client = Mock(post=Mock(side_effect=httpx.ConnectError("private refused")))
+    with pytest.raises(CanaryBlockedError) as caught:
+        client.call("observe", Mock(model_dump_json=Mock(return_value="{}")))
+    location = _review_location(caught.value)
+    assert location.startswith("pixav.pixel_injector.windows_control.call:")
+    assert " after " not in location
+    assert "private" not in location

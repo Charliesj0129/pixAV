@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import suppress
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -388,8 +389,41 @@ def _review_error_code(error: CanaryBlockedError | AccountSessionRequiredError) 
     return error.code if isinstance(error, UploadReviewRequiredError) else "USER_ACTION_REQUIRED"
 
 
+_NATIVE_REJECTION = re.compile(r"Windows native control rejected: (NATIVE_[A-Z_]{1,80}); retain resource fence")
+
+
 def _review_location(error: Exception) -> str:
-    """Locate the failed adapter step without logging exception text or locals."""
+    """Locate the failed adapter step without logging exception text or locals.
+
+    A cleanup step can fail after the original step and replace it; the
+    earliest replaced adapter step is the one that started the halt. Only an
+    implicit context is a replacement: ``raise ... from`` (including ``from
+    None``) is a deliberate translation and ends the walk.
+    """
+    location = _step_location(error)
+    earlier, seen = _replaced(error), {id(error)}
+    origin = None
+    codes = [_NATIVE_REJECTION.fullmatch(str(error))]
+    while earlier is not None and id(earlier) not in seen:
+        seen.add(id(earlier))
+        if (step := _step_location(earlier)) != __name__:
+            origin = step
+        codes.append(_NATIVE_REJECTION.fullmatch(str(earlier)))
+        earlier = _replaced(earlier)
+    if origin is not None:
+        location = f"{location} after {origin}"
+    # Only the host's fixed rejection token is kept; other exception text is not.
+    code = next((match[1] for match in reversed(codes) if match), None)
+    return location if code is None else f"{location} code {code}"
+
+
+def _replaced(error: BaseException) -> BaseException | None:
+    if error.__cause__ is not None or error.__suppress_context__:
+        return None
+    return error.__context__
+
+
+def _step_location(error: BaseException) -> str:
     location = __name__
     trace = error.__traceback__
     while trace is not None:

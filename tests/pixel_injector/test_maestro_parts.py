@@ -878,3 +878,63 @@ async def test_existing_share_refuses_ambiguous_ui_without_any_share_intent(uplo
         await MaestroPartVerifier(u).share_selected_existing(session, account)
     assert not u.recovery.get("share_intent") and not u.recovery.get("link_intent")
     u.flow.assert_not_awaited()
+
+
+async def test_details_failure_is_not_masked_by_a_pause_after_halt(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(side_effect=CanaryBlockedError("UI unavailable"))
+    u.adb.side_effect = ["", "", CanaryBlockedError("Windows tools runtime unavailable")]
+    with pytest.raises(CanaryBlockedError, match="UI unavailable"):
+        await u.open_details()
+    assert u.adb.await_args.args == ("shell", "input", "keyevent", "127")
+
+
+async def test_suppressed_details_pause_failure_is_logged_by_class_only(upload, caplog):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(side_effect=CanaryBlockedError("UI unavailable"))
+    u.adb.side_effect = ["", "", CanaryBlockedError("private pause detail")]
+    with caplog.at_level(logging.WARNING, logger="pixav.pixel_injector.maestro_parts"):
+        with pytest.raises(CanaryBlockedError, match="UI unavailable"):
+            await u.open_details()
+    records = [r for r in caplog.records if r.name == "pixav.pixel_injector.maestro_parts"]
+    assert len(records) == 1
+    assert "CanaryBlockedError" in records[0].getMessage()
+    assert "private pause detail" not in caplog.text
+
+
+async def test_details_pause_failure_after_success_still_stops(upload):
+    u, _, _ = upload
+    u.recovery["media_id"] = "123"
+    u.attributes = AsyncMock(
+        return_value=[{"resource-id": "com.google.android.apps.photos:id/collapse_info_panel_fab"}]
+    )
+    u.adb.side_effect = ["", "", CanaryBlockedError("ADB operation failed")]
+    with pytest.raises(CanaryBlockedError, match="ADB operation failed"):
+        await u.open_details()
+
+
+async def test_pending_backup_is_rechecked_with_bounded_backoff(upload):
+    u, session, _ = upload
+    u.open_details = AsyncMock()
+    done = [{"text": t} for t in [u.part.filename, "Backed up", "Original quality", "3840 x 2160"]]
+    u.attributes = AsyncMock(side_effect=[[{"text": u.part.filename}]] * 6 + [done])
+    verifier = MaestroPartVerifier(u)
+    verifier._share = AsyncMock(return_value="https://photos.app.goo.gl/verified")
+    with patch("pixav.pixel_injector.maestro_parts.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        assert await verifier.wait_for_share_url(session, timeout=3600) == "https://photos.app.goo.gl/verified"
+    assert [call.args[0] for call in sleep.await_args_list] == [15, 30, 60, 120, 120, 120]
+    assert u.open_details.await_count == 7
+
+
+async def test_backup_recheck_never_sleeps_past_the_deadline(upload):
+    u, session, _ = upload
+    u.open_details = AsyncMock()
+    u.attributes = AsyncMock(return_value=[{"text": u.part.filename}])
+    verifier = MaestroPartVerifier(u)
+    with patch("pixav.pixel_injector.maestro_parts.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with patch("pixav.pixel_injector.maestro_parts.time.monotonic", side_effect=[0, 0, 10, 20, 30, 50]):
+            with pytest.raises(CanaryBlockedError, match="deadline"):
+                await verifier.wait_for_share_url(session, timeout=50)
+    assert [call.args[0] for call in sleep.await_args_list] == [15, 20]
